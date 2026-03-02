@@ -42,6 +42,7 @@ Thumbs.db
 
 新しいフォルダー/
 コマンド早見表.txt
+logs/tensorboard/
 checkpoints/tokenizers/
 checkpoints/whisper/
 torch_hub/
