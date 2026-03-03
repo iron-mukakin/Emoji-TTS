@@ -47,6 +47,7 @@ CHECKPOINTS_DIR  = BASE_DIR / "checkpoints"
 CONFIGS_DIR      = BASE_DIR / "configs"
 LOGS_DIR         = BASE_DIR / "logs"
 OUTPUTS_DIR      = BASE_DIR / "gradio_outputs"
+LORA_DIR         = BASE_DIR / "lora"
 DEFAULT_HF_REPO  = "Aratako/Irodori-TTS-500M"
 DEFAULT_CONFIG   = "train_v1.yaml"
 FIXED_SECONDS    = 30.0
@@ -66,7 +67,6 @@ _active_log_path: Path | None = None
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scan_checkpoints() -> list[str]:
-    """checkpoints/ 配下の .pt / .safetensors を列挙（codecs・tokenizers 除外）。"""
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
     candidates = sorted([
         *CHECKPOINTS_DIR.glob("**/*.pt"),
@@ -82,25 +82,181 @@ def _scan_checkpoints() -> list[str]:
 
 
 def _scan_configs() -> list[str]:
-    """configs/ 配下の .yaml / .yml を列挙。"""
     CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
     return sorted(str(p) for p in CONFIGS_DIR.glob("*.yaml")) + \
            sorted(str(p) for p in CONFIGS_DIR.glob("*.yml"))
 
 
 def _scan_manifests() -> list[str]:
-    """プロジェクト配下の .jsonl を列挙。"""
     return sorted(str(p) for p in BASE_DIR.glob("**/*.jsonl"))
 
 
 def _scan_train_checkpoints() -> list[str]:
-    """学習出力フォルダ配下の .pt を列挙（convert用）。"""
     result = []
     for p in BASE_DIR.glob("**/*.pt"):
-        if p.stat().st_size > 1024 * 1024:  # 1MB以上のみ
+        if p.stat().st_size > 1024 * 1024:
             result.append(str(p))
     return sorted(result)
 
+
+def _scan_lora_adapters() -> list[str]:
+    LORA_DIR.mkdir(parents=True, exist_ok=True)
+    result = []
+    for p in sorted(LORA_DIR.rglob("adapter_config.json")):
+        result.append(str(p.parent))
+    return result
+
+
+def _scan_lora_full_adapters() -> list[str]:
+    LORA_DIR.mkdir(parents=True, exist_ok=True)
+    result = []
+    for p in sorted(LORA_DIR.rglob("adapter_config.json")):
+        if p.parent.name.endswith("_full"):
+            result.append(str(p.parent))
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LoRAプリセット用ユーティリティ  ← 追加
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scan_lora_configs() -> list[str]:
+    """configs/ 配下のYAMLのうち 'lora' セクションを持つものを列挙。"""
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    result = []
+    for p in sorted(CONFIGS_DIR.glob("*.yaml")) + sorted(CONFIGS_DIR.glob("*.yml")):
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            if "lora" in data:
+                result.append(str(p))
+        except Exception:
+            pass
+    return result
+
+
+def _lora_config_from_ui(
+    base_model, manifest, output_dir, run_name,
+    lora_rank, lora_alpha, lora_dropout, target_modules,
+    save_mode, attention_backend,
+    use_early_stopping, es_patience, es_min_delta,
+    use_ema, ema_decay,
+    resume_enabled, resume_lora_path,
+    batch_size, grad_accum, lr, optimizer,
+    lr_scheduler, warmup_steps,
+    max_steps, save_every, log_every,
+    valid_ratio, valid_every,
+    wandb_enabled, wandb_project, wandb_run_name,
+    seed,
+) -> dict:
+    return {
+        "lora": {
+            "lora_rank": int(lora_rank),
+            "lora_alpha": float(lora_alpha),
+            "lora_dropout": float(lora_dropout),
+            "target_modules": str(target_modules),
+            "save_mode": str(save_mode),
+            "attention_backend": str(attention_backend),
+            "use_early_stopping": bool(use_early_stopping),
+            "es_patience": int(es_patience),
+            "es_min_delta": float(es_min_delta),
+            "use_ema": bool(use_ema),
+            "ema_decay": float(ema_decay),
+            "batch_size": int(batch_size),
+            "grad_accum": int(grad_accum),
+            "lr": float(lr),
+            "optimizer": str(optimizer),
+            "lr_scheduler": str(lr_scheduler),
+            "warmup_steps": int(warmup_steps),
+            "max_steps": int(max_steps),
+            "save_every": int(save_every),
+            "log_every": int(log_every),
+            "valid_ratio": float(valid_ratio),
+            "valid_every": int(valid_every),
+            "wandb_enabled": bool(wandb_enabled),
+            "wandb_project": str(wandb_project) if wandb_project else "",
+            "wandb_run_name": str(wandb_run_name) if wandb_run_name else "",
+            "seed": int(seed),
+        }
+    }
+
+
+def _save_lora_config(config_name: str, data: dict) -> str:
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    p = Path(config_name)
+    if not p.suffix:
+        p = p.with_suffix(".yaml")
+    if not p.is_absolute():
+        p = CONFIGS_DIR / p.name
+    with open(p, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    return f"保存しました: {p}"
+
+
+def _load_lora_config(config_path: str) -> dict:
+    if not config_path:
+        return {}
+    p = Path(config_path)
+    if not p.is_file():
+        return {}
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    return data.get("lora", {})
+
+
+def _load_lora_preset(config_path: str):
+    if not config_path:
+        return (
+            16, 32.0, 0.05, "wq,wk,wv,wo",
+            "EMAのみ", "sdpa",
+            False, 3, 0.01,
+            True, 0.9999,
+            4, 1, 1e-4, "adamw",
+            "none", 0,
+            1000, 100, 10,
+            0.0, 100,
+            False, "", "",
+            0,
+        )
+    cfg = _load_lora_config(config_path)
+    def g(k, fb):
+        return cfg.get(k, fb)
+    return (
+        g("lora_rank", 16),
+        g("lora_alpha", 32.0),
+        g("lora_dropout", 0.05),
+        g("target_modules", "wq,wk,wv,wo"),
+        g("save_mode", "EMAのみ"),
+        g("attention_backend", "sdpa"),
+        g("use_early_stopping", False),
+        g("es_patience", 3),
+        g("es_min_delta", 0.01),
+        g("use_ema", True),
+        g("ema_decay", 0.9999),
+        g("batch_size", 4),
+        g("grad_accum", 1),
+        g("lr", 1e-4),
+        g("optimizer", "adamw"),
+        g("lr_scheduler", "none"),
+        g("warmup_steps", 0),
+        g("max_steps", 1000),
+        g("save_every", 100),
+        g("log_every", 10),
+        g("valid_ratio", 0.0),
+        g("valid_every", 100),
+        g("wandb_enabled", False),
+        g("wandb_project", "") or "",
+        g("wandb_run_name", "") or "",
+        g("seed", 0),
+    )
+
+
+def _save_lora_preset(name: str, *cfg_args):
+    cfg_data = _lora_config_from_ui(*cfg_args)
+    return _save_lora_config(name, cfg_data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 以降は元のコードと同じ（_ensure_default_model から build_ui まで）
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_default_model() -> None:
     if _scan_checkpoints():
@@ -197,8 +353,13 @@ def _resolve_checkpoint_path_infer(raw_checkpoint: str) -> str:
         return checkpoint
     raise ValueError(f"サポートされていないファイル形式: {suffix}")
 
-def _build_runtime_key(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark):
+def _build_runtime_key(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter="（なし）"):
     checkpoint_path = _resolve_checkpoint_path_infer(checkpoint)
+    lora_path = None
+    if str(lora_adapter).strip() and str(lora_adapter).strip() != "（なし）":
+        lp = Path(lora_adapter)
+        if lp.is_dir() and (lp / "adapter_config.json").exists():
+            lora_path = str(lp)
     return RuntimeKey(
         checkpoint=checkpoint_path,
         model_device=str(model_device),
@@ -209,17 +370,20 @@ def _build_runtime_key(checkpoint, model_device, model_precision, codec_device, 
         enable_watermark=bool(enable_watermark),
         compile_model=False,
         compile_dynamic=False,
+        lora_path=lora_path,
     )
 
-def _load_model(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark) -> str:
-    runtime_key = _build_runtime_key(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark)
+def _load_model(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter="（なし）") -> str:
+    runtime_key = _build_runtime_key(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter)
     _, reloaded = get_cached_runtime(runtime_key)
     status = "モデルを読み込みました" if reloaded else "モデルは既にロード済みです（再利用）"
+    lora_info = f"\nlora: {runtime_key.lora_path}" if runtime_key.lora_path else ""
     return (
         f"{status}\n"
         f"checkpoint: {runtime_key.checkpoint}\n"
         f"model_device: {runtime_key.model_device} / {runtime_key.model_precision}\n"
         f"codec_device: {runtime_key.codec_device} / {runtime_key.codec_precision}"
+        f"{lora_info}"
     )
 
 def _clear_runtime_cache() -> str:
@@ -228,6 +392,7 @@ def _clear_runtime_cache() -> str:
 
 def _run_generation(
     checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
+    lora_adapter, lora_scale,
     text, uploaded_audio, num_steps, seed_raw, cfg_guidance_mode, cfg_scale_text, cfg_scale_speaker,
     cfg_scale_raw, cfg_min_t, cfg_max_t, context_kv_cache,
     truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
@@ -236,7 +401,7 @@ def _run_generation(
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
 
-    runtime_key = _build_runtime_key(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark)
+    runtime_key = _build_runtime_key(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter)
     if str(text).strip() == "":
         raise ValueError("テキストを入力してください。")
 
@@ -267,6 +432,7 @@ def _run_generation(
             context_kv_cache=bool(context_kv_cache),
             speaker_kv_scale=speaker_kv_scale, speaker_kv_min_t=speaker_kv_min_t,
             speaker_kv_max_layers=speaker_kv_max_layers, trim_tail=True,
+            lora_scale=float(lora_scale) if runtime_key.lora_path else 1.0,
         ),
         log_fn=stdout_log,
     )
@@ -288,13 +454,7 @@ def _run_generation(
 # Prepare Manifest タブ ロジック
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def _read_csv_headers(file_path: str) -> list[str]:
-    """CSV または JSONL の1行目から列名を読み取って返す。
-    フォルダが指定された場合は metadata.csv / metadata.jsonl を探す。
-    audiofolder 経由（CSV/JSONL）は file_name -> audio に自動置換されるため
-    file_name は除外して返す。
-    """
     import csv as _csv
     import json as _json
 
@@ -302,7 +462,6 @@ def _read_csv_headers(file_path: str) -> list[str]:
     if not p:
         return []
     try:
-        # フォルダが指定された場合は metadata ファイルを探す
         if p.is_dir():
             for name in ("metadata.csv", "metadata.jsonl", "metadata.json"):
                 candidate = p / name
@@ -332,12 +491,10 @@ def _read_csv_headers(file_path: str) -> list[str]:
 
 
 def _preview_dataset(dataset: str, split: str, audio_col: str, text_col: str) -> str:
-    """データセットのファイル数カウントとサンプルプレビューを返す。ローカルJSONLにも対応。"""
     dataset = str(dataset).strip()
     if not dataset:
         return "データセットを入力してください。"
 
-    # ローカルJSONLファイルの場合
     p = Path(dataset)
     if p.is_file() and p.suffix in {".jsonl", ".json"}:
         try:
@@ -356,7 +513,6 @@ def _preview_dataset(dataset: str, split: str, audio_col: str, text_col: str) ->
         except Exception as e:
             return f"❌ ファイル読み込みエラー: {e}"
 
-    # ローカルフォルダ（音声ファイルを直接カウント）
     if p.is_dir():
         audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
         files = [f for f in p.rglob("*") if f.suffix.lower() in audio_exts]
@@ -365,7 +521,6 @@ def _preview_dataset(dataset: str, split: str, audio_col: str, text_col: str) ->
         preview_str = "\n".join(previews) if previews else "  （ファイルなし）"
         return f"✅ ローカルフォルダ: 音声ファイル {count} 件\n\n【サンプル（最大3件）】\n{preview_str}"
 
-    # HuggingFace データセット
     try:
         from datasets import load_dataset_builder
         builder = load_dataset_builder(dataset)
@@ -387,8 +542,8 @@ def _preview_dataset(dataset: str, split: str, audio_col: str, text_col: str) ->
 
 
 def _build_manifest_command(
-    data_source_mode,   # "local_csv" | "local_jsonl" | "hf_dataset"
-    dataset,            # HFデータセット名 or ローカルファイルパス
+    data_source_mode,
+    dataset,
     split,
     audio_col, text_col, speaker_col,
     output_manifest, latent_dir, device,
@@ -402,19 +557,16 @@ def _build_manifest_command(
     cmd = [sys.executable, str(BASE_DIR / "prepare_manifest.py")]
 
     if data_source_mode == "local_csv":
-        # datasets 4.x: フォルダパスをpathに直接渡す
         csv_path = Path(_s(dataset))
         folder = str(csv_path.parent if csv_path.suffix.lower() == ".csv" else csv_path)
         cmd += ["--dataset", "audiofolder",
                 "--data-files", folder,
                 "--split", "train"]
     elif data_source_mode == "local_jsonl":
-        # JSONL: audio_pathカラムにフルパスが入っている想定
         cmd += ["--dataset", "json",
                 "--data-files", _s(dataset),
                 "--split", "train"]
     else:
-        # HuggingFace データセット
         cmd += ["--dataset", _s(dataset),
                 "--split",   _s(split, "train")]
 
@@ -464,7 +616,7 @@ def _run_manifest(
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         proc = subprocess.Popen(
-            cmd_list,          # shell=False でリスト渡し → 引数が混入しない
+            cmd_list,
             shell=False,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, encoding="utf-8", errors="replace", env=env,
@@ -509,6 +661,10 @@ def _stop_process() -> str:
 _TRAIN_LOG_PATH: Path | None = None
 _TRAIN_PROC: subprocess.Popen | None = None
 _TRAIN_LOG_LOCK = threading.Lock()
+
+_LORA_TRAIN_PROC: subprocess.Popen | None = None
+_LORA_TRAIN_LOG_PATH: Path | None = None
+_LORA_TRAIN_LOG_LOCK = threading.Lock()
 
 
 def _load_yaml_config(config_path: str) -> dict:
@@ -596,6 +752,7 @@ def _build_train_command(
     resume_enabled, resume_checkpoint,
     save_mode,
     num_gpus,
+    attention_backend="sdpa",
 ) -> list[str]:
     if int(num_gpus) > 1:
         cmd = [sys.executable, "-m", "torch.distributed.run",
@@ -615,14 +772,14 @@ def _build_train_command(
     if use_ema:
         cmd += ["--ema-decay", str(ema_decay)]
 
-    # --resume: 有効かつパスが設定されている場合のみ追加
     if resume_enabled and str(resume_checkpoint).strip():
         cmd += ["--resume", str(resume_checkpoint)]
 
-    # チェックポイント保存形式
-    # save_mode: "EMAのみ"(デフォルト) / "Fullのみ" / "EMA + Full両方"
     if str(save_mode) in ("Fullのみ", "EMA + Full両方"):
         cmd += ["--save-full"]
+
+    if str(attention_backend) and str(attention_backend) != "sdpa":
+        cmd += ["--attention-backend", str(attention_backend)]
 
     return cmd
 
@@ -631,6 +788,7 @@ def _start_train(
     manifest, output_dir, config_path,
     use_early_stopping, es_patience, es_min_delta,
     use_ema, ema_decay, resume_enabled, resume_checkpoint, save_mode, num_gpus,
+    attention_backend="sdpa",
     *ui_cfg_args,
 ) -> tuple[str, str]:
     global _TRAIN_LOG_PATH, _TRAIN_PROC
@@ -639,12 +797,10 @@ def _start_train(
         if _TRAIN_PROC is not None and _TRAIN_PROC.poll() is None:
             return "学習が既に実行中です。停止してから再実行してください。", ""
 
-    # UIの設定をYAMLとして一時保存して使用
     cfg_data = _config_from_ui(*ui_cfg_args)
     tmp_config = CONFIGS_DIR / "_train_tmp.yaml"
     CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 既存configをベースにtrainセクションを上書き
     base_cfg = _load_yaml_config(str(config_path)) if Path(config_path).is_file() else {}
     base_cfg.update(cfg_data)
     with open(tmp_config, "w", encoding="utf-8") as f:
@@ -654,6 +810,7 @@ def _start_train(
         manifest, output_dir, tmp_config,
         use_early_stopping, es_patience, es_min_delta,
         use_ema, ema_decay, resume_enabled, resume_checkpoint, save_mode, num_gpus,
+        attention_backend,
     )
     cmd = " ".join(cmd_list)
 
@@ -678,7 +835,6 @@ def _start_train(
                 f.write(line)
                 f.flush()
         proc.wait()
-        # 学習終了（完了・中断とも）のタイミングで1回だけログ保存
         _write_tensorboard_events(log_path)
 
     threading.Thread(target=_stream, daemon=True).start()
@@ -704,7 +860,6 @@ def _read_train_log() -> str:
     if proc is not None and proc.poll() is not None:
         rc = proc.returncode
         text += f"\n\n--- 学習終了 (returncode={rc}) ---"
-    # 末尾200行のみ表示（長すぎる場合）
     lines = text.splitlines()
     if len(lines) > 200:
         text = f"... （先頭省略、末尾200行表示）\n" + "\n".join(lines[-200:])
@@ -712,9 +867,6 @@ def _read_train_log() -> str:
 
 
 def _parse_train_log_metrics():
-    """ログファイルから step / loss / lr を抽出して DataFrame を返す。
-    pandasが未インストールの場合はNoneを返す。
-    """
     if not _PANDAS_AVAILABLE:
         return None
     with _TRAIN_LOG_LOCK:
@@ -724,7 +876,6 @@ def _parse_train_log_metrics():
 
     rows = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        # 想定フォーマット: "step=100 loss=0.1234 lr=3.00e-04 ..."
         if "step=" not in line or "loss=" not in line:
             continue
         try:
@@ -741,7 +892,6 @@ def _parse_train_log_metrics():
 
 
 def _write_tensorboard_events(log_path: Path) -> None:
-    """学習終了時にTensorBoard用のイベントファイルを生成する。"""
     try:
         from torch.utils.tensorboard import SummaryWriter
         tb_dir = LOGS_DIR / "tensorboard" / log_path.stem
@@ -754,19 +904,13 @@ def _write_tensorboard_events(log_path: Path) -> None:
         writer.close()
         print(f"[gradio] TensorBoardイベント保存: {tb_dir}", flush=True)
     except ImportError:
-        # TensorBoardが未インストールの場合はCSVのみ保存
         pass
     finally:
-        # CSVも必ず保存
         df = _parse_train_log_metrics()
         if not df.empty:
             csv_path = LOGS_DIR / f"{log_path.stem}_metrics.csv"
             df.to_csv(csv_path, index=False)
             print(f"[gradio] メトリクスCSV保存: {csv_path}", flush=True)
-
-
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -880,9 +1024,9 @@ def _build_dataset_command(
     slice_output: str,
     min_sec: float,
     max_sec: float,
-    threshold: float,       # top_db → threshold (0.0〜1.0)
-    min_silence_ms: int,    # frame_length → min_silence_ms
-    speech_pad_ms: int,     # hop_length → speech_pad_ms
+    threshold: float,
+    min_silence_ms: int,
+    speech_pad_ms: int,
     target_sr_enabled: bool,
     target_sr: int,
     recursive_slice: bool,
@@ -936,7 +1080,7 @@ def _build_dataset_command(
         if str(model_cache_dir).strip():
             cmd += ["--model-cache-dir", str(model_cache_dir).strip()]
 
-    else:  # パイプライン（スライス→キャプション）
+    else:
         lang = "" if language in ("自動検出", "auto", "") else language
         cmd = [sys.executable, str(DATASET_TOOLS), "pipeline",
                "--input", input_path,
@@ -981,7 +1125,7 @@ def _start_dataset_job(*args) -> tuple[str, str]:
     with _DS_LOG_LOCK:
         _DS_LOG_PATH = log_path
         env = os.environ.copy()
-        env["PYTHONUTF8"] = "1"      # Windows CP932文字化け対策
+        env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         proc = subprocess.Popen(
             cmd_list, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1026,10 +1170,9 @@ def _read_dataset_log() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 絵文字キャプション ロジック（通常Datasetジョブと同じログ・停止ボタンで一元管理）
+# 絵文字キャプション ロジック
 # ─────────────────────────────────────────────────────────────────────────────
 
-# API プロバイダー定義
 _EMOJI_API_KEYS = {
     "LM Studio（ローカル）": "lm_studio",
     "Groq": "groq",
@@ -1045,7 +1188,6 @@ _EMOJI_DEFAULT_MODELS = {
 
 
 def _append_emoji_to_ds_log(log_path: Path, message: str) -> None:
-    """通常DatasetジョブのログファイルにAppendで書き込む。"""
     try:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(message + "\n")
@@ -1060,11 +1202,6 @@ def _run_emoji_caption_inline(
     api_label: str,
     api_key: str = "",
 ) -> None:
-    """
-    絵文字キャプションを通常DatasetジョブのDS_PROCとして起動する。
-    ログは通常ジョブと同じ _DS_LOG_PATH に追記されるため、
-    GUIのログ出力・停止ボタンで一元管理できる。
-    """
     global _DS_PROC, _DS_LOG_PATH
 
     api_key_str = _EMOJI_API_KEYS.get(api_label, "lm_studio")
@@ -1075,7 +1212,6 @@ def _run_emoji_caption_inline(
         "--wav-dir", str(wav_dir).strip(),
         "--api",     api_key_str,
     ]
-    # LM Studio以外でAPIキーが指定されている場合は渡す
     if api_key_str != "lm_studio" and str(api_key).strip():
         cmd += ["--api-key", str(api_key).strip()]
 
@@ -1093,7 +1229,7 @@ def _run_emoji_caption_inline(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, encoding="utf-8", errors="replace", env=env,
         )
-        _DS_PROC = proc  # 停止ボタンで止められるよう上書き登録
+        _DS_PROC = proc
 
     def _stream():
         with open(log_path, "a", encoding="utf-8") as f:
@@ -1105,6 +1241,167 @@ def _run_emoji_caption_inline(
         _append_emoji_to_ds_log(log_path, f"\n--- 絵文字キャプション完了 (returncode={rc}) ---")
 
     threading.Thread(target=_stream, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LoRA 学習タブ ロジック
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_lora_train_command(
+    base_model, manifest, output_dir, run_name,
+    lora_rank, lora_alpha, lora_dropout, target_modules,
+    save_mode, attention_backend,
+    use_early_stopping, es_patience, es_min_delta,
+    use_ema, ema_decay,
+    resume_enabled, resume_lora_path,
+    batch_size, grad_accum, lr, optimizer, lr_scheduler, warmup_steps,
+    max_steps, save_every, log_every,
+    valid_ratio, valid_every,
+    wandb_enabled, wandb_project, wandb_run_name,
+    seed,
+) -> list[str]:
+    cmd = [sys.executable, str(BASE_DIR / "lora_train.py")]
+    cmd += ["--base-model", str(base_model)]
+    cmd += ["--manifest", str(manifest)]
+
+    _run_name = str(run_name).strip() if str(run_name).strip() else ""
+    if _run_name:
+        cmd += ["--run-name", _run_name]
+
+    if str(output_dir).strip():
+        cmd += ["--output-dir", str(output_dir).strip()]
+
+    cmd += [
+        "--lora-rank", str(int(lora_rank)),
+        "--lora-alpha", str(float(lora_alpha)),
+        "--lora-dropout", str(float(lora_dropout)),
+        "--target-modules", str(target_modules).strip(),
+        "--batch-size", str(int(batch_size)),
+        "--gradient-accumulation-steps", str(int(grad_accum)),
+        "--lr", str(float(lr)),
+        "--optimizer", str(optimizer),
+        "--lr-scheduler", str(lr_scheduler),
+        "--warmup-steps", str(int(warmup_steps)),
+        "--max-steps", str(int(max_steps)),
+        "--save-every", str(int(save_every)),
+        "--log-every", str(int(log_every)),
+        "--seed", str(int(seed)),
+    ]
+
+    if str(attention_backend) != "sdpa":
+        cmd += ["--attention-backend", str(attention_backend)]
+
+    if str(save_mode) == "EMA + Full両方":
+        cmd += ["--save-full"]
+
+    if use_ema:
+        cmd += ["--ema-decay", str(float(ema_decay))]
+
+    if float(valid_ratio) > 0.0:
+        cmd += ["--valid-ratio", str(float(valid_ratio))]
+        if int(valid_every) > 0:
+            cmd += ["--valid-every", str(int(valid_every))]
+
+    if use_early_stopping and float(valid_ratio) > 0.0:
+        cmd += [
+            "--early-stopping",
+            "--early-stopping-patience", str(int(es_patience)),
+            "--early-stopping-min-delta", str(float(es_min_delta)),
+        ]
+
+    if wandb_enabled:
+        cmd += ["--wandb"]
+        if str(wandb_project).strip():
+            cmd += ["--wandb-project", str(wandb_project).strip()]
+        if str(wandb_run_name).strip():
+            cmd += ["--wandb-run-name", str(wandb_run_name).strip()]
+
+    if resume_enabled and str(resume_lora_path).strip():
+        cmd += ["--resume-lora", str(resume_lora_path).strip()]
+
+    return cmd
+
+
+def _start_lora_train(*args) -> tuple[str, str]:
+    global _LORA_TRAIN_PROC, _LORA_TRAIN_LOG_PATH
+
+    with _LORA_TRAIN_LOG_LOCK:
+        if _LORA_TRAIN_PROC is not None and _LORA_TRAIN_PROC.poll() is None:
+            return "LoRA学習が既に実行中です。停止してから再実行してください。", ""
+
+    cmd_list = _build_lora_train_command(*args)
+    cmd_str = " ".join(cmd_list)
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = LOGS_DIR / f"lora_train_{stamp}.log"
+
+    with _LORA_TRAIN_LOG_LOCK:
+        _LORA_TRAIN_LOG_PATH = log_path
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd_list, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding="utf-8", errors="replace", env=env,
+        )
+        _LORA_TRAIN_PROC = proc
+
+    def _stream():
+        with open(log_path, "w", encoding="utf-8") as f:
+            for line in proc.stdout:
+                f.write(line)
+                f.flush()
+        proc.wait()
+
+    threading.Thread(target=_stream, daemon=True).start()
+
+    warning = ""
+    if bool(args[10]) and float(args[26]) <= 0.0:
+        warning = "\n⚠️ Early Stopping は valid_ratio=0 のため無効化されました。"
+    return f"LoRA学習開始 (PID {proc.pid})\nログ: {log_path}{warning}", cmd_str
+
+
+def _stop_lora_train() -> str:
+    global _LORA_TRAIN_PROC
+    with _LORA_TRAIN_LOG_LOCK:
+        if _LORA_TRAIN_PROC is None or _LORA_TRAIN_PROC.poll() is not None:
+            return "実行中のLoRA学習プロセスはありません。"
+        _LORA_TRAIN_PROC.terminate()
+        return f"LoRA学習プロセス (PID {_LORA_TRAIN_PROC.pid}) に停止シグナルを送信しました。"
+
+
+def _read_lora_train_log() -> str:
+    with _LORA_TRAIN_LOG_LOCK:
+        path = _LORA_TRAIN_LOG_PATH
+        proc = _LORA_TRAIN_PROC
+    if path is None or not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if proc is not None and proc.poll() is not None:
+        text += f"\n\n--- LoRA学習終了 (returncode={proc.returncode}) ---"
+    lines = text.splitlines()
+    if len(lines) > 200:
+        text = "... （先頭省略、末尾200行表示）\n" + "\n".join(lines[-200:])
+    return text
+
+
+def _run_lora_convert(input_full_dir: str, force: bool = False) -> str:
+    if not str(input_full_dir).strip():
+        return "エラー: 変換対象の _full フォルダを選択してください。"
+    p = Path(input_full_dir)
+    if not p.is_dir():
+        return f"エラー: フォルダが存在しません: {p}"
+    cmd = [sys.executable, str(BASE_DIR / "convert_lora_checkpoint.py"), str(p)]
+    if force:
+        cmd += ["--force"]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    out = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return f"変換完了\n\n{out}"
+    else:
+        return f"変換失敗 (returncode={result.returncode}):\n{out}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1126,7 +1423,6 @@ def build_ui() -> gr.Blocks:
     initial_manifests        = _scan_manifests()
     initial_train_ckpts      = _scan_train_checkpoints()
 
-    # デフォルト設定をYAMLから読み込み
     default_cfg = _load_yaml_config(default_config).get("train", {}) if default_config else {}
 
     def _v(key, fallback=None):
@@ -1160,6 +1456,19 @@ def build_ui() -> gr.Blocks:
                         scale=4, allow_custom_value=False,
                     )
                     infer_refresh_btn = gr.Button("🔄 更新", scale=1)
+
+                with gr.Row():
+                    infer_lora_adapter = gr.Dropdown(
+                        label="LoRAアダプタ（なし=ベースモデルのみ）",
+                        choices=["（なし）"] + _scan_lora_adapters(),
+                        value="（なし）",
+                        scale=4, allow_custom_value=False,
+                    )
+                    infer_lora_refresh_btn = gr.Button("🔄", scale=1)
+                infer_lora_scale = gr.Slider(
+                    label="LoRAスケール（0.0=LoRA無効 / 1.0=通常 / >1.0=強調）",
+                    minimum=0.0, maximum=2.0, value=1.0, step=0.05, visible=False,
+                )
 
                 with gr.Row():
                     model_device = gr.Dropdown(label="モデルデバイス", choices=device_choices, value=default_model_device, scale=1)
@@ -1209,21 +1518,29 @@ def build_ui() -> gr.Blocks:
                 out_log     = gr.Textbox(label="実行ログ", lines=6)
                 out_timing  = gr.Textbox(label="タイミング情報", lines=6)
 
-                # イベント配線（推論タブ）
                 hf_dl_btn.click(_download_from_hf, inputs=[hf_repo_id], outputs=[infer_checkpoint, hf_dl_status])
                 infer_refresh_btn.click(
                     lambda: gr.Dropdown(choices=_scan_checkpoints(), value=(_scan_checkpoints() or [None])[-1]),
                     outputs=[infer_checkpoint],
                 )
+                infer_lora_refresh_btn.click(
+                    lambda: gr.Dropdown(choices=["（なし）"] + _scan_lora_adapters()),
+                    outputs=[infer_lora_adapter],
+                )
+                infer_lora_adapter.change(
+                    lambda v: gr.Slider(visible=(str(v).strip() not in ("", "（なし）"))),
+                    inputs=[infer_lora_adapter], outputs=[infer_lora_scale],
+                )
                 model_device.change(_on_model_device_change, inputs=[model_device], outputs=[model_precision])
                 codec_device.change(_on_codec_device_change, inputs=[codec_device], outputs=[codec_precision])
                 load_model_btn.click(_load_model,
-                    inputs=[infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark],
+                    inputs=[infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, infer_lora_adapter],
                     outputs=[model_status])
                 unload_model_btn.click(_clear_runtime_cache, outputs=[model_status])
                 generate_btn.click(_run_generation,
                     inputs=[
                         infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
+                        infer_lora_adapter, infer_lora_scale,
                         infer_text, infer_audio, num_steps, seed_raw, cfg_guidance_mode,
                         cfg_scale_text, cfg_scale_speaker, cfg_scale_raw, cfg_min_t, cfg_max_t,
                         context_kv_cache, truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
@@ -1242,7 +1559,6 @@ def build_ui() -> gr.Blocks:
                     "> **ローカルCSV/JSONLを使う場合**：Dataset作成タブで生成した `metadata.csv` または `metadata.jsonl` を直接指定できます。"
                 )
 
-                # ── データソース選択 ──
                 pm_data_source = gr.Radio(
                     label="データソース",
                     choices=["ローカルCSV", "ローカルJSONL", "HuggingFaceデータセット"],
@@ -1270,7 +1586,6 @@ def build_ui() -> gr.Blocks:
                             visible=False,
                         )
 
-                # ── 列名設定 ──
                 with gr.Accordion("📋 列名設定", open=True):
                     gr.Markdown(
                         "**ローカルCSV / JSONL（audiofolder形式）の列名**\n"
@@ -1287,7 +1602,6 @@ def build_ui() -> gr.Blocks:
                                                      choices=[""], allow_custom_value=True)
                     pm_col_status = gr.Textbox(label="列名取得状況", interactive=False, lines=1)
 
-                # ── 出力設定 ──
                 with gr.Row():
                     pm_output_manifest = gr.Textbox(
                         label="出力マニフェストパス（.jsonl）",
@@ -1301,14 +1615,13 @@ def build_ui() -> gr.Blocks:
                         label="使用デバイス", choices=device_choices, value=default_model_device,
                     )
 
-                # ── データソース切り替えで表示を変える ──
                 def _on_pm_source_change(mode):
                     is_hf = mode == "HuggingFaceデータセット"
                     return (
-                        gr.update(visible=not is_hf),  # pm_dataset
-                        gr.update(visible=is_hf),       # pm_hf_name
-                        gr.update(visible=is_hf),       # pm_split
-                        gr.update(value="audio"),        # pm_audio_col
+                        gr.update(visible=not is_hf),
+                        gr.update(visible=is_hf),
+                        gr.update(visible=is_hf),
+                        gr.update(value="audio"),
                     )
                 pm_data_source.change(
                     _on_pm_source_change, inputs=[pm_data_source],
@@ -1316,15 +1629,12 @@ def build_ui() -> gr.Blocks:
                 )
 
                 def _auto_fill_columns(file_path: str, mode: str):
-                    """CSV / JSONL のヘッダーを読んで列名ドロップダウンを自動設定する。"""
                     if mode == "HuggingFaceデータセット":
                         return gr.update(), gr.update(), gr.update(), "HFデータセット: 列名を手動で入力してください。"
                     headers = _read_csv_headers(file_path)
                     if not headers:
                         return gr.update(), gr.update(), gr.update(), "⚠️ 列名を取得できませんでした。ファイルパスを確認してください。"
-                    # audiofolder は file_name → audio に自動変換するため audio 固定
                     audio_choices = ["audio"] + [h for h in headers if h not in {"audio", "file_name"}]
-                    # file_name / audio 以外でテキスト列を推定
                     exclude = {"file_name", "audio", "speaker_id", "speaker"}
                     text_choices = [h for h in headers if h not in {"file_name", "audio"}]
                     text_guess = next((h for h in headers if h not in exclude), text_choices[0] if text_choices else "text")
@@ -1346,7 +1656,6 @@ def build_ui() -> gr.Blocks:
                     outputs=[pm_audio_col, pm_text_col, pm_speaker_col, pm_col_status],
                 )
 
-                # ── コマンドプレビュー ──
                 pm_cmd_preview = gr.Textbox(label="📋 実行コマンドプレビュー", interactive=False, lines=3)
 
                 def _get_pm_inputs_values(mode, local_path, hf_name, split,
@@ -1400,7 +1709,6 @@ def build_ui() -> gr.Blocks:
             with gr.Tab("🏋️ 学習"):
                 gr.Markdown("## 学習設定")
 
-                # ── プリセット管理 ──
                 with gr.Accordion("💾 プリセット管理（configs/ フォルダ）", open=True):
                     with gr.Row():
                         preset_dropdown = gr.Dropdown(
@@ -1416,7 +1724,6 @@ def build_ui() -> gr.Blocks:
                         preset_save_btn = gr.Button("💾 保存", scale=1)
                     preset_status = gr.Textbox(label="プリセット操作結果", interactive=False, lines=1)
 
-                # ── 実行設定 ──
                 with gr.Row():
                     train_manifest = gr.Dropdown(
                         label="マニフェストファイル (.jsonl)",
@@ -1438,8 +1745,13 @@ def build_ui() -> gr.Blocks:
                         value="EMAのみ",
                         info="EMA=推論用軽量版、Full=追加学習用（optimizer状態含む）",
                     )
+                    train_attention_backend = gr.Dropdown(
+                        label="Attention Backend",
+                        choices=["sdpa", "flash2", "sage", "eager"],
+                        value="sdpa",
+                        info="sdpa=推奨 / flash2=FlashAttention2要インストール / sage=SageAttention要インストール",
+                    )
 
-                # ── 学習モデル（ベースモデル）設定 ──
                 with gr.Accordion("🔁 ベースモデル・追加学習設定", open=True):
                     _default_safetensors = str(
                         CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M" / "model.safetensors"
@@ -1466,7 +1778,6 @@ def build_ui() -> gr.Blocks:
                         info=f"空欄の場合、resume有効時は {_default_safetensors} を自動参照します。",
                     )
 
-                # ── バッチ・精度 ──
                 with gr.Accordion("⚙️ バッチ・精度設定", open=True):
                     gr.Markdown("*バッチサイズと勾配蓄積ステップの積が実効バッチサイズになります。*")
                     with gr.Row():
@@ -1480,7 +1791,6 @@ def build_ui() -> gr.Blocks:
                         t_compile_model      = gr.Checkbox(label="torch.compileを使用（初回遅延あり）", value=_v("compile_model", False))
                         t_precision          = gr.Dropdown(label="学習精度", choices=["bf16", "fp32", "fp16"], value=_v("precision", "bf16"))
 
-                # ── オプティマイザ ──
                 with gr.Accordion("🔧 オプティマイザ設定", open=True):
                     gr.Markdown("*Muon: 行列重み向けの高性能オプティマイザ。AdamW: 汎用的で安定。*")
                     with gr.Row():
@@ -1493,7 +1803,6 @@ def build_ui() -> gr.Blocks:
                         t_adam_beta2   = gr.Number(label="Adam β2（AdamW使用時）", value=_v("adam_beta2", 0.999))
                         t_adam_eps     = gr.Number(label="Adam ε（AdamW使用時）", value=_v("adam_eps", 1e-8))
 
-                # ── スケジューラ ──
                 with gr.Accordion("📈 学習率スケジューラ", open=True):
                     gr.Markdown("*wsd: warmup→stable→decay の3段階スケジュール。cosine: コサインアニーリング。*")
                     with gr.Row():
@@ -1502,7 +1811,6 @@ def build_ui() -> gr.Blocks:
                         t_stable_steps  = gr.Number(label="安定期ステップ数（wsdのみ）", value=_v("stable_steps", 2100), precision=0)
                         t_min_lr_scale  = gr.Number(label="最小学習率スケール比率（0〜1）", value=_v("min_lr_scale", 0.01))
 
-                # ── 学習ステップ ──
                 with gr.Accordion("🔢 学習ステップ・テキスト設定", open=True):
                     with gr.Row():
                         t_max_steps             = gr.Number(label="最大学習ステップ数", value=_v("max_steps", 3000), precision=0)
@@ -1511,7 +1819,6 @@ def build_ui() -> gr.Blocks:
                         t_fixed_target_latent_steps = gr.Number(label="固定ターゲットラテント長", value=_v("fixed_target_latent_steps", 750), precision=0)
                         t_fixed_target_full_mask= gr.Checkbox(label="固定ターゲット全マスク", value=_v("fixed_target_full_mask", True))
 
-                # ── Conditioning Dropout ──
                 with gr.Accordion("🎲 Conditioningドロップアウト・タイムステップ", open=False):
                     gr.Markdown("*ドロップアウト率を高めると過学習防止。小データセットでは0.1〜0.2推奨。*")
                     with gr.Row():
@@ -1519,14 +1826,12 @@ def build_ui() -> gr.Blocks:
                         t_speaker_dropout   = gr.Slider(label="話者条件ドロップアウト率（0=無効）", minimum=0.0, maximum=0.5, value=_v("speaker_condition_dropout", 0.15), step=0.01)
                         t_timestep_stratified= gr.Checkbox(label="タイムステップ層化サンプリング（安定化に有効）", value=_v("timestep_stratified", True))
 
-                # ── チェックポイント保存設定 ──
                 with gr.Accordion("💾 グラフ更新・チェックポイント保存設定", open=False):
                     with gr.Row():
                         t_log_every  = gr.Number(label="グラフ描画間隔（ステップ数）", value=_v("log_every", 10), precision=0,
                                                  info="この間隔でloss/lrをログ出力→グラフに反映。ファイル保存とは無関係。")
                         t_save_every = gr.Number(label="チェックポイント保存間隔（ステップ数）", value=_v("save_every", 100), precision=0)
 
-                # ── W&B ──
                 with gr.Accordion("📊 Weights & Biases 設定", open=False):
                     gr.Markdown("*wandb_enabledをオンにするとクラウドでリアルタイム学習曲線を確認できます。*")
                     with gr.Row():
@@ -1534,14 +1839,12 @@ def build_ui() -> gr.Blocks:
                         t_wandb_project  = gr.Textbox(label="W&B プロジェクト名", value=_v("wandb_project", "") or "")
                         t_wandb_run_name = gr.Textbox(label="W&B 実行名（省略可）", value=_v("wandb_run_name", "") or "")
 
-                # ── バリデーション ──
                 with gr.Accordion("✅ バリデーション設定", open=False):
                     gr.Markdown("*valid_ratioを0より大きくするとバリデーションlossを監視できます。early_stoppingには必須。*")
                     with gr.Row():
                         t_valid_ratio= gr.Slider(label="バリデーション分割比率（0=無効）", minimum=0.0, maximum=0.5, value=_v("valid_ratio", 0.0), step=0.01)
                         t_valid_every= gr.Number(label="バリデーション実行間隔（ステップ数）", value=_v("valid_every", 100), precision=0)
 
-                # ── オプション機能 ──
                 with gr.Accordion("🔀 オプション機能", open=False):
                     gr.Markdown("*Early Stoppingはvalid_ratio > 0 のときのみ有効。EMAは推論品質向上に有効。*")
                     with gr.Row():
@@ -1553,17 +1856,14 @@ def build_ui() -> gr.Blocks:
                         t_ema_decay= gr.Number(label="EMA減衰率（0に近いほど追従速度が速い）", value=0.9999)
                     t_seed = gr.Number(label="乱数シード（再現性のために固定推奨）", value=_v("seed", 0), precision=0)
 
-                # ── コマンドプレビュー ──
                 gr.Markdown("### 📋 実行コマンドプレビュー")
                 train_cmd_preview = gr.Textbox(label="コマンドライン（確認用）", interactive=False, lines=3)
 
-                # ── 実行制御 ──
                 with gr.Row():
                     train_start_btn = gr.Button("▶️ 学習開始", variant="primary", size="lg")
                     train_stop_btn  = gr.Button("⏹️ 学習停止", variant="stop")
                 train_status = gr.Textbox(label="実行状況", interactive=False, lines=2)
 
-                # ── ログ・グラフ（自動更新） ──
                 gr.Markdown("### 📈 学習ログ・グラフ")
                 with gr.Row():
                     auto_refresh_interval = gr.Slider(
@@ -1576,7 +1876,6 @@ def build_ui() -> gr.Blocks:
 
                 train_log_text = gr.Textbox(label="学習ログ（末尾200行）", interactive=False, lines=15, max_lines=15, elem_id="train_log_text")
 
-                # 学習ログを常に最下部へ自動スクロールするスクリプト
                 gr.HTML("""
 <script>
 (function() {
@@ -1624,10 +1923,8 @@ def build_ui() -> gr.Blocks:
                         df = _parse_train_log_metrics()
                         return log, df, df
 
-                    # 手動更新ボタン
                     train_log_refresh_btn.click(_do_refresh, outputs=[train_log_text, loss_plot, lr_plot])
 
-                    # 自動更新タイマー
                     _auto_timer = gr.Timer(value=5, active=True)
                     _auto_timer.tick(_do_refresh, outputs=[train_log_text, loss_plot, lr_plot])
                     auto_refresh_interval.change(
@@ -1648,11 +1945,11 @@ def build_ui() -> gr.Blocks:
                         df = _parse_train_log_metrics()
                         if df is None:
                             metrics = "（pandas未インストールのためグラフ非表示）"
-                        elif df.empty:  # type: ignore
+                        elif df.empty:
                             metrics = "（データなし）"
                         else:
                             lines = [f"step={int(r['step'])}  loss={r['loss']:.4f}  lr={r['lr']:.2e}"
-                                     for _, r in df.tail(10).iterrows()]  # type: ignore
+                                     for _, r in df.tail(10).iterrows()]
                             metrics = "\n".join(lines)
                         return log, metrics
 
@@ -1666,7 +1963,6 @@ def build_ui() -> gr.Blocks:
                         outputs=[_auto_timer],
                     )
 
-                # ── UI変数リスト（コマンドプレビュー更新用） ──
                 _train_cfg_inputs = [
                     train_manifest, train_output_dir,
                     t_batch_size, t_grad_accum, t_num_workers, t_persistent_workers, t_prefetch_factor,
@@ -1689,27 +1985,27 @@ def build_ui() -> gr.Blocks:
                     t_use_ema, t_ema_decay,
                     resume_enabled, resume_checkpoint, save_mode,
                     num_gpus,
+                    train_attention_backend,
                 ] + _train_cfg_inputs
 
                 def _update_train_cmd(manifest, output_dir, config_path,
                                       use_early_stopping, es_patience, es_min_delta,
                                       use_ema, ema_decay,
                                       resume_enabled, resume_checkpoint, save_mode,
-                                      num_gpus, *_rest):
+                                      num_gpus, attention_backend, *_rest):
                     return _build_train_command(manifest, output_dir, config_path,
                                                use_early_stopping, es_patience, es_min_delta,
                                                use_ema, ema_decay,
                                                resume_enabled, resume_checkpoint, save_mode,
-                                               num_gpus)
+                                               num_gpus, attention_backend)
 
                 for comp in [train_manifest, train_output_dir, preset_dropdown,
                               t_early_stopping, t_es_patience, t_es_min_delta,
                               t_use_ema, t_ema_decay,
                               resume_enabled, resume_checkpoint, save_mode,
-                              num_gpus]:
+                              num_gpus, train_attention_backend]:
                     comp.change(_update_train_cmd, inputs=_train_exec_inputs, outputs=[train_cmd_preview])
 
-                # プリセット読み込み
                 def _load_preset(config_path: str):
                     cfg = _load_yaml_config(config_path).get("train", {})
                     def g(k, fb): return cfg.get(k, fb)
@@ -1780,7 +2076,267 @@ def build_ui() -> gr.Blocks:
                 train_stop_btn.click(_stop_train, outputs=[train_status])
 
             # ═══════════════════════════════════════════════════════════════
-            # タブ4: Dataset作成
+            # タブ4: LoRA学習
+            # ═══════════════════════════════════════════════════════════════
+            with gr.Tab("🚀 LoRA学習"):
+                gr.Markdown(
+                    "## LoRA 差分学習\n"
+                    "ベースモデルに対して LoRA アダプタを学習します。\n\n"
+                    "> **必要ライブラリ**: `pip install peft`"
+                )
+
+                # ── プリセット管理 ── ← 追加
+                with gr.Accordion("💾 プリセット管理（configs/ フォルダ）", open=True):
+                    with gr.Row():
+                        lora_preset_dropdown = gr.Dropdown(
+                            label="プリセット選択",
+                            choices=_scan_lora_configs(),
+                            value=None,
+                            scale=3,
+                        )
+                        lora_preset_refresh_btn = gr.Button("🔄 更新", scale=1)
+                    with gr.Row():
+                        lora_preset_name_input = gr.Textbox(
+                            label="保存ファイル名（例: my_lora.yaml）",
+                            value="my_lora.yaml",
+                            scale=3,
+                        )
+                        lora_preset_save_btn = gr.Button("💾 保存", scale=1)
+                    lora_preset_status = gr.Textbox(label="プリセット操作結果", interactive=False, lines=1)
+
+                # ── ベースモデル ──
+                with gr.Row():
+                    lora_base_model = gr.Dropdown(
+                        label="ベースモデル (.pt / .safetensors)",
+                        choices=initial_checkpoints,
+                        value=(
+                            str(CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M" / "model.safetensors")
+                            if (CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M" / "model.safetensors").exists()
+                            else (initial_checkpoints[-1] if initial_checkpoints else None)
+                        ),
+                        allow_custom_value=True, scale=4,
+                    )
+                    lora_base_refresh_btn = gr.Button("🔄 更新", scale=1)
+
+                # ── マニフェスト ──
+                with gr.Row():
+                    lora_manifest = gr.Dropdown(
+                        label="マニフェストファイル (.jsonl)",
+                        choices=initial_manifests,
+                        value=initial_manifests[-1] if initial_manifests else None,
+                        allow_custom_value=True, scale=4,
+                    )
+                    lora_manifest_refresh_btn = gr.Button("🔄", scale=1)
+
+                # ── 実行名・保存先 ──
+                with gr.Row():
+                    lora_run_name = gr.Textbox(
+                        label="実行名 (run_name)（空欄=タイムスタンプ自動生成）",
+                        value="", placeholder="my_lora_run", scale=2,
+                    )
+                    lora_output_dir = gr.Textbox(
+                        label="LoRA出力フォルダ（空欄=lora/{run_name}/）",
+                        value="", placeholder=str(LORA_DIR / "{run_name}"), scale=2,
+                    )
+
+                # ── 保存モード・Attention ──
+                with gr.Row():
+                    lora_save_mode = gr.Dropdown(
+                        label="保存モード",
+                        choices=["EMAのみ", "EMA + Full両方"],
+                        value="EMAのみ",
+                        info="EMAのみ=推論専用 / EMA+Full=Resume前提",
+                    )
+                    lora_attention_backend = gr.Dropdown(
+                        label="Attention Backend",
+                        choices=["sdpa", "flash2", "sage", "eager"],
+                        value="sdpa",
+                        info="sdpa=推奨 / flash2・sage=別途インストール必要",
+                    )
+
+                # ── LoRA設定 ──
+                with gr.Accordion("🔧 LoRA設定", open=True):
+                    with gr.Row():
+                        lora_rank = gr.Slider(label="LoRAランク", minimum=1, maximum=128, value=16, step=1)
+                        lora_alpha = gr.Number(label="lora_alpha", value=32.0)
+                        lora_dropout = gr.Slider(label="lora_dropout", minimum=0.0, maximum=0.5, value=0.05, step=0.01)
+                    lora_target_modules = gr.Textbox(
+                        label="ターゲットモジュール（カンマ区切り）",
+                        value="wq,wk,wv,wo",
+                        info="デフォルト: wq,wk,wv,wo / 拡張: wq,wk,wv,wo,wk_text,wv_text,wk_speaker,wv_speaker,w1,w2,w3",
+                    )
+
+                # ── Resume設定 ──
+                with gr.Accordion("🔄 Resume設定", open=False):
+                    lora_resume_enabled = gr.Checkbox(label="Resume（既存LoRAから再開）", value=False)
+                    with gr.Row():
+                        lora_resume_path = gr.Dropdown(
+                            label="既存LoRAフォルダ（_full推奨）",
+                            choices=_scan_lora_adapters(),
+                            value=None, allow_custom_value=True, scale=4,
+                        )
+                        lora_resume_refresh_btn = gr.Button("🔄", scale=1)
+                    lora_resume_warning = gr.Markdown(visible=False)
+
+                    def _on_lora_resume_path_change(path):
+                        if path and "_ema" in str(path):
+                            return gr.update(visible=True, value=(
+                                "⚠️ **_ema フォルダを選択しています。**\n\n"
+                                "EMA版にはoptimizer状態・step数が含まれないため、"
+                                "学習は step=0 から再スタートします。\n"
+                                "学習率ウォームアップが再度かかり、学習曲線が不連続になります。\n\n"
+                                "中断した学習を完全に再開する場合は **_full フォルダ** を選択してください。"
+                            ))
+                        return gr.update(visible=False)
+
+                    lora_resume_path.change(
+                        _on_lora_resume_path_change,
+                        inputs=[lora_resume_path], outputs=[lora_resume_warning],
+                    )
+                    lora_resume_refresh_btn.click(
+                        lambda: gr.Dropdown(choices=_scan_lora_adapters()),
+                        outputs=[lora_resume_path],
+                    )
+
+                # ── 学習パラメータ ──
+                with gr.Accordion("⚙️ 学習パラメータ", open=True):
+                    with gr.Row():
+                        lora_batch_size = gr.Slider(label="バッチサイズ", minimum=1, maximum=32, value=4, step=1)
+                        lora_grad_accum = gr.Slider(label="勾配蓄積ステップ", minimum=1, maximum=16, value=1, step=1)
+                    with gr.Row():
+                        lora_lr = gr.Number(label="学習率", value=1e-4)
+                        lora_optimizer = gr.Dropdown(
+                            label="オプティマイザ", choices=["adamw", "muon", "lion", "ademamix"],
+                            value="adamw",
+                        )
+                        lora_lr_scheduler = gr.Dropdown(
+                            label="スケジューラ", choices=["none", "cosine", "wsd"], value="none",
+                        )
+                        lora_warmup_steps = gr.Number(label="ウォームアップステップ", value=0, precision=0)
+                    with gr.Row():
+                        lora_max_steps = gr.Number(label="最大学習ステップ", value=1000, precision=0)
+                        lora_save_every = gr.Number(label="保存間隔", value=100, precision=0)
+                        lora_log_every = gr.Number(label="ログ間隔", value=10, precision=0)
+
+                # ── EMA設定 ──
+                with gr.Accordion("📊 EMA設定", open=False):
+                    with gr.Row():
+                        lora_use_ema = gr.Checkbox(label="EMAを有効化", value=True)
+                        lora_ema_decay = gr.Number(label="EMA減衰率", value=0.9999)
+
+                # ── バリデーション設定 ──
+                with gr.Accordion("✅ バリデーション設定", open=False):
+                    with gr.Row():
+                        lora_valid_ratio = gr.Slider(label="バリデーション分割比率", minimum=0.0, maximum=0.5, value=0.0, step=0.01)
+                        lora_valid_every = gr.Number(label="バリデーション実行間隔", value=100, precision=0)
+
+                # ── Early Stopping ──
+                with gr.Accordion("🛑 Early Stopping設定", open=False):
+                    with gr.Row():
+                        lora_early_stopping = gr.Checkbox(label="Early Stoppingを有効化", value=False)
+                        lora_es_patience = gr.Number(label="パティエンス", value=3, precision=0)
+                        lora_es_min_delta = gr.Number(label="最小悪化量", value=0.01)
+
+                # ── W&B設定 ──
+                with gr.Accordion("📈 W&B設定", open=False):
+                    with gr.Row():
+                        lora_wandb_enabled = gr.Checkbox(label="W&Bを有効化", value=False)
+                        lora_wandb_project = gr.Textbox(label="W&Bプロジェクト名", value="")
+                        lora_wandb_run_name = gr.Textbox(label="W&B実行名（省略可）", value="")
+
+                lora_seed = gr.Number(label="乱数シード", value=0, precision=0)
+
+                gr.Markdown("### 📋 実行コマンドプレビュー")
+                lora_cmd_preview = gr.Textbox(label="コマンドライン（確認用）", interactive=False, lines=3)
+
+                with gr.Row():
+                    lora_start_btn = gr.Button("▶️ LoRA学習開始", variant="primary", size="lg")
+                    lora_stop_btn = gr.Button("⏹️ 停止", variant="stop")
+                lora_train_status = gr.Textbox(label="実行状況", interactive=False, lines=2)
+
+                gr.Markdown("### 📋 学習ログ")
+                with gr.Row():
+                    lora_log_interval = gr.Slider(label="自動更新間隔（秒）", minimum=2, maximum=60, value=5, step=1, scale=3)
+                    lora_log_refresh_btn = gr.Button("🔄 手動更新", scale=1)
+                lora_log_text = gr.Textbox(label="LoRA学習ログ（末尾200行）", interactive=False, lines=15, max_lines=15)
+
+                # ── イベント配線 ──
+                _lora_exec_inputs = [
+                    lora_base_model, lora_manifest, lora_output_dir, lora_run_name,
+                    lora_rank, lora_alpha, lora_dropout, lora_target_modules,
+                    lora_save_mode, lora_attention_backend,
+                    lora_early_stopping, lora_es_patience, lora_es_min_delta,
+                    lora_use_ema, lora_ema_decay,
+                    lora_resume_enabled, lora_resume_path,
+                    lora_batch_size, lora_grad_accum, lora_lr, lora_optimizer,
+                    lora_lr_scheduler, lora_warmup_steps,
+                    lora_max_steps, lora_save_every, lora_log_every,
+                    lora_valid_ratio, lora_valid_every,
+                    lora_wandb_enabled, lora_wandb_project, lora_wandb_run_name,
+                    lora_seed,
+                ]
+
+                # プリセット読み込み・保存対象コンポーネント
+                # （base_model / manifest / output_dir / run_name はパス依存のため読み込み対象外）
+                _lora_preset_outputs = [
+                    lora_rank, lora_alpha, lora_dropout, lora_target_modules,
+                    lora_save_mode, lora_attention_backend,
+                    lora_early_stopping, lora_es_patience, lora_es_min_delta,
+                    lora_use_ema, lora_ema_decay,
+                    lora_batch_size, lora_grad_accum, lora_lr, lora_optimizer,
+                    lora_lr_scheduler, lora_warmup_steps,
+                    lora_max_steps, lora_save_every, lora_log_every,
+                    lora_valid_ratio, lora_valid_every,
+                    lora_wandb_enabled, lora_wandb_project, lora_wandb_run_name,
+                    lora_seed,
+                ]
+
+                def _update_lora_cmd(*args):
+                    try:
+                        return " ".join(_build_lora_train_command(*args))
+                    except Exception as e:
+                        return f"(プレビュー生成エラー: {e})"
+
+                for comp in [lora_base_model, lora_manifest, lora_output_dir, lora_run_name,
+                              lora_rank, lora_alpha, lora_dropout, lora_target_modules,
+                              lora_save_mode, lora_attention_backend,
+                              lora_use_ema, lora_ema_decay, lora_max_steps]:
+                    comp.change(_update_lora_cmd, inputs=_lora_exec_inputs, outputs=[lora_cmd_preview])
+
+                # プリセット読み込み・更新・保存
+                lora_preset_dropdown.change(
+                    _load_lora_preset,
+                    inputs=[lora_preset_dropdown],
+                    outputs=_lora_preset_outputs,
+                )
+                lora_preset_refresh_btn.click(
+                    lambda: gr.Dropdown(choices=_scan_lora_configs(), value=None),
+                    outputs=[lora_preset_dropdown],
+                )
+                lora_preset_save_btn.click(
+                    _save_lora_preset,
+                    inputs=[lora_preset_name_input] + _lora_exec_inputs,
+                    outputs=[lora_preset_status],
+                )
+
+                lora_base_refresh_btn.click(
+                    lambda: gr.Dropdown(choices=_scan_checkpoints(), value=(_scan_checkpoints() or [None])[-1]),
+                    outputs=[lora_base_model],
+                )
+                lora_manifest_refresh_btn.click(
+                    lambda: gr.Dropdown(choices=_scan_manifests(), value=(_scan_manifests() or [None])[-1]),
+                    outputs=[lora_manifest],
+                )
+                lora_start_btn.click(_start_lora_train, inputs=_lora_exec_inputs,
+                                     outputs=[lora_train_status, lora_cmd_preview])
+                lora_stop_btn.click(_stop_lora_train, outputs=[lora_train_status])
+                lora_log_refresh_btn.click(_read_lora_train_log, outputs=[lora_log_text])
+                _lora_timer = gr.Timer(value=5, active=True)
+                _lora_timer.tick(_read_lora_train_log, outputs=[lora_log_text])
+                lora_log_interval.change(lambda v: float(v), inputs=[lora_log_interval], outputs=[_lora_timer])
+
+            # ═══════════════════════════════════════════════════════════════
+            # タブ5: Dataset作成
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("🎙️ Dataset作成"):
                 gr.Markdown(
@@ -1790,14 +2346,12 @@ def build_ui() -> gr.Blocks:
                     "> 必要ライブラリ: `pip install librosa soundfile faster-whisper`"
                 )
 
-                # ── 実行モード選択 ──
                 ds_mode = gr.Radio(
                     label="実行モード",
                     choices=["スライスのみ", "キャプションのみ", "パイプライン（スライス→キャプション）"],
                     value="パイプライン（スライス→キャプション）",
                 )
 
-                # ── スライス設定 ──
                 with gr.Accordion("✂️ スライス設定", open=True) as slice_accordion:
                     gr.Markdown("*Silero VAD（ニューラルネット音声活動検出）で発話区間を検出してスライスします。連続発話・キャラクター音声に対応。*")
                     with gr.Row():
@@ -1830,7 +2384,6 @@ def build_ui() -> gr.Blocks:
                         ds_target_sr_enabled = gr.Checkbox(label="リサンプルを有効化", value=False)
                         ds_target_sr         = gr.Number(label="リサンプル先サンプリングレート（Hz）", value=44100, precision=0)
 
-                # ── キャプション設定 ──
                 with gr.Accordion("🗣️ キャプション設定", open=True) as caption_accordion:
                     gr.Markdown("*faster-whisper で音声を文字起こしします。精度重視設定（large-v3 + beam=5）がデフォルトです。*")
                     ds_caption_input = gr.Textbox(
@@ -1870,7 +2423,6 @@ def build_ui() -> gr.Blocks:
                         info="モデルが存在しない場合は自動ダウンロードされます。空欄にするとHFデフォルト (~/.cache/huggingface/hub) に保存されます。",
                     )
 
-                # ── 絵文字キャプション設定（オプション） ──
                 with gr.Accordion("🎭 絵文字キャプション設定（オプション）", open=False):
                     gr.Markdown(
                         "有効にすると、Whisperキャプション完了後に音響特徴量とLLMを使って"
@@ -1899,7 +2451,6 @@ def build_ui() -> gr.Blocks:
                             info="LM StudioはAPIキー不要。起動してモデルをロードしておいてください。",
                         )
 
-                    # 外部APIキー入力欄（LM Studio以外で表示）
                     ec_api_key = gr.Textbox(
                         label="APIキー（Groq / OpenAI / Together AI）",
                         value="",
@@ -1909,7 +2460,6 @@ def build_ui() -> gr.Blocks:
                         info="LM Studio以外を選択した場合に必要です。",
                     )
 
-                    # チェックボックスでプルダウン有効化、プルダウン変更でAPIキー欄表示切り替え
                     def _ec_on_enabled(checked):
                         return gr.update(interactive=checked)
 
@@ -1920,7 +2470,6 @@ def build_ui() -> gr.Blocks:
                     ec_enabled.change(_ec_on_enabled, inputs=[ec_enabled], outputs=[ec_api])
                     ec_api.change(_ec_on_api_change, inputs=[ec_api], outputs=[ec_api_key])
 
-                # ── manifest出力設定 ──
                 with gr.Accordion("📄 Manifest出力設定", open=True):
                     with gr.Row():
                         ds_manifest_output_dir = gr.Textbox(
@@ -1946,17 +2495,14 @@ def build_ui() -> gr.Blocks:
                         "- **JSONL**: `{\"text\":\"...\",\"audio_path\":\"...\"}` — `prepare_manifest.py` への入力前段として使用可能"
                     )
 
-                # ── コマンドプレビュー ──
                 gr.Markdown("### 📋 実行コマンドプレビュー")
                 ds_cmd_preview = gr.Textbox(label="コマンドライン（確認用）", interactive=False, lines=3)
 
-                # ── 実行制御 ──
                 with gr.Row():
                     ds_start_btn = gr.Button("▶️ 実行", variant="primary", size="lg")
                     ds_stop_btn  = gr.Button("⏹️ 停止", variant="stop")
                 ds_status = gr.Textbox(label="実行状況", interactive=False, lines=2)
 
-                # ── ログ（自動更新） ──
                 gr.Markdown("### 📋 実行ログ")
                 with gr.Row():
                     ds_log_interval = gr.Slider(
@@ -1967,7 +2513,6 @@ def build_ui() -> gr.Blocks:
                     label="ログ出力", interactive=False, lines=20, max_lines=20,
                     elem_id="ds_log_text",
                 )
-                # ログ自動スクロールスクリプト
                 gr.HTML("""
 <script>
 (function() {
@@ -1988,8 +2533,6 @@ def build_ui() -> gr.Blocks:
 </script>
 """)
 
-                # ── モードに応じてアコーディオンのラベルを変える ──
-                # (Gradio では open/visible の動的制御は gr.update で行う)
                 def _on_mode_change(mode):
                     show_slice   = mode in ("スライスのみ", "パイプライン（スライス→キャプション）")
                     show_caption = mode in ("キャプションのみ", "パイプライン（スライス→キャプション）")
@@ -2000,7 +2543,6 @@ def build_ui() -> gr.Blocks:
                     outputs=[slice_accordion, caption_accordion],
                 )
 
-                # ── コマンドプレビュー更新 ──
                 _ds_all_inputs = [
                     ds_mode, ds_input, ds_slice_output,
                     ds_min_sec, ds_max_sec, ds_top_db, ds_frame_length, ds_hop_length,
@@ -2019,15 +2561,9 @@ def build_ui() -> gr.Blocks:
                 for comp in _ds_all_inputs:
                     comp.change(_update_ds_cmd, inputs=_ds_all_inputs, outputs=[ds_cmd_preview])
 
-                # ── 実行・停止・ログ ──
-                # ec_enabled / ec_api を追加した拡張入力リスト
                 _ds_exec_inputs = _ds_all_inputs + [ec_enabled, ec_api, ec_api_key]
 
                 def _start_dataset_job_with_emoji(*args):
-                    """通常Dataset処理を起動し、絵文字キャプションが有効なら後続で自動実行する。
-                    ログ・停止ボタンは通常ジョブと共有（_DS_LOG_PATH / _DS_PROC）。
-                    """
-                    # 末尾3つが ec_enabled, ec_api, ec_api_key
                     base_args   = args[:-3]
                     ec_enabled_ = bool(args[-3])
                     ec_api_     = str(args[-2])
@@ -2036,9 +2572,6 @@ def build_ui() -> gr.Blocks:
                     status, cmd = _start_dataset_job(*base_args)
 
                     if ec_enabled_:
-                        # _build_dataset_command 引数順:
-                        # [0]=mode [2]=slice_output [11]=caption_input
-                        # [12]=manifest_output_dir [13]=manifest_filename [14]=output_format
                         output_fmt    = str(args[14]).strip()
                         if output_fmt != "CSV":
                             status += "\n⚠️ 絵文字キャプションはCSV形式のみ対応です。出力形式をCSVに変更してください。"
@@ -2085,35 +2618,66 @@ def build_ui() -> gr.Blocks:
                 )
 
             # ═══════════════════════════════════════════════════════════════
-            # タブ5: チェックポイント変換
+            # タブ6: チェックポイント変換
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("🔄 チェックポイント変換"):
-                gr.Markdown(
-                    "## .pt → .safetensors 変換\n"
-                    "学習チェックポイント（`.pt`）を推論用の `.safetensors` 形式に変換します。\n"
-                    "変換後のファイルは元の `.pt` と同じフォルダに保存されます。"
-                )
-
-                with gr.Row():
-                    conv_input = gr.Dropdown(
-                        label="変換対象の .pt ファイル",
-                        choices=initial_train_ckpts,
-                        value=initial_train_ckpts[-1] if initial_train_ckpts else None,
-                        allow_custom_value=True, scale=4,
+                with gr.Tab("📦 通常チェックポイント変換"):
+                    gr.Markdown(
+                        "## .pt → .safetensors 変換\n"
+                        "学習チェックポイント（`.pt`）を推論用の `.safetensors` 形式に変換します。\n"
+                        "変換後のファイルは元の `.pt` と同じフォルダに保存されます。"
                     )
-                    conv_refresh_btn = gr.Button("🔄 更新", scale=1)
 
-                conv_btn    = gr.Button("⚙️ 変換実行", variant="primary", size="lg")
-                conv_status = gr.Textbox(label="変換結果", interactive=False, lines=6)
+                    with gr.Row():
+                        conv_input = gr.Dropdown(
+                            label="変換対象の .pt ファイル",
+                            choices=initial_train_ckpts,
+                            value=initial_train_ckpts[-1] if initial_train_ckpts else None,
+                            allow_custom_value=True, scale=4,
+                        )
+                        conv_refresh_btn = gr.Button("🔄 更新", scale=1)
 
-                conv_refresh_btn.click(
-                    lambda: gr.Dropdown(choices=_scan_train_checkpoints(), value=(_scan_train_checkpoints() or [None])[-1]),
-                    outputs=[conv_input],
-                )
-                conv_btn.click(_run_convert, inputs=[conv_input], outputs=[conv_status])
+                    conv_btn    = gr.Button("⚙️ 変換実行", variant="primary", size="lg")
+                    conv_status = gr.Textbox(label="変換結果", interactive=False, lines=6)
+
+                    conv_refresh_btn.click(
+                        lambda: gr.Dropdown(choices=_scan_train_checkpoints(), value=(_scan_train_checkpoints() or [None])[-1]),
+                        outputs=[conv_input],
+                    )
+                    conv_btn.click(_run_convert, inputs=[conv_input], outputs=[conv_status])
+
+                with gr.Tab("🚀 LoRA変換"):
+                    gr.Markdown(
+                        "## LoRA Full版 → EMA版 変換\n"
+                        "`_full` フォルダの EMA shadow 重みから、推論用の `_ema` フォルダを生成します。\n\n"
+                        "> **必要条件**: LoRA学習時に `--save-full` と `--ema-decay` を指定して保存したチェックポイント"
+                    )
+
+                    with gr.Row():
+                        lora_conv_input = gr.Dropdown(
+                            label="変換対象の _full フォルダ",
+                            choices=_scan_lora_full_adapters(),
+                            value=(_scan_lora_full_adapters() or [None])[-1],
+                            allow_custom_value=True, scale=4,
+                        )
+                        lora_conv_refresh_btn = gr.Button("🔄 更新", scale=1)
+
+                    lora_conv_force = gr.Checkbox(label="既存の出力を上書き (--force)", value=False)
+                    lora_conv_btn = gr.Button("⚙️ LoRA変換実行", variant="primary", size="lg")
+                    lora_conv_status = gr.Textbox(label="変換結果", interactive=False, lines=8)
+
+                    lora_conv_refresh_btn.click(
+                        lambda: gr.Dropdown(choices=_scan_lora_full_adapters(), value=(_scan_lora_full_adapters() or [None])[-1]),
+                        outputs=[lora_conv_input],
+                    )
+                    lora_conv_btn.click(
+                        _run_lora_convert,
+                        inputs=[lora_conv_input, lora_conv_force],
+                        outputs=[lora_conv_status],
+                    )
 
             # ═══════════════════════════════════════════════════════════════
-            # タブ6: モデルマージ
+            # タブ7: モデルマージ
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("🔀 モデルマージ"):
                 gr.Markdown(
@@ -2122,7 +2686,6 @@ def build_ui() -> gr.Blocks:
                     "> **対応形式**: `_ema.pt` / `.safetensors`（推論用のみ）"
                 )
 
-                # ── モデル選択 ──
                 initial_merge_ckpts = _merge_scan()
                 default_base_path   = get_default_base_path()
 
@@ -2144,7 +2707,6 @@ def build_ui() -> gr.Blocks:
                     )
                     merge_refresh_b = gr.Button("🔄", scale=1)
 
-                # ── 基本マージ設定 ──
                 with gr.Accordion("⚙️ 基本マージ設定", open=True):
                     merge_method = gr.Dropdown(
                         label="マージ手法",
@@ -2181,13 +2743,11 @@ def build_ui() -> gr.Blocks:
                             )
                             merge_refresh_base = gr.Button("🔄", scale=1)
 
-                    # Task Arithmetic 以外では TA設定を折りたたむ
                     def _on_method_change(method):
                         visible = method == "task_arithmetic"
                         return gr.update(visible=visible)
                     merge_method.change(_on_method_change, inputs=[merge_method], outputs=[ta_group])
 
-                # ── 部分マージ ──
                 with gr.Accordion("🧩 部分マージ（グループごとに手法を選択）", open=False):
                     gr.Markdown(
                         "有効にすると、レイヤーグループごとに異なるマージ手法を設定できます。\n"
@@ -2229,7 +2789,6 @@ def build_ui() -> gr.Blocks:
                             pg_io_lam_a     = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="λA")
                             pg_io_lam_b     = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="λB")
 
-                # ── LoRA的差分注入 ──
                 with gr.Accordion("💉 LoRA的差分注入（オプション）", open=False):
                     gr.Markdown(
                         "ベースモデルに対してドナーモデルの差分を指定スケールで注入します。\n"
@@ -2268,7 +2827,6 @@ def build_ui() -> gr.Blocks:
                         lora_grp_diffusion= gr.Checkbox(label="diffusion_core（拡散コア）", value=False)
                         lora_grp_io       = gr.Checkbox(label="io（入出力）",            value=False)
 
-                # ── 出力設定 ──
                 with gr.Accordion("💾 出力設定", open=True):
                     with gr.Row():
                         merge_output_format = gr.Dropdown(
@@ -2285,11 +2843,9 @@ def build_ui() -> gr.Blocks:
                             scale=3,
                         )
 
-                # ── 実行 ──
                 merge_run_btn = gr.Button("🔀 マージ実行", variant="primary", size="lg")
                 merge_status  = gr.Textbox(label="実行結果", interactive=False, lines=10)
 
-                # ── 更新ボタン配線 ──
                 def _rescan_merge():
                     ckpts = _merge_scan()
                     val = ckpts[-1] if ckpts else None
@@ -2301,7 +2857,6 @@ def build_ui() -> gr.Blocks:
                 lora_refresh_base.click(_rescan_merge, outputs=[lora_base])
                 lora_refresh_donor.click(_rescan_merge, outputs=[lora_donor])
 
-                # ── マージ実行配線 ──
                 _merge_inputs = [
                     merge_ckpt_a, merge_ckpt_b,
                     merge_method, merge_alpha,
@@ -2317,7 +2872,6 @@ def build_ui() -> gr.Blocks:
                     merge_output_format, merge_output_dir,
                 ]
                 merge_run_btn.click(_run_merge_ui, inputs=_merge_inputs, outputs=[merge_status])
-
 
     return demo
 

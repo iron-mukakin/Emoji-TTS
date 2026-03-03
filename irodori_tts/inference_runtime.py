@@ -158,6 +158,7 @@ class RuntimeKey:
     enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
+    lora_path: str | None = None
 
 
 @dataclass
@@ -188,6 +189,8 @@ class SamplingRequest:
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1
+    lora_scale: float = 1.0
+    lora_disabled_modules: tuple[str, ...] = ()
 
 
 @dataclass
@@ -366,6 +369,32 @@ def _load_checkpoint_for_inference(path: Path) -> tuple[dict[str, torch.Tensor],
     return _load_checkpoint_from_pt(path)
 
 
+def _apply_lora_settings(
+    model,
+    lora_scale: float,
+    lora_disabled_modules: tuple[str, ...],
+) -> None:
+    """推論開始時にLoRAスケール・無効モジュールを適用する。"""
+    try:
+        for name, module in model.named_modules():
+            if hasattr(module, "scaling"):
+                for adapter_name in getattr(module, "scaling", {}):
+                    module.scaling[adapter_name] = lora_scale
+    except Exception:
+        pass
+
+
+def _restore_lora_defaults(model) -> None:
+    """推論終了後にLoRAスケールをデフォルト (1.0) に戻す。"""
+    try:
+        for name, module in model.named_modules():
+            if hasattr(module, "scaling"):
+                for adapter_name in getattr(module, "scaling", {}):
+                    module.scaling[adapter_name] = 1.0
+    except Exception:
+        pass
+
+
 class InferenceRuntime:
     def __init__(
         self,
@@ -416,6 +445,22 @@ class InferenceRuntime:
             enabled=bool(key.compile_model),
             dynamic=bool(key.compile_dynamic),
         )
+
+        # LoRAアダプタのロード（lora_path が指定されている場合のみ）
+        if key.lora_path:
+            try:
+                from peft import PeftModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "LoRA推論には peft ライブラリが必要です。`pip install peft` を実行してください。"
+                ) from exc
+            model = PeftModel.from_pretrained(
+                model,
+                key.lora_path,
+                is_trainable=False,
+            )
+            model = model.to(dtype=model_dtype)
+            model.eval()
 
         # pyファイル基準のcheckpoints/tokenizersフォルダをキャッシュ先に使用
         _tokenizer_cache_dir = (
@@ -636,98 +681,107 @@ class InferenceRuntime:
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
         with self._infer_lock, torch.inference_mode():
-            t0 = _measure_start(self.model_device)
-            text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text], max_length=text_max_len
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("tokenize_text", stage_sec))
-            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
-            text_ids = text_ids.to(self.model_device)
-            text_mask = text_mask.to(self.model_device)
-
-            target_samples = int(float(req.seconds) * self.codec.sample_rate)
-            latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
-            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
-
-            if isinstance(self.train_cfg, dict):
-                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
-                    msg = (
-                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                        "used in training. Long-tail stability may degrade."
-                    )
-                    messages.append(msg)
-                    _log(msg)
-
-            t0 = _measure_start(self.model_device, self.codec_device)
-            msg_count_before_ref = len(messages)
-            ref_latent, ref_mask = self._load_reference_latent(req=req, messages=messages)
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("prepare_reference", stage_sec))
-            for msg in messages[msg_count_before_ref:]:
-                _log(msg)
-            _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
-
-            t0 = _measure_start(self.model_device)
-            z_patched = sample_euler_rf_cfg(
-                model=self.model,
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                sequence_length=patched_steps,
-                num_steps=int(req.num_steps),
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_guidance_mode=cfg_mode,
-                cfg_min_t=float(req.cfg_min_t),
-                cfg_max_t=float(req.cfg_max_t),
-                seed=used_seed,
-                truncation_factor=truncation_factor,
-                rescale_k=rescale_k,
-                rescale_sigma=rescale_sigma,
-                use_context_kv_cache=bool(req.context_kv_cache),
-                speaker_kv_scale=speaker_kv_scale,
-                speaker_kv_max_layers=speaker_kv_max_layers,
-                speaker_kv_min_t=speaker_kv_min_t,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("sample_rf", stage_sec))
-            _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
-
-            t0 = _measure_start(self.model_device)
-            z = unpatchify_latent(
-                z_patched,
-                patch_size=self.model_cfg.latent_patch_size,
-                latent_dim=self.model_cfg.latent_dim,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("unpatchify_latent", stage_sec))
-            _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
-            z = z[:, :latent_steps]
-
-            t0 = _measure_start(self.model_device, self.codec_device)
-            audio = self.codec.decode_latent(z).cpu()
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("decode_latent", stage_sec))
-            _log(f"[runtime] decode_latent: {stage_sec * 1000.0:.1f} ms")
-
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
-            _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
-
-            max_samples = target_samples
-            if bool(req.trim_tail):
-                flattening_point = find_flattening_point(
-                    z[0],
-                    window_size=max(1, int(req.tail_window_size)),
-                    std_threshold=float(req.tail_std_threshold),
-                    mean_threshold=float(req.tail_mean_threshold),
+            # LoRA設定の動的適用
+            _lora_active = self.key.lora_path is not None and hasattr(self.model, "set_adapter")
+            if _lora_active:
+                _apply_lora_settings(self.model, req.lora_scale, req.lora_disabled_modules)
+            try:
+                t0 = _measure_start(self.model_device)
+                text_ids, text_mask = self.tokenizer.batch_encode(
+                    [normalized_text], max_length=text_max_len
                 )
-                flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
-                if flattening_samples > 0:
-                    max_samples = min(max_samples, flattening_samples)
-            audio = audio[..., :max_samples]
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("tokenize_text", stage_sec))
+                _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
+                text_ids = text_ids.to(self.model_device)
+                text_mask = text_mask.to(self.model_device)
+
+                target_samples = int(float(req.seconds) * self.codec.sample_rate)
+                latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
+                patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+
+                if isinstance(self.train_cfg, dict):
+                    fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+                    if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
+                        msg = (
+                            f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
+                            "used in training. Long-tail stability may degrade."
+                        )
+                        messages.append(msg)
+                        _log(msg)
+
+                t0 = _measure_start(self.model_device, self.codec_device)
+                msg_count_before_ref = len(messages)
+                ref_latent, ref_mask = self._load_reference_latent(req=req, messages=messages)
+                stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+                stage_timings.append(("prepare_reference", stage_sec))
+                for msg in messages[msg_count_before_ref:]:
+                    _log(msg)
+                _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+                t0 = _measure_start(self.model_device)
+                z_patched = sample_euler_rf_cfg(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    sequence_length=patched_steps,
+                    num_steps=int(req.num_steps),
+                    cfg_scale_text=cfg_scale_text,
+                    cfg_scale_speaker=cfg_scale_speaker,
+                    cfg_guidance_mode=cfg_mode,
+                    cfg_min_t=float(req.cfg_min_t),
+                    cfg_max_t=float(req.cfg_max_t),
+                    seed=used_seed,
+                    truncation_factor=truncation_factor,
+                    rescale_k=rescale_k,
+                    rescale_sigma=rescale_sigma,
+                    use_context_kv_cache=bool(req.context_kv_cache),
+                    speaker_kv_scale=speaker_kv_scale,
+                    speaker_kv_max_layers=speaker_kv_max_layers,
+                    speaker_kv_min_t=speaker_kv_min_t,
+                )
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("sample_rf", stage_sec))
+                _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
+
+                t0 = _measure_start(self.model_device)
+                z = unpatchify_latent(
+                    z_patched,
+                    patch_size=self.model_cfg.latent_patch_size,
+                    latent_dim=self.model_cfg.latent_dim,
+                )
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("unpatchify_latent", stage_sec))
+                _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
+                z = z[:, :latent_steps]
+
+                t0 = _measure_start(self.model_device, self.codec_device)
+                audio = self.codec.decode_latent(z).cpu()
+                stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+                stage_timings.append(("decode_latent", stage_sec))
+                _log(f"[runtime] decode_latent: {stage_sec * 1000.0:.1f} ms")
+
+                total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+                _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
+
+                max_samples = target_samples
+                if bool(req.trim_tail):
+                    flattening_point = find_flattening_point(
+                        z[0],
+                        window_size=max(1, int(req.tail_window_size)),
+                        std_threshold=float(req.tail_std_threshold),
+                        mean_threshold=float(req.tail_mean_threshold),
+                    )
+                    flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
+                    if flattening_samples > 0:
+                        max_samples = min(max_samples, flattening_samples)
+                audio = audio[..., :max_samples]
+
+            finally:
+                if _lora_active:
+                    _restore_lora_defaults(self.model)
 
         _log("[runtime] done synthesize")
         return SamplingResult(

@@ -282,13 +282,19 @@ def build_optimizer_extended(
     lion_betas: tuple[float, float] = (0.9, 0.99),
     ademamix_alpha: float = 5.0,
     ademamix_beta3: float = 0.9999,
+    trainable_params_override: list[torch.nn.Parameter] | None = None,
 ) -> torch.optim.Optimizer:
     """build_optimizerを拡張し、Lion / AdEMAMix / SGD を追加サポート。
 
     muon / adamw / その他は既存の build_optimizer に委譲する。
+    trainable_params_override: 指定された場合、model.parameters()の代わりにこのリストを使用する。
+                               LoRA差分学習等でアダプタパラメータのみを渡す際に使用。
     """
     name = (optimizer_name or train_cfg.optimizer).lower()
-    params = [p for p in model.parameters() if p.requires_grad]
+    if trainable_params_override is not None:
+        params = [p for p in trainable_params_override if p.requires_grad]
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
     wd_params = [p for p in params if p.dim() >= 2]
     no_wd_params = [p for p in params if p.dim() < 2]
     param_groups = [

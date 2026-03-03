@@ -20,9 +20,9 @@ model:
   adaln_rank: 192
 
 train:
-  batch_size: 1
-  gradient_accumulation_steps: 8
-  num_workers: 8
+  batch_size: 80
+  gradient_accumulation_steps: 1
+  num_workers: 16
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
   allow_tf32: true
@@ -52,6 +52,6 @@ train:
   wandb_run_name:
   wandb_mode: online
   ddp_find_unused_parameters: false
-  valid_ratio: 0.0
+  valid_ratio: 0.0005
   valid_every: 1000
   seed: 0

@@ -44,7 +44,7 @@ Thumbs.db
 *.zip
 *.rar
 
-新しいフォルダー/
+開発用ファイル/
 コマンド早見表.txt
 logs/tensorboard/
 checkpoints/tokenizers/
