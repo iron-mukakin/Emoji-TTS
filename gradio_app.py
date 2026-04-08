@@ -1616,6 +1616,7 @@ def _build_dataset_command(
     whisper_model: str,
     language: str,
     speaker_id: str,
+    speaker_field_mode: str,
     recursive_caption: bool,
     device: str,
     model_cache_dir: str,
@@ -1650,8 +1651,14 @@ def _build_dataset_command(
                ]
         if lang:
             cmd += ["--language", lang]
-        if str(speaker_id).strip():
-            cmd += ["--speaker-id", str(speaker_id).strip()]
+        speaker_value = str(speaker_id).strip()
+        is_voice_design = str(speaker_field_mode).strip() == "caption"
+        if is_voice_design:
+            cmd += ["--voice-design"]
+            if speaker_value:
+                cmd += ["--voice-design-caption", speaker_value]
+        elif speaker_value:
+            cmd += ["--speaker-id", speaker_value]
         if recursive_caption:
             cmd += ["--recursive"]
         if str(device).strip() and device != "自動":
@@ -1677,8 +1684,14 @@ def _build_dataset_command(
             cmd += ["--target-sr", str(int(target_sr))]
         if lang:
             cmd += ["--language", lang]
-        if str(speaker_id).strip():
-            cmd += ["--speaker-id", str(speaker_id).strip()]
+        speaker_value = str(speaker_id).strip()
+        is_voice_design = str(speaker_field_mode).strip() == "caption"
+        if is_voice_design:
+            cmd += ["--voice-design"]
+            if speaker_value:
+                cmd += ["--voice-design-caption", speaker_value]
+        elif speaker_value:
+            cmd += ["--speaker-id", speaker_value]
         if str(device).strip() and device != "自動":
             cmd += ["--device", str(device).strip()]
         if str(model_cache_dir).strip():
@@ -1780,6 +1793,7 @@ def _run_emoji_caption_inline(
     wav_dir: str,
     api_label: str,
     api_key: str = "",
+    voice_design: bool = False,
 ) -> None:
     global _DS_PROC, _DS_LOG_PATH
 
@@ -1793,6 +1807,8 @@ def _run_emoji_caption_inline(
     ]
     if api_key_str != "lm_studio" and str(api_key).strip():
         cmd += ["--api-key", str(api_key).strip()]
+    if voice_design:
+        cmd += ["--voice-design"]
 
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
@@ -2890,7 +2906,7 @@ def build_ui() -> gr.Blocks:
                               else "model_v2: speaker_id列を使用 / codec dim32")
                     )
                     return (
-                        gr.update(visible=not is_voice),
+                        gr.update(visible=not is_voice, interactive=not is_voice, value="" if is_voice else None),
                         gr.update(visible=is_voice),
                         gr.update(value=codec_repo),
                         status,
@@ -3692,23 +3708,41 @@ def build_ui() -> gr.Blocks:
                             value="自動",
                         )
                     with gr.Row():
+                        ds_speaker_field_mode = gr.Radio(
+                            label="話者ID欄の用途",
+                            choices=["speaker", "caption"],
+                            value="speaker",
+                            info="speaker=通常モード（speaker_id列） / caption=VoiceDesignモード（caption列）",
+                            scale=2,
+                        )
+                    with gr.Row():
                         ds_speaker_id = gr.Textbox(
                             label="話者ID（省略可・全ファイルに付与）",
                             value="",
                             placeholder="例: SPEAKER_A",
                             scale=2,
+                            visible=True,
                         )
                         ds_recursive_caption = gr.Checkbox(label="サブフォルダも検索", value=False, scale=1)
+                    def _on_speaker_field_mode_change(mode):
+                        is_voice_design = str(mode).strip() == "caption"
+                        return gr.update(visible=not is_voice_design)
+                    ds_speaker_field_mode.change(
+                        _on_speaker_field_mode_change,
+                        inputs=[ds_speaker_field_mode],
+                        outputs=[ds_speaker_id],
+                    )
                     ds_model_cache_dir = gr.Textbox(
                         label="Whisperモデルキャッシュフォルダ",
                         value=str(CHECKPOINTS_DIR / "whisper"),
                         info="モデルが存在しない場合は自動ダウンロードされます。空欄にするとHFデフォルト (~/.cache/huggingface/hub) に保存されます。",
                     )
 
-                with gr.Accordion("🎭 絵文字キャプション設定（オプション）", open=False):
+                with gr.Accordion("🎭 絵文字キャプション設定（オプション）", open=False) as ec_accordion:
                     gr.Markdown(
-                        "有効にすると、Whisperキャプション完了後に音響特徴量とLLMを使って"
-                        "**Irodori-TTS互換の絵文字キャプション**を自動生成します。\n\n"
+                        "Whisperキャプション完了後に音響特徴量とLLMを使って自動処理します。\n\n"
+                        "- **text列 （全モード）**: 絵文字キャプション（`EMOJI_ANNOTATIONS` ルール）\n"
+                        "- **caption列 （VoiceDesignモードのみ）**: 音声分析キャプション（`VOICE_ANALYSIS_CAPTION_RULES`・音響パラメーターのみ・読み上げ内容含まず）\n\n"
                         "> 必要ライブラリ: `pip install librosa openai`  \n"
                         "> Manifest出力設定が **CSV形式** の場合のみ動作します。"
                     )
@@ -3717,7 +3751,7 @@ def build_ui() -> gr.Blocks:
                             label="🎭 絵文字キャプションを有効にする",
                             value=False,
                             scale=1,
-                            info="チェックを入れると通常キャプション完了後に絵文字キャプションを続けて実行します。",
+                            info="チェックを入れるとWhisperキャプション完了後に続けて実行します。",
                         )
                         ec_api = gr.Dropdown(
                             label="APIプロバイダー",
@@ -3773,7 +3807,8 @@ def build_ui() -> gr.Blocks:
                         )
                     gr.Markdown(
                         "📌 **フォーマット補足**\n"
-                        "- **CSV**: `audio_path,text,speaker_id` — Excelや各種ツールで開きやすい汎用形式\n"
+                        "- **CSV（speakerモード）**: `file_name,text,speaker`\n"
+                        "- **CSV（caption/VoiceDesignモード）**: `file_name,text,caption`\n"
                         "- **JSONL**: `{\"text\":\"...\",\"audio_path\":\"...\"}` — `prepare_manifest.py` への入力前段として使用可能"
                     )
 
@@ -3818,7 +3853,10 @@ def build_ui() -> gr.Blocks:
                 def _on_mode_change(mode):
                     show_slice   = mode in ("スライスのみ", "パイプライン（スライス→キャプション）")
                     show_caption = mode in ("キャプションのみ", "パイプライン（スライス→キャプション）")
-                    return gr.update(open=show_slice), gr.update(open=show_caption)
+                    return (
+                        gr.update(visible=show_slice, open=show_slice),
+                        gr.update(visible=show_caption, open=show_caption),
+                    )
 
                 ds_mode.change(
                     _on_mode_change, inputs=[ds_mode],
@@ -3831,6 +3869,7 @@ def build_ui() -> gr.Blocks:
                     ds_target_sr_enabled, ds_target_sr, ds_recursive_slice,
                     ds_caption_input, ds_manifest_output_dir, ds_manifest_filename,
                     ds_output_format, ds_whisper_model, ds_language, ds_speaker_id,
+                    ds_speaker_field_mode,
                     ds_recursive_caption, ds_device, ds_model_cache_dir,
                 ]
 
@@ -3851,10 +3890,16 @@ def build_ui() -> gr.Blocks:
                     ec_api_     = str(args[-2])
                     ec_api_key_ = str(args[-1]).strip()
 
+                    # args[18] = ds_speaker_field_mode（_ds_all_inputs の順序に対応）
+                    speaker_field_mode_ = str(args[18]).strip()
+                    is_voice_design_    = speaker_field_mode_ == "caption"
+
                     status, cmd = _start_dataset_job(*base_args)
 
                     if ec_enabled_:
-                        output_fmt    = str(args[14]).strip()
+                        # 絵文字キャプション（text列）は両モードで実行
+                        # 音声分析キャプション（caption列）はVoiceDesignモード時のみ実行
+                        output_fmt = str(args[14]).strip()
                         if output_fmt != "CSV":
                             status += "\n⚠️ 絵文字キャプションはCSV形式のみ対応です。出力形式をCSVに変更してください。"
                         else:
@@ -3864,7 +3909,9 @@ def build_ui() -> gr.Blocks:
                             mode_         = str(args[0])
                             wav_dir_      = str(args[11]).strip() if mode_ == "キャプションのみ" else str(args[2]).strip()
 
-                            def _wait_and_emoji(csv_path=csv_path, wav_dir_=wav_dir_, ec_api_=ec_api_, ec_api_key_=ec_api_key_):
+                            def _wait_and_emoji(csv_path=csv_path, wav_dir_=wav_dir_,
+                                                ec_api_=ec_api_, ec_api_key_=ec_api_key_,
+                                                vd=is_voice_design_):
                                 while True:
                                     with _DS_LOG_LOCK:
                                         proc = _DS_PROC
@@ -3874,10 +3921,13 @@ def build_ui() -> gr.Blocks:
                                 with _DS_LOG_LOCK:
                                     rc = _DS_PROC.returncode if _DS_PROC else -1
                                 if rc == 0:
-                                    _run_emoji_caption_inline(csv_path, wav_dir_, ec_api_, ec_api_key_)
+                                    _run_emoji_caption_inline(csv_path, wav_dir_, ec_api_, ec_api_key_, voice_design=vd)
 
                             threading.Thread(target=_wait_and_emoji, daemon=True).start()
-                            status += f"\n🎭 絵文字キャプション: 通常処理完了後に自動実行します（API: {ec_api_}）"
+                            if is_voice_design_:
+                                status += f"\n🎭 絵文字キャプション（text列）＋音声分析キャプション（caption列）: 完了後に自動実行します（API: {ec_api_}）"
+                            else:
+                                status += f"\n🎭 絵文字キャプション（text列のみ）: 完了後に自動実行します（API: {ec_api_}）\n   ※ speaker列はそのまま維持されます。"
 
                     return status, cmd
 
