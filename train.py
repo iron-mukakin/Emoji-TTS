@@ -1331,7 +1331,6 @@ def main() -> None:
     full_dataset = LatentTextDataset(
         manifest_path=train_cfg.manifest_path,
         latent_dim=model_cfg.latent_dim,
-        latent_patch_size=model_cfg.latent_patch_size,
         max_latent_steps=train_cfg.max_latent_steps,
     )
     train_dataset = full_dataset
@@ -1345,14 +1344,12 @@ def main() -> None:
         train_dataset = LatentTextDataset(
             manifest_path=train_cfg.manifest_path,
             latent_dim=model_cfg.latent_dim,
-            latent_patch_size=model_cfg.latent_patch_size,
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=train_indices,
         )
         valid_dataset = LatentTextDataset(
             manifest_path=train_cfg.manifest_path,
             latent_dim=model_cfg.latent_dim,
-            latent_patch_size=model_cfg.latent_patch_size,
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=valid_indices,
         )
@@ -1368,6 +1365,7 @@ def main() -> None:
         )
     collator = TTSCollator(
         tokenizer=tokenizer,
+        caption_tokenizer=None,
         latent_dim=model_cfg.latent_dim,
         latent_patch_size=model_cfg.latent_patch_size,
         fixed_target_latent_steps=train_cfg.fixed_target_latent_steps,

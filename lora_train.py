@@ -440,7 +440,6 @@ def main() -> None:
     full_dataset = LatentTextDataset(
         manifest_path=args.manifest,
         latent_dim=model_cfg.latent_dim,
-        latent_patch_size=model_cfg.latent_patch_size,
         max_latent_steps=args.max_latent_steps,
     )
 
@@ -455,14 +454,12 @@ def main() -> None:
         train_dataset = LatentTextDataset(
             manifest_path=args.manifest,
             latent_dim=model_cfg.latent_dim,
-            latent_patch_size=model_cfg.latent_patch_size,
             max_latent_steps=args.max_latent_steps,
             subset_indices=train_indices,
         )
         valid_dataset = LatentTextDataset(
             manifest_path=args.manifest,
             latent_dim=model_cfg.latent_dim,
-            latent_patch_size=model_cfg.latent_patch_size,
             max_latent_steps=args.max_latent_steps,
             subset_indices=valid_indices,
         )
@@ -470,6 +467,7 @@ def main() -> None:
 
     collator = TTSCollator(
         tokenizer=tokenizer,
+        caption_tokenizer=None,
         latent_dim=model_cfg.latent_dim,
         latent_patch_size=model_cfg.latent_patch_size,
         fixed_target_latent_steps=args.fixed_target_latent_steps,
