@@ -65,7 +65,7 @@ CONFIGS_DIR      = BASE_DIR / "configs"
 LOGS_DIR         = BASE_DIR / "logs"
 OUTPUTS_DIR      = BASE_DIR / "gradio_outputs"
 LORA_DIR         = BASE_DIR / "lora"
-DEFAULT_HF_REPO  = "Aratako/Irodori-TTS-500M-v2"
+DEFAULT_HF_REPO  = "Aratako/Irodori-TTS-500M-v3"
 DEFAULT_CONFIG   = "train_v2.yaml"
 DEFAULT_PREPARE_CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 PREPARE_CODEC_REPO_CHOICES = [
@@ -201,7 +201,7 @@ def _run_create_speaker(
         return f"エラー: チェックポイントパスが無効です。\n{e}"
 
     _codec_fields = ("checkpoint", "model_device", "codec_repo", "model_precision",
-                     "codec_device", "codec_precision", "enable_watermark")
+                     "codec_device", "codec_precision")
     _mismatch = [
         f for f in _codec_fields
         if getattr(_cached_key, f, None) != getattr(runtime_key, f, None)
@@ -669,6 +669,10 @@ def _load_model(checkpoint, model_device, model_precision, codec_device, codec_p
         version_label, codec_repo_used, ldim = info
         version_str = f"\nモデルバージョン: {version_label} (latent_dim={ldim})"
         auto_codec_repo = codec_repo_used
+    else:
+        ldim = None
+
+    watermark_backend = "SilentCipher" if ldim == 32 else "DACVAE"
 
     lora_info = f"\nLoRAアダプタ: {runtime_key.lora_path}" if runtime_key.lora_path else ""
     voice_design_enabled = _runtime_uses_voice_design()
@@ -680,6 +684,7 @@ def _load_model(checkpoint, model_device, model_precision, codec_device, codec_p
         f"model_device: {runtime_key.model_device} / {runtime_key.model_precision}\n"
         f"codec_device: {runtime_key.codec_device} / {runtime_key.codec_precision}\n"
         f"codec_repo: {auto_codec_repo}"
+        f"\nwatermark: {watermark_backend} {'enabled' if runtime_key.enable_watermark else 'disabled'}"
         f"{vd_line}"
         f"{lora_info}"
     )
@@ -797,10 +802,11 @@ def _run_generation(
 
     # ── 共通のsynthesize呼び出しヘルパー ───────────────────────────
     def _synthesize_line(line_text: str, line_seed) -> object:
+        request_seconds = None if getattr(runtime.model_cfg, "use_duration_predictor", False) else FIXED_SECONDS
         return runtime.synthesize(
             SamplingRequest(
                 text=str(line_text), ref_wav=ref_wav, ref_latent=ref_latent_path, no_ref=bool(no_ref),
-                seconds=FIXED_SECONDS, max_ref_seconds=30.0, max_text_len=None,
+                seconds=request_seconds, duration_scale=1.0, max_ref_seconds=30.0, max_text_len=None,
                 caption=caption_value or None,
                 max_caption_len=max_caption_len,
                 num_steps=int(num_steps),
@@ -1047,7 +1053,7 @@ def _build_manifest_command(
 
     mode = str(prepare_mode).strip().lower()
     auto_codec_repo = str(codec_repo).strip()
-    if mode in {"model_v2", "voice_design"}:
+    if mode in {"model_v3", "model_v2", "voice_design"}:
         auto_codec_repo = "Aratako/Semantic-DACVAE-Japanese-32dim"
     elif mode == "model_v1":
         auto_codec_repo = "facebook/dacvae-watermarked"
@@ -2813,9 +2819,9 @@ def build_ui() -> gr.Blocks:
                 )
                 pm_prepare_mode = gr.Dropdown(
                     label="モード",
-                    choices=["model_v1", "model_v2", "voice_design"],
-                    value="model_v2",
-                    info="model_v1=dim128, model_v2=dim32, voice_design=dim32 + caption列",
+                    choices=["model_v3", "model_v2", "model_v1", "voice_design"],
+                    value="model_v3",
+                    info="model_v3=dim32(推奨), model_v2=dim32, model_v1=dim128, voice_design=dim32 + caption列",
                 )
 
                 with gr.Group() as pm_local_group:
@@ -2903,7 +2909,8 @@ def build_ui() -> gr.Blocks:
                         "voice_design: caption列を使用 / codec dim32"
                         if is_voice
                         else ("model_v1: speaker_id列を使用 / codec dim128" if mode_key == "model_v1"
-                              else "model_v2: speaker_id列を使用 / codec dim32")
+                              else ("model_v3: speaker_id列を使用 / codec dim32(推奨)" if mode_key == "model_v3"
+                                    else "model_v2: speaker_id列を使用 / codec dim32"))
                     )
                     return (
                         gr.update(visible=not is_voice, interactive=not is_voice, value="" if is_voice else None),

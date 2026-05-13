@@ -17,10 +17,12 @@ from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
+from .duration import build_duration_features
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
+from .watermark import SilentCipherWatermarker
 
 
 def _is_mps_available() -> bool:
@@ -147,6 +149,53 @@ def find_flattening_point(
     return total_steps
 
 
+def trim_trailing_silence(
+    audio: torch.Tensor,
+    *,
+    sample_rate: int,
+    frame_ms: float = 50.0,
+    hop_ms: float = 10.0,
+    threshold_ratio: float = 0.003,
+    min_threshold: float = 1.0e-4,
+    keep_ms: float = 160.0,
+    min_trim_ms: float = 250.0,
+) -> torch.Tensor:
+    if audio.numel() == 0:
+        return audio
+
+    if audio.ndim == 1:
+        mono = audio.detach().float().abs()
+        total_samples = int(audio.shape[0])
+    else:
+        total_samples = int(audio.shape[-1])
+        mono = audio.detach().float().abs().reshape(-1, total_samples).amax(dim=0)
+    if total_samples <= 0:
+        return audio
+
+    peak = float(mono.max().item())
+    threshold = max(float(min_threshold), peak * float(threshold_ratio))
+    frame = max(1, int(float(sample_rate) * float(frame_ms) / 1000.0))
+    hop = max(1, int(float(sample_rate) * float(hop_ms) / 1000.0))
+    keep = max(0, int(float(sample_rate) * float(keep_ms) / 1000.0))
+    min_trim = max(0, int(float(sample_rate) * float(min_trim_ms) / 1000.0))
+
+    last_active_end = total_samples
+    found_active = False
+    for start in range(0, total_samples, hop):
+        end = min(total_samples, start + frame)
+        if float(mono[start:end].mean().item()) >= threshold:
+            last_active_end = end
+            found_active = True
+
+    if not found_active:
+        return audio
+
+    cut_at = min(total_samples, last_active_end + keep)
+    if total_samples - cut_at < min_trim:
+        return audio
+    return audio[..., :cut_at].contiguous()
+
+
 @dataclass(frozen=True)
 class RuntimeKey:
     checkpoint: str
@@ -174,7 +223,10 @@ class SamplingRequest:
     ref_ensure_max: bool = True
     num_candidates: int = 1
     decode_mode: str = "sequential"
-    seconds: float = 30.0
+    seconds: float | None = None
+    duration_scale: float = 1.0
+    min_seconds: float = 0.5
+    max_seconds: float = 30.0
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
     max_caption_len: int | None = None
@@ -488,7 +540,16 @@ class InferenceRuntime:
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
+        self.silentcipher_watermarker = (
+            SilentCipherWatermarker(device=str(self.codec_device))
+            if self._uses_silentcipher_watermark
+            else None
+        )
         self._infer_lock = threading.Lock()
+
+    @property
+    def _uses_silentcipher_watermark(self) -> bool:
+        return bool(self.key.enable_watermark and self.model_cfg.latent_dim == 32)
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -600,7 +661,7 @@ class InferenceRuntime:
             dtype=codec_dtype,
             deterministic_encode=bool(key.codec_deterministic_encode),
             deterministic_decode=bool(key.codec_deterministic_decode),
-            enable_watermark=bool(key.enable_watermark),
+            enable_watermark=bool(key.enable_watermark and model_cfg.latent_dim != 32),
             local_dir=str(codec_cache_dir),
         )
         if model_cfg.latent_dim != codec.latent_dim:
@@ -702,7 +763,8 @@ class InferenceRuntime:
             ref_latent = ref_latent[:, :max_ref_latent_steps]
 
         ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
-            self.model_device
+            device=self.model_device,
+            dtype=runtime_dtype,
         )
         if ref_latent_patched.shape[1] == 0:
             raise ValueError(
@@ -730,13 +792,14 @@ class InferenceRuntime:
             (
                 "[runtime] start synthesize "
                 "model_device={} model_precision={} codec_device={} codec_precision={} "
-                "watermark={} mode={} seconds={} steps={} seed={} candidates={} decode_mode={}"
+                "watermark={} silentcipher_watermark={} mode={} seconds={} steps={} seed={} candidates={} decode_mode={}"
             ).format(
                 self.key.model_device,
                 self.key.model_precision,
                 self.key.codec_device,
                 self.key.codec_precision,
                 self.codec.enable_watermark,
+                self._uses_silentcipher_watermark,
                 req.cfg_guidance_mode,
                 req.seconds,
                 req.num_steps,
@@ -748,8 +811,20 @@ class InferenceRuntime:
         if self.key.lora_path:
             _log(f"[runtime] lora_path={self.key.lora_path} scale={req.lora_scale}")
 
-        if req.seconds <= 0:
-            raise ValueError(f"seconds must be > 0, got {req.seconds}")
+        manual_seconds = None if req.seconds is None else float(req.seconds)
+        if manual_seconds is not None and manual_seconds <= 0:
+            raise ValueError(f"seconds must be > 0 when provided, got {req.seconds}")
+        duration_scale = float(req.duration_scale)
+        if duration_scale <= 0:
+            raise ValueError(f"duration_scale must be > 0, got {duration_scale}")
+        min_seconds = float(req.min_seconds)
+        max_seconds = float(req.max_seconds)
+        if min_seconds <= 0:
+            raise ValueError(f"min_seconds must be > 0, got {min_seconds}")
+        if max_seconds < min_seconds:
+            raise ValueError(
+                f"max_seconds must be >= min_seconds, got min={min_seconds} max={max_seconds}"
+            )
         num_candidates = int(req.num_candidates)
         if num_candidates <= 0:
             raise ValueError(f"num_candidates must be > 0, got {num_candidates}")
@@ -883,20 +958,6 @@ class InferenceRuntime:
                     caption_ids = caption_ids.to(self.model_device)
                     caption_mask = caption_mask.to(self.model_device)
 
-                target_samples = int(float(req.seconds) * self.codec.sample_rate)
-                latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
-                patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
-
-                if isinstance(self.train_cfg, dict):
-                    fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-                    if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
-                        msg = (
-                            f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                            "used in training. Long-tail stability may degrade."
-                        )
-                        messages.append(msg)
-                        _log(msg)
-
                 t0 = _measure_start(self.model_device, self.codec_device)
                 msg_count_before_ref = len(messages)
                 ref_latent, ref_mask = self._load_reference_latent(
@@ -909,6 +970,93 @@ class InferenceRuntime:
                 for msg in messages[msg_count_before_ref:]:
                     _log(msg)
                 _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+                hop_length = int(self.codec.model.hop_length)
+                if manual_seconds is not None:
+                    clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
+                    if clamped_seconds != manual_seconds:
+                        msg = (
+                            f"warning: manual duration {manual_seconds:.3f}s was clamped to "
+                            f"{clamped_seconds:.3f}s."
+                        )
+                        messages.append(msg)
+                        _log(msg)
+                    target_samples = max(1, int(clamped_seconds * self.codec.sample_rate))
+                    latent_steps = math.ceil(target_samples / hop_length)
+                    msg = f"info: using manual duration {clamped_seconds:.3f}s."
+                    messages.append(msg)
+                    _log(msg)
+                elif self.model_cfg.use_duration_predictor:
+                    t0 = _measure_start(self.model_device)
+                    has_speaker_duration = torch.zeros(
+                        (num_candidates,), dtype=torch.bool, device=self.model_device
+                    )
+                    if self.model_cfg.use_speaker_condition and ref_mask is not None:
+                        has_speaker_duration = ref_mask.any(dim=1)
+                    duration_features = build_duration_features(
+                        [normalized_text] * num_candidates,
+                        token_counts=text_mask.sum(dim=1),
+                        max_text_len=text_max_len,
+                        has_speaker=has_speaker_duration,
+                    ).to(self.model_device)
+                    (
+                        duration_text_state,
+                        duration_text_mask,
+                        duration_speaker_state,
+                        duration_speaker_mask,
+                        _duration_caption_state,
+                        _duration_caption_mask,
+                    ) = self.model.encode_conditions(
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                    )
+                    pred_log_frames = self.model.predict_duration_log_frames(
+                        text_state=duration_text_state,
+                        text_mask=duration_text_mask,
+                        speaker_state=duration_speaker_state,
+                        speaker_mask=duration_speaker_mask,
+                        duration_features=duration_features,
+                        has_speaker=has_speaker_duration,
+                    )
+                    pred_frames = torch.expm1(pred_log_frames).float().mean().item()
+                    scaled_frames = pred_frames * duration_scale
+                    min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
+                    max_frames = max(1, math.floor(max_seconds * self.codec.sample_rate / hop_length))
+                    latent_steps = int(round(scaled_frames))
+                    latent_steps = max(min_frames, min(max_frames, latent_steps))
+                    target_samples = int(latent_steps * hop_length)
+                    stage_sec = _measure_end(self.model_device, t0)
+                    stage_timings.append(("predict_duration", stage_sec))
+                    msg = (
+                        f"info: predicted duration frames={pred_frames:.1f}, "
+                        f"scale={duration_scale:.3f}, using_frames={latent_steps} "
+                        f"({target_samples / float(self.codec.sample_rate):.3f}s)."
+                    )
+                    messages.append(msg)
+                    _log(msg)
+                    _log(f"[runtime] predict_duration: {stage_sec * 1000.0:.1f} ms")
+                else:
+                    fallback_seconds = 30.0
+                    target_samples = int(fallback_seconds * self.codec.sample_rate)
+                    latent_steps = math.ceil(target_samples / hop_length)
+                    msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
+                    messages.append(msg)
+                    _log(msg)
+
+                patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+                if isinstance(self.train_cfg, dict):
+                    fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+                    if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
+                        msg = (
+                            f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
+                            "used in training. Long-tail stability may degrade."
+                        )
+                        messages.append(msg)
+                        _log(msg)
 
                 t0 = _measure_start(self.model_device)
                 z_patched = sample_euler_rf_cfg(
@@ -970,7 +1118,13 @@ class InferenceRuntime:
                             )
                             if flattening_samples > 0:
                                 max_samples = min(max_samples, flattening_samples)
-                        trimmed_audios.append(audio_i[:, :max_samples])
+                        audio_i = audio_i[:, :max_samples]
+                        if bool(req.trim_tail):
+                            audio_i = trim_trailing_silence(
+                                audio_i,
+                                sample_rate=int(self.codec.sample_rate),
+                            )
+                        trimmed_audios.append(audio_i)
                 else:
                     for i in range(num_candidates):
                         audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
@@ -987,10 +1141,34 @@ class InferenceRuntime:
                             )
                             if flattening_samples > 0:
                                 max_samples = min(max_samples, flattening_samples)
-                        trimmed_audios.append(audio_i[:, :max_samples])
+                        audio_i = audio_i[:, :max_samples]
+                        if bool(req.trim_tail):
+                            audio_i = trim_trailing_silence(
+                                audio_i,
+                                sample_rate=int(self.codec.sample_rate),
+                            )
+                        trimmed_audios.append(audio_i)
                 stage_sec = _measure_end(self.model_device, t0, self.codec_device)
                 stage_timings.append(("decode_latent", stage_sec))
                 _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
+
+                if self._uses_silentcipher_watermark:
+                    if self.silentcipher_watermarker is not None and self.silentcipher_watermarker.ready:
+                        t0 = _measure_start(self.codec_device)
+                        trimmed_audios = self.silentcipher_watermarker.encode_batch(
+                            trimmed_audios,
+                            sample_rate=int(self.codec.sample_rate),
+                        )
+                        stage_sec = _measure_end(self.codec_device, t0)
+                        stage_timings.append(("silentcipher_watermark", stage_sec))
+                        _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
+                    else:
+                        msg = (
+                            "warning: SilentCipher watermark is unavailable; generated audio was not "
+                            "watermarked."
+                        )
+                        messages.append(msg)
+                        _log(msg)
 
                 total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
                 _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
@@ -1015,6 +1193,8 @@ class InferenceRuntime:
         if self.caption_tokenizer is not None:
             del self.caption_tokenizer
         del self.codec
+        if self.silentcipher_watermarker is not None:
+            del self.silentcipher_watermarker
         gc.collect()
         for device in (self.model_device, self.codec_device):
             if device.type == "cuda":
