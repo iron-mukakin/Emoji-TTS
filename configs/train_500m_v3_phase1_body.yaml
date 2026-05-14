@@ -18,39 +18,44 @@ model:
   speaker_patch_size: 1
   timestep_embed_dim: 512
   adaln_rank: 192
+  use_duration_predictor: false
+
 train:
-  batch_size: 2
-  gradient_accumulation_steps: 2
-  num_workers: 2
+  train_mode: rf
+  batch_size: 80
+  gradient_accumulation_steps: 1
+  num_workers: 16
   dataloader_persistent_workers: true
-  dataloader_prefetch_factor: 2
+  dataloader_prefetch_factor: 4
   allow_tf32: true
   compile_model: false
   precision: bf16
   optimizer: muon
   muon_momentum: 0.95
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   weight_decay: 0.01
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  adam_eps: 1.0e-08
   lr_scheduler: wsd
-  warmup_steps: 300
-  stable_steps: 2100
+  warmup_steps: 1000
+  stable_steps: 24000
   min_lr_scale: 0.01
-  max_steps: 3000
+  max_steps: 30000
   max_text_len: 256
-  text_condition_dropout: 0.15
-  speaker_condition_dropout: 0.15
+  text_condition_dropout: 0.1
+  speaker_condition_dropout: 0.1
   timestep_stratified: true
   max_latent_steps: 750
-  fixed_target_latent_steps: 750
-  fixed_target_full_mask: true
-  log_every: 10
-  save_every: 100
-  wandb_enabled: true
-  wandb_project: null
-  wandb_run_name: null
-  valid_ratio: 0.1
-  valid_every: 100
+  fixed_target_latent_steps:
+  fixed_target_full_mask: false
+  rf_loss_mode: utterance_mean
+  log_every: 100
+  save_every: 1000
+  checkpoint_best_n: 5
+  wandb_enabled: false
+  wandb_project:
+  wandb_entity:
+  wandb_run_name:
+  wandb_mode: online
+  ddp_find_unused_parameters: false
+  valid_ratio: 0.0005
+  valid_every: 1000
   seed: 0

@@ -77,7 +77,8 @@ EMOJI_ANNOTATIONS = """
 🫶 優しく・柔らかく（Gently, tenderly）
 😭 嗚咽・泣き声・悲しみ（Sobbing, crying, sorrowfully）
 😱 悲鳴・叫び・絶叫（Scream, shout, shriek）
-😪 眠そうに・気だるげに（Sleepily, languidly）
+😪 眠そうに・気だるげに（Sleepily/ languidly）
+😴 寝言、いびき（Sleep talking, snoring）
 ⏩ 早口・一気にまくしたてる（Fast-speaking, rapidly）
 📞 電話越し・スピーカー越し（Over the phone）
 🐢 ゆっくりと（Slowly）
@@ -86,6 +87,7 @@ EMOJI_ANNOTATIONS = """
 😒 舌打ち（Tutting, clicking tongue）
 😰 慌てて・動揺・緊張・どもり（Panicked, nervous, stuttering）
 😆 喜びながら（Joyfully, happily）
+💥 勢いよく、勢いに任せて（With force,momentum, forcefully）
 😠 怒り・不満げに・拗ねながら（Angry, displeased, sulking）
 😲 驚き・感嘆（Surprise, awe）
 🥱 あくび（Yawn）
@@ -94,6 +96,7 @@ EMOJI_ANNOTATIONS = """
 🫣 恥ずかしそうに・照れながら（Shyly, bashfully）
 🙄 呆れたように（Exasperatedly）
 😊 楽しげに・嬉しそうに（Cheerfully, gladly）
+😎 得意げに、自信ありげに（Confidently, proudly）
 👌 相槌・頷く音（Backchanneling, agreement）
 🙏 懇願するように（Pleadingly, begging）
 🥴 酔っ払って（Drunkenly）
@@ -101,6 +104,9 @@ EMOJI_ANNOTATIONS = """
 🤐 口を塞がれて（Muffled）
 😌 安堵・満足げに（Relieved, contentedly）
 🤔 疑問の声（Questioning voice）
+💪 力を込めて、力強く（With effort, strongly）
+👃 匂いを嗅ぐ音（Sniffing / smelling sound）
+📖 ナレーション、独白、モノローグ（Narration, monologue）
 
 【音響特徴量の読み方】
 - pitch_mean_hz: 平均ピッチ。高い(>250Hz)=高音・明るい・興奮、低い(<150Hz)=低音・落ち着き・怒り

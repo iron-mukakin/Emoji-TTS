@@ -7,9 +7,7 @@ peft ライブラリを使用し、操作面・引数仕様を train.py に最�
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import math
 import os
 import random
 import re
@@ -20,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from irodori_tts.config import (
@@ -30,6 +29,7 @@ from irodori_tts.config import (
     merge_dataclass_overrides,
 )
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
+from irodori_tts.duration import set_duration_has_speaker_feature
 from irodori_tts.model import TextToLatentRFDiT
 from irodori_tts.optim import build_optimizer_extended, build_scheduler, current_lr
 from irodori_tts.progress import TrainProgress
@@ -46,12 +46,14 @@ from train import (
     EMAModel,
     EarlyStopping,
     SAFETENSORS_CONFIG_META_KEY,
+    SAFETENSORS_INFERENCE_CONFIG_KEYS,
     _check_model_config_compatibility,
     _load_model_state_from_checkpoint,
     apply_attention_backend,
     apply_gradient_checkpointing,
     build_text_tokenizer,
     cli_provided,
+    compute_rf_loss,
     echo_style_masked_mse,
     enforce_periodic_checkpoint_limit,
     list_best_val_loss_checkpoints,
@@ -81,11 +83,15 @@ EXTENDED_TARGET_MODULES = [
     "w1", "w2", "w3",               # SwiGLU MLP
 ]
 
+LORA_TRAINER_STATE_NAME = "trainer_state.pt"
+LORA_METADATA_NAME = "irodori_lora_metadata.json"
+
+# フォーク版独自のチェックポイント名パターン（resume互換用）
 LORA_CHECKPOINT_STEP_RE = re.compile(r"^lora_checkpoint_(\d+)_(ema|full)$")
 
 
 # ---------------------------------------------------------------------------
-# LoRA チェックポイント保存
+# LoRA チェックポイント保存（本家互換形式）
 # ---------------------------------------------------------------------------
 
 def save_lora_checkpoint(
@@ -101,73 +107,61 @@ def save_lora_checkpoint(
     ema_model: EMAModel | None = None,
     save_full: bool = False,
 ) -> None:
-    """LoRAチェックポイントを保存する。
+    """LoRAチェックポイントを本家互換形式で保存する。
 
-    保存方針:
+    保存形式:
     - EMAが有効な場合:
-        lora_checkpoint_XXXXXXX_ema/ ... EMA版（推論用）常に保存
-        lora_checkpoint_XXXXXXX_full/ ... フル版（再開用）--save-full時のみ
+        lora_checkpoint_XXXXXXX_ema/  ... EMA版（推論用）: adapter_config.json + adapter_model.safetensors
+        lora_checkpoint_XXXXXXX_full/ ... フル版（再開用、--save-full時）: 上記 + trainer_state.pt + lora_metadata.json
     - EMAが無効な場合:
-        lora_checkpoint_XXXXXXX_ema/ ... 生重みを EMA版フォルダに保存
-    """
-    from safetensors.torch import save_file as save_safetensors
+        lora_checkpoint_XXXXXXX_ema/ ... 生重みをEMA版フォルダに保存（同形式）
 
+    trainer_state.pt / lora_metadata.json は本家 ori_train.py の形式に準拠。
+    """
     ema_dir = output_dir / f"lora_checkpoint_{step:07d}_ema"
     ema_dir.mkdir(parents=True, exist_ok=True)
 
-    # adapter_config.json は peft が自動生成するが、手動でコピーしておく
-    # EMA版: EMA重みで adapter_model.safetensors を保存
     if ema_model is not None:
-        # EMA適用してアダプタ重みを取得
         ema_model.apply_shadow(model)
         _save_lora_adapter_safetensors(model, ema_dir)
         ema_model.restore(model)
     else:
         _save_lora_adapter_safetensors(model, ema_dir)
 
-    # フル版保存 (EMA + optimizer + scheduler + ema_shadow)
     if save_full:
         full_dir = output_dir / f"lora_checkpoint_{step:07d}_full"
         full_dir.mkdir(parents=True, exist_ok=True)
 
-        # 生重みで adapter_model.safetensors を保存
+        # 生重みで adapter 保存
         _save_lora_adapter_safetensors(model, full_dir)
 
-        # optimizer / scheduler
-        torch.save(optimizer.state_dict(), full_dir / "optimizer.pt")
-        if scheduler is not None:
-            torch.save(scheduler.state_dict(), full_dir / "scheduler.pt")
+        # 本家互換: trainer_state.pt
+        torch.save(
+            {
+                "step": step,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": None if scheduler is None else scheduler.state_dict(),
+                "model_config": base_model_cfg,
+                "train_config": lora_cfg_dict,
+                "base_init": {"mode": "checkpoint", "checkpoint_path": base_model_path},
+                # フォーク拡張フィールド
+                "ema_decay": ema_model.decay if ema_model is not None else None,
+            },
+            full_dir / LORA_TRAINER_STATE_NAME,
+        )
 
-        # EMA shadow重みを独立保存（JSON肥大化防止）
+        # 本家互換: lora_metadata.json
+        (full_dir / LORA_METADATA_NAME).write_text(
+            json.dumps(
+                {"base_init": {"mode": "checkpoint", "checkpoint_path": base_model_path}},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        # EMA shadow 重みを独立保存（フォーク拡張）
         if ema_model is not None:
             torch.save(ema_model.shadow, full_dir / "ema_shadow.pt")
-
-        # train_state.json
-        import hashlib
-        base_sha256 = ""
-        try:
-            bp = Path(base_model_path)
-            if bp.is_file():
-                h = hashlib.sha256()
-                with open(bp, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                base_sha256 = h.hexdigest()
-        except Exception:
-            pass
-
-        train_state = {
-            "step": step,
-            "base_model_path": base_model_path,
-            "base_model_sha256": base_sha256,
-            "base_model_config": base_model_cfg,
-            "lora_config": lora_cfg_dict,
-            "train_config": asdict(train_cfg),
-            "ema_decay": ema_model.decay if ema_model is not None else None,
-        }
-        (full_dir / "train_state.json").write_text(
-            json.dumps(train_state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
 
 
 def _save_lora_adapter_safetensors(model, out_dir: Path) -> None:
@@ -231,7 +225,7 @@ def _load_base_model(base_model_path: str, device: torch.device) -> tuple[TextTo
         raise FileNotFoundError(f"Base model not found: {base_model_path}")
 
     # train.py の共通関数でモデル重みと設定を読み込む
-    model_state, checkpoint_model_cfg = _load_model_state_from_checkpoint(p)
+    model_state, checkpoint_model_cfg, _ = _load_model_state_from_checkpoint(p)
 
     if checkpoint_model_cfg is None:
         raise ValueError(
@@ -240,10 +234,9 @@ def _load_base_model(base_model_path: str, device: torch.device) -> tuple[TextTo
             f".pt files require 'model_config' key: {p}"
         )
 
-    # inference config keys を除外してモデル設定を取得
-    _INF_KEYS = {"max_text_len", "fixed_target_latent_steps"}
-    model_cfg_dict = {k: v for k, v in checkpoint_model_cfg.items() if k not in _INF_KEYS}
-    model_cfg = ModelConfig(**model_cfg_dict)
+    # SAFETENSORS_INFERENCE_CONFIG_KEYS (train.py と共有) を除外してモデル設定を取得
+    model_cfg_dict = {k: v for k, v in checkpoint_model_cfg.items() if k not in SAFETENSORS_INFERENCE_CONFIG_KEYS}
+    model_cfg = ModelConfig(**{k: v for k, v in model_cfg_dict.items() if hasattr(ModelConfig, k) or k in ModelConfig.__dataclass_fields__})
 
     model = TextToLatentRFDiT(model_cfg).to(device)
     missing, unexpected = model.load_state_dict(model_state, strict=False)
@@ -317,6 +310,7 @@ def main() -> None:
     parser.add_argument("--grad-checkpoint", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--text-condition-dropout", type=float, default=0.1)
+    parser.add_argument("--caption-condition-dropout", type=float, default=0.1)
     parser.add_argument("--speaker-condition-dropout", type=float, default=0.1)
     parser.add_argument("--timestep-stratified", action="store_true")
     parser.add_argument("--max-latent-steps", type=int, default=750)
@@ -331,6 +325,8 @@ def main() -> None:
     parser.add_argument("--lion-beta2", type=float, default=0.99)
     parser.add_argument("--ademamix-alpha", type=float, default=5.0)
     parser.add_argument("--ademamix-beta3", type=float, default=0.9999)
+    parser.add_argument("--metrics-log-dir", default=None,
+                        help="メトリクスログ(metrics_log.jsonl)の出力先ディレクトリ (デフォルト: <output_dir>/logs)。")
 
     args = parser.parse_args()
 
@@ -376,6 +372,15 @@ def main() -> None:
     if args.grad_checkpoint:
         apply_gradient_checkpointing(raw_model)
 
+    # v3モデル判定
+    use_caption = bool(getattr(model_cfg, "use_caption_condition", False))
+    use_duration = bool(getattr(model_cfg, "use_duration_predictor", False))
+    use_speaker = bool(getattr(model_cfg, "use_speaker_condition", True))
+    if use_caption:
+        print(f"v3 caption conditioning enabled: {model_cfg.caption_tokenizer_repo_resolved}")
+    if use_duration:
+        print("v3 duration predictor enabled.")
+
     # ── LoRA 設定 ──────────────────────────────────────────────────
     try:
         from peft import LoraConfig, get_peft_model, PeftModel
@@ -397,24 +402,31 @@ def main() -> None:
     scheduler_state = None
 
     if args.resume_lora:
-        # _full フォルダから Resume
+        # _full フォルダから Resume（本家互換: trainer_state.pt 優先、次に train_state.json）
         resume_dir = Path(args.resume_lora)
         print(f"LoRA Resume: {resume_dir}")
         model = PeftModel.from_pretrained(raw_model, str(resume_dir), is_trainable=True)
 
-        train_state_path = resume_dir / "train_state.json"
-        if train_state_path.exists():
-            train_state = json.loads(train_state_path.read_text(encoding="utf-8"))
+        trainer_state_path = resume_dir / LORA_TRAINER_STATE_NAME
+        legacy_state_path = resume_dir / "train_state.json"
+        if trainer_state_path.exists():
+            # 本家互換形式
+            train_state = torch.load(str(trainer_state_path), map_location="cpu", weights_only=True)
             step = int(train_state.get("step", 0))
-            print(f"Resume: step={step} を復元")
-
-        opt_path = resume_dir / "optimizer.pt"
-        if opt_path.exists():
-            optimizer_state = torch.load(str(opt_path), map_location="cpu", weights_only=True)
-
-        sched_path = resume_dir / "scheduler.pt"
-        if sched_path.exists():
-            scheduler_state = torch.load(str(sched_path), map_location="cpu", weights_only=True)
+            optimizer_state = train_state.get("optimizer")
+            scheduler_state = train_state.get("scheduler")
+            print(f"Resume (trainer_state.pt): step={step} を復元")
+        elif legacy_state_path.exists():
+            # フォーク旧形式フォールバック
+            train_state = json.loads(legacy_state_path.read_text(encoding="utf-8"))
+            step = int(train_state.get("step", 0))
+            opt_path = resume_dir / "optimizer.pt"
+            if opt_path.exists():
+                optimizer_state = torch.load(str(opt_path), map_location="cpu", weights_only=True)
+            sched_path = resume_dir / "scheduler.pt"
+            if sched_path.exists():
+                scheduler_state = torch.load(str(sched_path), map_location="cpu", weights_only=True)
+            print(f"Resume (train_state.json legacy): step={step} を復元")
     else:
         # 新規LoRA学習
         lora_config = LoraConfig(
@@ -436,11 +448,23 @@ def main() -> None:
     _HF_TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tokenizer = build_text_tokenizer(model_cfg, local_files_only=False)
 
+    caption_tokenizer = None
+    if use_caption:
+        from irodori_tts.tokenizer import PretrainedTextTokenizer as _PT
+        caption_tokenizer = _PT.from_pretrained(
+            repo_id=model_cfg.caption_tokenizer_repo_resolved,
+            add_bos=model_cfg.caption_add_bos_resolved,
+            local_files_only=False,
+        )
+        print(f"Caption tokenizer loaded: {model_cfg.caption_tokenizer_repo_resolved} vocab={caption_tokenizer.vocab_size}")
+
     # ── データセット ────────────────────────────────────────────────
     full_dataset = LatentTextDataset(
         manifest_path=args.manifest,
         latent_dim=model_cfg.latent_dim,
         max_latent_steps=args.max_latent_steps,
+        enable_caption_condition=use_caption,
+        enable_speaker_condition=use_speaker,
     )
 
     train_dataset = full_dataset
@@ -456,23 +480,30 @@ def main() -> None:
             latent_dim=model_cfg.latent_dim,
             max_latent_steps=args.max_latent_steps,
             subset_indices=train_indices,
+            enable_caption_condition=use_caption,
+            enable_speaker_condition=use_speaker,
+            manifest_index=full_dataset.manifest_index,
         )
         valid_dataset = LatentTextDataset(
             manifest_path=args.manifest,
             latent_dim=model_cfg.latent_dim,
             max_latent_steps=args.max_latent_steps,
             subset_indices=valid_indices,
+            enable_caption_condition=use_caption,
+            enable_speaker_condition=use_speaker,
+            manifest_index=full_dataset.manifest_index,
         )
         print(f"バリデーション分割: train={len(train_dataset)} valid={len(valid_dataset)}")
 
     collator = TTSCollator(
         tokenizer=tokenizer,
-        caption_tokenizer=None,
+        caption_tokenizer=caption_tokenizer,
         latent_dim=model_cfg.latent_dim,
         latent_patch_size=model_cfg.latent_patch_size,
         fixed_target_latent_steps=args.fixed_target_latent_steps,
         fixed_target_full_mask=args.fixed_target_full_mask,
         max_text_len=args.max_text_len,
+        max_caption_len=args.max_text_len,
     )
 
     drop_last = len(train_dataset) >= args.batch_size
@@ -527,6 +558,7 @@ def main() -> None:
         valid_every=args.valid_every,
         seed=args.seed,
         text_condition_dropout=args.text_condition_dropout,
+        caption_condition_dropout=args.caption_condition_dropout,
         speaker_condition_dropout=args.speaker_condition_dropout,
         timestep_stratified=args.timestep_stratified,
         max_latent_steps=args.max_latent_steps,
@@ -585,7 +617,7 @@ def main() -> None:
 
         ema_model = LoRAEMAModel(model, decay=args.ema_decay)
 
-        # Resume時にema_shadow.ptがあれば復元
+        # Resume時にema_shadow.ptがあれば復元（フォーク拡張フィールド）
         if args.resume_lora:
             shadow_path = Path(args.resume_lora) / "ema_shadow.pt"
             if shadow_path.exists():
@@ -628,6 +660,17 @@ def main() -> None:
         except ImportError as exc:
             raise RuntimeError("wandb が未インストールです。`pip install wandb` を実行してください。") from exc
 
+    # ── ローカルメトリクスログ ────────────────────────────────────
+    _metrics_log_file = None
+    if args.metrics_log_dir is not None:
+        _metrics_log_dir = Path(args.metrics_log_dir)
+    else:
+        _metrics_log_dir = output_dir / "logs"
+    _metrics_log_dir.mkdir(parents=True, exist_ok=True)
+    _metrics_log_path = _metrics_log_dir / "metrics_log.jsonl"
+    _metrics_log_file = open(_metrics_log_path, "a", encoding="utf-8", buffering=1)
+    print(f"ローカルメトリクスログ有効: {_metrics_log_path}")
+
     # ── 学習ループ ─────────────────────────────────────────────────
     accum_steps = args.gradient_accumulation_steps
     clip_grad_norm = args.clip_grad_norm
@@ -658,14 +701,35 @@ def main() -> None:
 
                 text_ids = batch["text_ids"].to(device, non_blocking=True)
                 text_mask = batch["text_mask"].to(device, non_blocking=True)
+
+                # v3: caption conditioning
+                caption_ids = None
+                caption_mask = None
+                has_caption = None
+                if use_caption:
+                    caption_ids = batch["caption_ids"].to(device, non_blocking=True)
+                    caption_mask = batch["caption_mask"].to(device, non_blocking=True)
+                    has_caption = batch["has_caption"].to(device, non_blocking=True)
+
+                # v3: duration predictor
+                num_frames = batch["num_frames"].to(device, non_blocking=True)
+                duration_features = batch["duration_features"].to(device, non_blocking=True)
+
+                # speaker conditioning
+                ref_latent = None
+                ref_mask = None
+                has_speaker = None
+                if use_speaker:
+                    ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
+                    ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
+                    has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+
+                bsz = text_ids.shape[0]
+
                 x0 = batch["latent_patched"].to(device, non_blocking=True)
                 x_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
                 x_mask_valid = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
-                ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
-                ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
-                has_speaker = batch["has_speaker"].to(device, non_blocking=True)
 
-                bsz = x0.shape[0]
                 if args.timestep_stratified:
                     t = sample_stratified_logit_normal_t(
                         batch_size=bsz, device=device,
@@ -683,15 +747,30 @@ def main() -> None:
                 x_t = rf_interpolate(x0, noise, t)
                 v_target = rf_velocity_target(x0, noise)
 
+                # ── Conditioning dropout ────────────────────────────────
                 text_cond_drop = torch.rand(bsz, device=device) < args.text_condition_dropout
-                if text_cond_drop.any():
-                    text_mask = text_mask.clone()
-                    text_mask[text_cond_drop] = False
 
-                speaker_cond_drop = torch.rand(bsz, device=device) < args.speaker_condition_dropout
-                use_speaker = has_speaker & (~speaker_cond_drop)
-                ref_mask = ref_mask & use_speaker[:, None]
-                ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
+                caption_drop_for_model = None
+                if use_caption:
+                    caption_cond_drop = torch.rand(bsz, device=device) < args.caption_condition_dropout
+                    use_cap = has_caption & (~caption_cond_drop)
+                    caption_drop_for_model = ~use_cap
+                    if not use_duration:
+                        caption_mask = caption_mask & use_cap[:, None]
+
+                speaker_drop_for_model = None
+                duration_has_speaker = None
+                if use_speaker:
+                    speaker_cond_drop = torch.rand(bsz, device=device) < args.speaker_condition_dropout
+                    use_sp = has_speaker & (~speaker_cond_drop)
+                    speaker_drop_for_model = ~use_sp
+                    duration_speaker_drop = torch.rand(bsz, device=device) < train_cfg.duration_speaker_dropout
+                    duration_has_speaker = has_speaker & (~duration_speaker_drop)
+                    duration_features = set_duration_has_speaker_feature(duration_features, duration_has_speaker)
+                    if not use_duration:
+                        # v2以前: 手動マスク
+                        ref_mask = ref_mask & use_sp[:, None]
+                        ref_latent = ref_latent * use_sp[:, None, None].to(ref_latent.dtype)
 
                 should_step = (accum_micro_steps % accum_steps) == 0
 
@@ -699,18 +778,47 @@ def main() -> None:
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if use_bf16 else nullcontext()
                 ):
-                    v_pred = model(
-                        x_t=x_t, t=t,
-                        text_input_ids=text_ids, text_mask=text_mask,
-                        ref_latent=ref_latent, ref_mask=ref_mask,
-                        latent_mask=x_mask,
-                    )
+                    if use_duration:
+                        # v3: duration predictor あり
+                        v_pred, duration_pred = model(
+                            x_t=x_t, t=t,
+                            text_input_ids=text_ids, text_mask=text_mask,
+                            ref_latent=ref_latent, ref_mask=ref_mask,
+                            caption_input_ids=caption_ids, caption_mask=caption_mask,
+                            latent_mask=x_mask,
+                            text_condition_dropout=text_cond_drop,
+                            speaker_condition_dropout=speaker_drop_for_model,
+                            caption_condition_dropout=caption_drop_for_model,
+                            duration_features=duration_features,
+                            duration_has_speaker=duration_has_speaker,
+                        )
+                    else:
+                        # v1/v2: duration predictor なし
+                        v_pred = model(
+                            x_t=x_t, t=t,
+                            text_input_ids=text_ids, text_mask=text_mask,
+                            ref_latent=ref_latent, ref_mask=ref_mask,
+                            caption_input_ids=caption_ids, caption_mask=caption_mask,
+                            latent_mask=x_mask,
+                        )
+                        duration_pred = None
 
                 v_pred = v_pred.float()
-                loss = echo_style_masked_mse(
-                    v_pred, v_target.float(),
+                rf_loss = compute_rf_loss(
+                    pred=v_pred, target=v_target.float(),
                     loss_mask=x_mask, valid_mask=x_mask_valid,
+                    mode=train_cfg.rf_loss_mode,
                 )
+
+                duration_loss = torch.zeros((), device=device, dtype=torch.float32)
+                if use_duration and duration_pred is not None:
+                    duration_target = torch.log1p(num_frames.float())
+                    duration_loss = F.huber_loss(
+                        duration_pred.float(), duration_target,
+                        delta=float(train_cfg.duration_huber_delta), reduction="mean",
+                    )
+
+                loss = rf_loss + float(train_cfg.duration_loss_weight) * duration_loss
                 (loss / float(accum_steps)).backward()
                 accum_loss += loss.detach()
 
@@ -762,6 +870,9 @@ def main() -> None:
                         print(f"step={step} loss={step_loss:.6f} lr={lr_val:.3e}")
                     if wandb_run is not None:
                         wandb_run.log({"train/loss": step_loss, "train/lr": lr_val}, step=step)
+                    if _metrics_log_file is not None:
+                        _wmetrics = {"type": "train", "step": step, "loss": step_loss, "lr": lr_val}
+                        _metrics_log_file.write(json.dumps(_wmetrics) + "\n")
 
                 if step % args.save_every == 0:
                     print(f"チェックポイント保存中 (step={step})...")
@@ -785,6 +896,9 @@ def main() -> None:
                     print(f"valid step={step} loss={v_loss:.6f}")
                     if wandb_run is not None:
                         wandb_run.log({"valid/loss": v_loss}, step=step)
+                    if _metrics_log_file is not None:
+                        _vmetrics = {"type": "valid", "step": step, "loss": v_loss, "rf_loss": valid_metrics["rf_loss"]}
+                        _metrics_log_file.write(json.dumps(_vmetrics) + "\n")
 
                     # ベストval保存
                     best_dir = save_lora_best_val(output_dir, model, ema_model, step, v_loss)
@@ -811,6 +925,9 @@ def main() -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+        if _metrics_log_file is not None:
+            _metrics_log_file.close()
+            _metrics_log_file = None
 
         # DataLoaderワーカーを先にシャットダウン（SIGINTで中断した際のpickleエラー抑制）
         for _dl in [loader, valid_loader]:

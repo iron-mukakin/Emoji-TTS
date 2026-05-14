@@ -11,6 +11,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from .codec import patchify_latent
+from .duration import build_duration_features
 from .tokenizer import PretrainedTextTokenizer
 
 
@@ -162,6 +163,8 @@ class LatentTextDataset(Dataset):
         else:
             ref_item = self._read_item(ref_index)
             ref_latent = self._load_latent(ref_item["latent_path"])
+        manifest_num_frames = int(item.get("num_frames", latent.shape[0]))
+        num_frames = min(manifest_num_frames, int(latent.shape[0]))
         return {
             "text": item["text"],
             "caption": str(item.get(self.caption_key, "")) if self.enable_caption_condition else "",
@@ -169,6 +172,7 @@ class LatentTextDataset(Dataset):
             if self.enable_caption_condition
             else False,
             "latent": latent,
+            "num_frames": num_frames,
             "ref_latent": ref_latent,
             "has_speaker": has_speaker,
         }
@@ -257,6 +261,7 @@ class TTSCollator:
         bsz = len(latents)
 
         text_ids, text_mask = self.tokenizer.batch_encode(texts, max_length=self.max_text_len)
+        token_counts = text_mask.sum(dim=1)
         caption_ids = None
         caption_mask = None
         if self.caption_tokenizer is not None:
@@ -317,6 +322,13 @@ class TTSCollator:
         out = {
             "text_ids": text_ids,
             "text_mask": text_mask,
+            "num_frames": torch.tensor([int(x["num_frames"]) for x in batch], dtype=torch.long),
+            "duration_features": build_duration_features(
+                texts,
+                token_counts=token_counts,
+                max_text_len=self.max_text_len,
+                has_speaker=has_speaker,
+            ),
             "latent": latent_batch,
             "latent_mask": latent_mask,
             "latent_mask_valid": latent_mask_valid,

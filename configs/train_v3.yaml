@@ -1,3 +1,24 @@
+model:
+  latent_dim: 32
+  latent_patch_size: 1
+  text_vocab_size: 99574
+  text_tokenizer_repo: llm-jp/llm-jp-3-150m
+  model_dim: 1280
+  num_layers: 12
+  num_heads: 20
+  mlp_ratio: 2.875
+  text_mlp_ratio: 2.6
+  speaker_mlp_ratio: 2.6
+  text_dim: 512
+  text_layers: 10
+  text_heads: 8
+  speaker_dim: 768
+  speaker_layers: 8
+  speaker_heads: 12
+  speaker_patch_size: 1
+  timestep_embed_dim: 512
+  adaln_rank: 192
+
 train:
   batch_size: 2
   gradient_accumulation_steps: 2
@@ -28,7 +49,7 @@ train:
   fixed_target_full_mask: true
   log_every: 10
   save_every: 100
-  wandb_enabled: true
+  wandb_enabled: false
   wandb_project: null
   wandb_run_name: null
   valid_ratio: 0.1

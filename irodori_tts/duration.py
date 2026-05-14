@@ -165,3 +165,18 @@ def build_duration_features(
         )
 
     return torch.tensor(rows, dtype=torch.float32)
+
+
+def set_duration_has_speaker_feature(
+    features: torch.Tensor,
+    has_speaker: torch.Tensor,
+) -> torch.Tensor:
+    if features.ndim != 2:
+        raise ValueError(f"Expected duration features shape (B, D), got {tuple(features.shape)}")
+    if features.shape[1] <= 0:
+        raise ValueError(
+            f"duration features must have at least one column, got {features.shape[1]}"
+        )
+    out = features.clone()
+    out[:, -1] = has_speaker.to(device=features.device, dtype=features.dtype)
+    return out

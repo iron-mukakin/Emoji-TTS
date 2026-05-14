@@ -111,7 +111,9 @@ def _scan_configs() -> list[str]:
 
 
 def _scan_manifests() -> list[str]:
-    return sorted(str(p) for p in BASE_DIR.glob("**/*.jsonl"))
+    _manifest_dir = BASE_DIR / "my_manifest"
+    _manifest_dir.mkdir(parents=True, exist_ok=True)
+    return sorted(str(p) for p in _manifest_dir.glob("*.jsonl"))
 
 
 def _scan_train_checkpoints() -> list[str]:
@@ -1264,6 +1266,7 @@ def _build_train_command(
         "--config", str(config_path),
         "--manifest", str(manifest),
         "--output-dir", str(output_dir),
+        "--metrics-log-dir", str(LOGS_DIR),
     ]
     if use_early_stopping:
         cmd += ["--early-stopping",
@@ -1439,41 +1442,83 @@ def _read_train_log() -> str:
 
 def _parse_train_log_metrics():
     if not _PANDAS_AVAILABLE:
-        return None
+        return None, None
     with _TRAIN_LOG_LOCK:
         path = _TRAIN_LOG_PATH
+
+    _empty_train = pd.DataFrame({"step": [], "loss": [], "rf_loss": [], "lr": []})
+    _empty_valid = pd.DataFrame({"step": [], "loss": [], "rf_loss": []})
+
     if path is None or not path.exists():
-        return pd.DataFrame({"step": [], "loss": [], "lr": []})
+        return _empty_train, _empty_valid
 
     import re as _re_metrics
-    # 各フィールドを個別に正規表現で抽出（speed= や eta= が混在しても壊れない）
     _RE_STEP = _re_metrics.compile(r"\bstep=(\d+)")
     _RE_LOSS = _re_metrics.compile(r"\bloss=([0-9.eE+\-]+)")
+    _RE_RF   = _re_metrics.compile(r"\brf=([0-9.eE+\-]+)")
+    _RE_DUR  = _re_metrics.compile(r"\bdur=([0-9.eE+\-]+)")
     _RE_LR   = _re_metrics.compile(r"\blr=([0-9.eE+\-]+)")
 
-    rows = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if "step=" not in line or "loss=" not in line:
-            continue
-        # valid行・EarlyStopping行などのメトリクス以外の行を除外
-        stripped = line.lstrip()
-        if stripped.startswith("valid") or stripped.startswith("EarlyStopping"):
-            continue
-        try:
-            m_step = _RE_STEP.search(line)
-            m_loss = _RE_LOSS.search(line)
-            m_lr   = _RE_LR.search(line)
-            if not m_step or not m_loss:
+    # ① metrics_log.jsonl があればそちらを優先して読む（LOGS_DIR固定）
+    jsonl_path = LOGS_DIR / "metrics_log.jsonl"
+    if not jsonl_path.exists():
+        jsonl_path = None
+
+    train_rows = []
+    valid_rows = []
+
+    if jsonl_path is not None and jsonl_path.exists():
+        # JSONL から読み込む
+        for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            step = int(m_step.group(1))
-            loss = float(m_loss.group(1))
-            lr   = float(m_lr.group(1)) if m_lr else 0.0
-            rows.append({"step": step, "loss": loss, "lr": lr})
-        except (ValueError, AttributeError):
-            continue
-    if not rows:
-        return pd.DataFrame({"step": [], "loss": [], "lr": []})
-    return pd.DataFrame(rows)
+            try:
+                rec = json.loads(line)
+                rtype = rec.get("type", "train")
+                step  = int(rec["step"])
+                loss  = float(rec["loss"])
+                rf    = float(rec.get("rf_loss", 0.0))
+                if rtype == "train":
+                    lr  = float(rec.get("lr", 0.0))
+                    dur = float(rec.get("duration_loss", float("nan")))
+                    train_rows.append({"step": step, "loss": loss, "rf_loss": rf, "lr": lr, "dur_loss": dur})
+                elif rtype == "valid":
+                    dur = float(rec.get("duration_loss", float("nan")))
+                    valid_rows.append({"step": step, "loss": loss, "rf_loss": rf, "dur_loss": dur})
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
+    else:
+        # JSONL なし → テキストログからパース（wandb_enabled=False の通常運用）
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "step=" not in line or "loss=" not in line:
+                continue
+            stripped = line.lstrip()
+            try:
+                m_step = _RE_STEP.search(line)
+                m_loss = _RE_LOSS.search(line)
+                if not m_step or not m_loss:
+                    continue
+                step = int(m_step.group(1))
+                loss = float(m_loss.group(1))
+                m_rf  = _RE_RF.search(line)
+                m_dur = _RE_DUR.search(line)
+                rf  = float(m_rf.group(1))  if m_rf  else float("nan")
+                dur = float(m_dur.group(1)) if m_dur else float("nan")
+                if stripped.startswith("valid"):
+                    valid_rows.append({"step": step, "loss": loss, "rf_loss": rf, "dur_loss": dur})
+                elif stripped.startswith("EarlyStopping"):
+                    continue
+                else:
+                    m_lr = _RE_LR.search(line)
+                    lr   = float(m_lr.group(1)) if m_lr else 0.0
+                    train_rows.append({"step": step, "loss": loss, "rf_loss": rf, "lr": lr, "dur_loss": dur})
+            except (ValueError, AttributeError):
+                continue
+
+    df_train = pd.DataFrame(train_rows) if train_rows else _empty_train
+    df_valid = pd.DataFrame(valid_rows) if valid_rows else _empty_valid
+    return df_train, df_valid
 
 
 def _write_tensorboard_events(log_path: Path) -> None:
@@ -1482,20 +1527,28 @@ def _write_tensorboard_events(log_path: Path) -> None:
         tb_dir = LOGS_DIR / "tensorboard" / log_path.stem
         tb_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(tb_dir))
-        df = _parse_train_log_metrics()
-        for _, row in df.iterrows():
-            writer.add_scalar("train/loss", row["loss"], int(row["step"]))
-            writer.add_scalar("train/lr",   row["lr"],   int(row["step"]))
+        df_train, df_valid = _parse_train_log_metrics()
+        for _, row in df_train.iterrows():
+            writer.add_scalar("train/loss",    row["loss"],    int(row["step"]))
+            writer.add_scalar("train/rf_loss", row["rf_loss"], int(row["step"]))
+            writer.add_scalar("train/lr",      row["lr"],      int(row["step"]))
+        for _, row in df_valid.iterrows():
+            writer.add_scalar("valid/loss",    row["loss"],    int(row["step"]))
+            writer.add_scalar("valid/rf_loss", row["rf_loss"], int(row["step"]))
         writer.close()
         print(f"[gradio] TensorBoardイベント保存: {tb_dir}", flush=True)
     except ImportError:
         pass
     finally:
-        df = _parse_train_log_metrics()
-        if not df.empty:
+        df_train, df_valid = _parse_train_log_metrics()
+        if df_train is not None and not df_train.empty:
             csv_path = LOGS_DIR / f"{log_path.stem}_metrics.csv"
-            df.to_csv(csv_path, index=False)
+            df_train.to_csv(csv_path, index=False)
             print(f"[gradio] メトリクスCSV保存: {csv_path}", flush=True)
+        if df_valid is not None and not df_valid.empty:
+            csv_path_v = LOGS_DIR / f"{log_path.stem}_valid_metrics.csv"
+            df_valid.to_csv(csv_path_v, index=False)
+            print(f"[gradio] バリデーションCSV保存: {csv_path_v}", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1887,6 +1940,7 @@ def _build_lora_train_command(
         "--save-every", str(int(save_every)),
         "--log-every", str(int(log_every)),
         "--seed", str(int(seed)),
+        "--caption-condition-dropout", "0.1",
     ]
 
     if str(attention_backend) != "sdpa":
@@ -2866,11 +2920,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     pm_output_manifest = gr.Textbox(
                         label="出力マニフェストパス（.jsonl）",
-                        value=str(BASE_DIR / "data" / "train_manifest.jsonl"),
+                        value=str(BASE_DIR / "my_manifest" / "train_manifest.jsonl"),
                     )
                     pm_latent_dir = gr.Textbox(
                         label="ラテント保存フォルダ",
-                        value=str(BASE_DIR / "data" / "latents"),
+                        value=str(BASE_DIR / "my_manifest" / "latents"),
                     )
                     pm_device = gr.Dropdown(
                         label="使用デバイス", choices=device_choices, value=default_model_device,
@@ -3059,12 +3113,12 @@ def build_ui() -> gr.Blocks:
 
                 with gr.Accordion("🔁 ベースモデル・追加学習設定", open=True):
                     _default_safetensors = str(
-                        CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v2" / "model.safetensors"
+                        CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors"
                     )
                     gr.Markdown(
                         "**--resume オプション設定**\n\n"
                         "- **オフ（スクラッチ学習）**: モデルを最初からランダム初期化して学習します。\n"
-                        "- **オン・パス未入力**: `checkpoints/Aratako_Irodori-TTS-500M-v2/model.safetensors` が"
+                        "- **オン・パス未入力**: `checkpoints/Aratako_Irodori-TTS-500M-v3/model.safetensors` が"
                         "存在すれば自動でロードして追加学習します（デフォルト動作）。\n"
                         "- **オン・パス入力**: 指定したファイルをベースに追加学習します。"
                         "`.safetensors` を指定するとstep=0から学習開始、`.pt` チェックポイントを指定すると"
@@ -3073,7 +3127,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         resume_enabled = gr.Checkbox(
                             label="--resume を有効にする（追加学習 / チェックポイント再開）",
-                            value=True,
+                            value=False,
                             scale=1,
                         )
                     resume_checkpoint = gr.Textbox(
@@ -3086,7 +3140,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("⚙️ バッチ・精度設定", open=True):
                     gr.Markdown("*バッチサイズと勾配蓄積ステップの積が実効バッチサイズになります。*")
                     with gr.Row():
-                        t_batch_size  = gr.Slider(label="バッチサイズ（GPUメモリに合わせて調整）", minimum=1, maximum=64, value=_v("batch_size", 4), step=1)
+                        t_batch_size  = gr.Slider(label="バッチサイズ（GPUメモリに合わせて調整）", minimum=1, maximum=32, value=_v("batch_size", 2), step=1)
                         t_grad_accum  = gr.Slider(label="勾配蓄積ステップ数（実効バッチを増やす）", minimum=1, maximum=32, value=_v("gradient_accumulation_steps", 2), step=1)
                         t_num_workers = gr.Slider(label="DataLoaderワーカー数", minimum=0, maximum=16, value=_v("num_workers", 4), step=1)
                     with gr.Row():
@@ -3137,12 +3191,12 @@ def build_ui() -> gr.Blocks:
                                                  info="この間隔でloss/lrをログ出力→グラフに反映。ファイル保存とは無関係。")
                         t_save_every = gr.Number(label="チェックポイント保存間隔（ステップ数）", value=_v("save_every", 100), precision=0)
 
-                with gr.Accordion("📊 Weights & Biases 設定", open=False):
-                    gr.Markdown("*wandb_enabledをオンにするとクラウドでリアルタイム学習曲線を確認できます。*")
+                with gr.Accordion("📊 ローカルメトリクスログ設定", open=False):
+                    gr.Markdown("*有効化するとlogsフォルダに`metrics_log.jsonl`を書き出し、GUI上のグラフにリアルタイム反映します（クラウド不要）。*")
                     with gr.Row():
-                        t_wandb_enabled  = gr.Checkbox(label="W&B を有効化", value=_v("wandb_enabled", False))
-                        t_wandb_project  = gr.Textbox(label="W&B プロジェクト名", value=_v("wandb_project", "") or "")
-                        t_wandb_run_name = gr.Textbox(label="W&B 実行名（省略可）", value=_v("wandb_run_name", "") or "")
+                        t_wandb_enabled  = gr.Checkbox(label="ローカルメトリクスログを有効化", value=_v("wandb_enabled", False))
+                    t_wandb_project  = gr.Textbox(value=_v("wandb_project", "") or "", visible=False)
+                    t_wandb_run_name = gr.Textbox(value=_v("wandb_run_name", "") or "", visible=False)
 
                 with gr.Accordion("✅ バリデーション設定", open=False):
                     gr.Markdown("*valid_ratioを0より大きくするとバリデーションlossを監視できます。early_stoppingには必須。*")
@@ -3208,16 +3262,30 @@ def build_ui() -> gr.Blocks:
 
                 if _PANDAS_AVAILABLE:
                     gr.Markdown("*ログ・グラフは自動更新されます（手動更新ボタンでも即時反映可）。*")
-                    _empty_df = pd.DataFrame({"step": [], "loss": [], "lr": []})
+                    _empty_train = pd.DataFrame({"step": [], "loss": [], "rf_loss": [], "lr": []})
+                    _empty_valid = pd.DataFrame({"step": [], "loss": [], "rf_loss": []})
                     with gr.Row():
                         loss_plot = gr.LinePlot(
-                            value=_empty_df,
-                            label="Loss曲線",
+                            value=_empty_train,
+                            label="Train Loss",
+                            x="step", y="loss",
+                            height=300,
+                        )
+                        rf_loss_plot = gr.LinePlot(
+                            value=_empty_train,
+                            label="Train RF Loss",
+                            x="step", y="rf_loss",
+                            height=300,
+                        )
+                    with gr.Row():
+                        valid_loss_plot = gr.LinePlot(
+                            value=_empty_valid,
+                            label="Valid Loss",
                             x="step", y="loss",
                             height=300,
                         )
                         lr_plot = gr.LinePlot(
-                            value=_empty_df,
+                            value=_empty_train,
                             label="学習率曲線",
                             x="step", y="lr",
                             height=300,
@@ -3225,13 +3293,17 @@ def build_ui() -> gr.Blocks:
 
                     def _do_refresh():
                         log = _read_train_log()
-                        df = _parse_train_log_metrics()
-                        return log, df, df
+                        df_train, df_valid = _parse_train_log_metrics()
+                        if df_train is None:
+                            df_train = pd.DataFrame({"step": [], "loss": [], "rf_loss": [], "lr": []})
+                        if df_valid is None:
+                            df_valid = pd.DataFrame({"step": [], "loss": [], "rf_loss": []})
+                        return log, df_train, df_train, df_valid, df_train
 
-                    train_log_refresh_btn.click(_do_refresh, outputs=[train_log_text, loss_plot, lr_plot])
+                    train_log_refresh_btn.click(_do_refresh, outputs=[train_log_text, loss_plot, rf_loss_plot, valid_loss_plot, lr_plot])
 
                     _auto_timer = gr.Timer(value=5, active=True)
-                    _auto_timer.tick(_do_refresh, outputs=[train_log_text, loss_plot, lr_plot])
+                    _auto_timer.tick(_do_refresh, outputs=[train_log_text, loss_plot, rf_loss_plot, valid_loss_plot, lr_plot])
                     auto_refresh_interval.change(
                         lambda v: float(v),
                         inputs=[auto_refresh_interval],
@@ -3243,19 +3315,21 @@ def build_ui() -> gr.Blocks:
                         "⚠️ **グラフ表示には `pandas` が必要です。**\n"
                         "`pip install pandas` または `uv add pandas` を実行後に再起動してください。"
                     )
-                    metrics_text = gr.Textbox(label="メトリクス（step / loss / lr）", interactive=False, lines=6)
+                    metrics_text = gr.Textbox(label="メトリクス（step / loss / rf_loss / lr）", interactive=False, lines=6)
 
                     def _do_refresh_nopd():
                         log = _read_train_log()
-                        df = _parse_train_log_metrics()
-                        if df is None:
+                        df_train, df_valid = _parse_train_log_metrics()
+                        if df_train is None:
                             metrics = "（pandas未インストールのためグラフ非表示）"
-                        elif df.empty:
+                        elif df_train.empty:
                             metrics = "（データなし）"
                         else:
-                            lines = [f"step={int(r['step'])}  loss={r['loss']:.4f}  lr={r['lr']:.2e}"
-                                     for _, r in df.tail(10).iterrows()]
-                            metrics = "\n".join(lines)
+                            lines_out = [
+                                f"step={int(r['step'])}  loss={r['loss']:.4f}  rf={r.get('rf_loss', float('nan')):.4f}  lr={r['lr']:.2e}"
+                                for _, r in df_train.tail(10).iterrows()
+                            ]
+                            metrics = "\n".join(lines_out)
                         return log, metrics
 
                     train_log_refresh_btn.click(_do_refresh_nopd, outputs=[train_log_text, metrics_text])

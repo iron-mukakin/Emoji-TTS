@@ -28,7 +28,7 @@ train:
   # ── バッチ・勾配蓄積 ──────────────────────────────────────────
   # 50件 ÷ batch_size=4 = 12step/epoch
   # gradient_accumulation=2 で実効バッチ=8を確保
-  batch_size: 4
+  batch_size: 2
   gradient_accumulation_steps: 2
 
   # ── DataLoader ───────────────────────────────────────────────
