@@ -1,6 +1,6 @@
 # Irodori-TTS (フォーク版)
 
-[![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Aratako/Irodori-TTS-500M)
+[![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)
 [![License: MIT](https://img.shields.io/badge/Code%20License-MIT-green.svg)](LICENSE)
 
 > **本プロジェクトは [Aratako/Irodori-TTS](https://github.com/Aratako/Irodori-TTS) のフォーク版です。**  
@@ -8,20 +8,26 @@
 
 **Irodori-TTS** は Flow Matching ベースの音声合成モデルです。アーキテクチャと学習設計は [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/) に準拠し、[DACVAE](https://github.com/facebookresearch/dacvae) の連続潜在表現を生成ターゲットとして使用します。
 
-オリジナルのモデル重みと音声サンプルは[モデルカード](https://huggingface.co/Aratako/Irodori-TTS-500M)を参照してください。
+オリジナルのモデル重みと音声サンプルは[モデルカード](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)を参照してください。
 
 ---
 
 ## 機能一覧
 
 - **Flow Matching TTS** — 連続DACVAE潜在空間上のRectified Flow拡散トランスフォーマー（RF-DiT）
+- **マルチバージョン対応** — v3 / v2（潜在dim 32）と v1（潜在dim 128）のチェックポイントに対応。モデルロード時にコーデックを自動切替
 - **ゼロショット声質クローニング** — 参照音声から話者の声質を再現
+- **スピーカーライブラリ** — 参照音声を名前付きスピーカープロファイル（`speakers/`）として登録し、セッションをまたいで再利用
+- **Voice Design** — 対応モデル使用時、テキストで声のスタイルを記述するキャプション条件付き生成
 - **感情スタイルプリセット** — ワンクリックでスタイルを切り替え（ノーマル / 力強く / おとなしく / 明るく / ひそやかに）、CFGパラメータの細かい手動調整も可能
 - **複数候補生成** — 1回の実行で最大8候補の音声を同時生成
-- **LoRA差分学習** — `peft` を使った軽量アダプタ学習。Resume・EMA・Early Stopping対応
+- **改行分割生成** — 改行ごとに個別生成、または無音区間を挟んで連結生成
+- **LoRA差分学習** — `peft` を使った軽量アダプタ学習。Resume・EMA・Early Stopping・モジュール単位の無効化に対応
 - **フルファインチューニング** — Multi-GPU DDP学習。Muon/AdamW/Lion/AdEMAMixオプティマイザ、WSD/Cosineスケジューラ、勾配チェックポイント対応
 - **データセットツール** — 音声スライス、Whisperキャプション、LLM APIを使った絵文字スタイルアノテーション
 - **モデルマージ** — Weighted Average・SLERP・Task Arithmetic・部分マージ・LoRA的差分注入
+- **LoRAマージ** — LoRAアダプタ同士のマージ、またはLoRAアダプタをベースモデルへ焼き込み
+- **ダークモード** — UIでライト/ダークテーマを切り替え可能
 - **Gradio Web UI** — 全機能をブラウザから操作可能
 
 ---
@@ -34,7 +40,7 @@
 2. **参照潜在エンコーダ** — パッチ化した参照音声の潜在表現をエンコードし、話者・スタイルの条件付けに使用するSelf-Attention + SwiGLU層
 3. **拡散トランスフォーマー** — Low-Rank AdaLN（タイムステップ条件付き適応層正規化）、half-RoPE、SwiGLU MLPを持つJoint-Attention DiTブロック
 
-音声はDACVAEコーデック（128次元）で連続潜在列として表現され、48 kHz高品質波形に変換されます。
+音声はDACVAEコーデックで連続潜在列として表現されます。v2/v3モデルは32次元潜在（48 kHz）、v1モデルは128次元潜在を使用します。
 
 ---
 
@@ -59,7 +65,7 @@ uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
 ```
 
 ブラウザで `http://localhost:7860` にアクセスしてください。  
-チェックポイントが見つからない場合、初回起動時に `Aratako/Irodori-TTS-500M` が自動ダウンロードされます。
+チェックポイントが見つからない場合、初回起動時に `Aratako/Irodori-TTS-500M-v3` が自動ダウンロードされます。
 
 起動オプション:
 
@@ -74,7 +80,7 @@ uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
 
 ```bash
 uv run python infer.py \
-  --hf-checkpoint Aratako/Irodori-TTS-500M \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "今日はいい天気ですね。" \
   --ref-wav path/to/reference.wav \
   --output-wav outputs/sample.wav
@@ -84,7 +90,7 @@ uv run python infer.py \
 
 ```bash
 uv run python infer.py \
-  --hf-checkpoint Aratako/Irodori-TTS-500M \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "今日はいい天気ですね。" \
   --no-ref \
   --output-wav outputs/sample.wav
@@ -141,15 +147,23 @@ uv run python infer.py \
 
 ### タブ1: 推論（🔊）
 
-- **モデル読み込み** — チェックポイント（`.pt` / `.safetensors`）・デバイス・精度を選択。repo IDを入力してHuggingFaceから直接ダウンロードも可能。
-- **LoRAアダプタ** — LoRAアダプタを読み込み、スケール（0.0〜2.0）を調整。
-- **音声生成** — テキストを入力し、任意で参照音声をアップロード。
+- **モデル読み込み** — チェックポイント（`.pt` / `.safetensors`）・デバイス・精度を選択。repo IDを入力してHuggingFaceから直接ダウンロードも可能。ロードしたモデルの `latent_dim` に基づきコーデックリポジトリ（dim32/dim128）を自動選択。
+- **LoRAアダプタ** — LoRAアダプタを読み込み、スケール（0.0〜2.0）を調整。無効にするモジュールをカンマ区切りで指定することも可能。
+- **参照音声** — 3種類の入力方法に対応:
+  - **直接アップロード** — WAVファイルをアップロードして声質クローニング。
+  - **スピーカーライブラリ** — `speakers/` に登録済みのスピーカープロファイルを選択して使用。
+  - **スピーカー登録** — 参照WAVをDACVAEコーデックでエンコードし、`speakers/{名前}/` に `ref.wav` / `ref.pt` / `profile.json` として保存。実行前にモデルを読み込む必要あり。
+- **Voice Design** — Voice Design対応モデル読み込み時のみ表示。キャプションテキストとキャプションCFGスケールで声のスタイルを自然言語で指定。
 - **感情スタイルプリセット** — ノーマル / 力強く / おとなしく / 明るく / ひそやかに の各ボタンでCFGとスタイルパラメータを自動設定。
 - **スタイルスライダー** — テキスト表現力・感情の強さ・話者密着度・表現の振れ幅を個別調整。
 - **サンプリング設定** — ステップ数（1〜120）・乱数シード。
 - **CFG設定** — ガイダンスモード（`independent` / `joint` / `alternating`）・テキストCFG・話者CFG。
 - **詳細設定** — CFGタイムステップ範囲・コンテキストKVキャッシュ・スコア再スケール・話者KVスケール（上級者向け）。
-- **複数候補生成** — 1回の実行で1〜8候補を生成。各候補は個別のWAVファイルとして保存。
+- **改行分割生成モード** — 3種類から選択:
+  - **デフォルト** — テキスト全体を1回で生成（従来の動作）。
+  - **改行ごとに連続生成で終了** — 改行ごとに個別生成し、それぞれ別のWAVファイルとして出力。
+  - **改行ごとに連続生成後に連結** — 改行ごとに個別生成し、設定した無音区間（0.1〜3.0秒）を挟んで1ファイルに連結して出力。
+- **複数候補生成** — 1回の実行で1〜8候補を生成。各候補は `outputs_gradio/` に別ファイルとして保存。
 
 ### タブ2: Prepare Manifest（📂）
 
@@ -158,6 +172,15 @@ uv run python infer.py \
 対応データソース: ローカルCSV（audiofolder形式）・ローカルJSONL・HuggingFaceデータセット。
 
 ファイルを指定すると音声・テキスト・話者ID列名をヘッダーから自動検出します。
+
+対応モード:
+
+| モード | コーデック | 説明 |
+|---|---|---|
+| `model_v3` | dim32（推奨） | 話者条件付き・v3モデル向け |
+| `model_v2` | dim32 | 話者条件付き・v2モデル向け |
+| `model_v1` | dim128 | 話者条件付き・v1モデル向け |
+| `voice_design` | dim32 | キャプション条件付き（caption列が必要） |
 
 ```bash
 # CLIでの実行例
@@ -195,7 +218,7 @@ uv run python prepare_manifest.py \
 | バリデーション | バリデーション分割比率・実行間隔・Early Stopping |
 | EMA | 推論品質向上のための指数移動平均 |
 | チェックポイント | 保存間隔・EMAのみ または EMA+Fullの両方 |
-| ログ | W&B連携・ログ出力間隔 |
+| ログ | ローカルメトリクスログ（`logs/` にJSONL出力）・ログ出力間隔・リアルタイムlossグラフ |
 
 単一GPU:
 
@@ -238,15 +261,18 @@ UIでは末尾200行のリアルタイムログ・ETA・loss値・ステップ�
 
 `lora:` セクションを持つYAMLファイルとして `configs/` フォルダへのプリセット保存・読み込みが可能です。
 
+推論時のモジュール単位無効化: 推論タブの **LoRA無効モジュール** フィールドにカンマ区切りでモジュール名を指定すると、モデルをリロードせずに指定モジュールのLoRA適用をスケール0で無効化できます。
+
 ### タブ5: Dataset作成
 
-**スライス** — 無音区間検出で長尺音声を分割します。
+**スライス** — Silero VADニューラル音声活動検出で長尺音声を分割します。
 
 | パラメータ | 説明 |
 |---|---|
 | 最小/最大時間（秒） | 許容するセグメント長の範囲 |
-| Top dB | 無音判定のdBFSしきい値 |
-| Frame / Hop length | STFT窓パラメータ |
+| VAD閾値 | 発話検出の感度（0.5推奨） |
+| 無音最短継続時間（ms） | 分割を発生させる最小無音長 |
+| 発話前後パディング（ms） | 発話区間の前後に追加する余白 |
 | ターゲットサンプリングレート | 任意のリサンプリング |
 | 再帰的 | サブディレクトリも対象にする |
 
@@ -256,14 +282,17 @@ UIでは末尾200行のリアルタイムログ・ETA・loss値・ステップ�
 |---|---|
 | Whisperモデル | `tiny` / `base` / `small` / `medium` / `large-v3` |
 | 言語 | 言語コード（例: `ja`）または自動検出 |
+| 話者ID欄の用途 | `speaker`（speaker_id列） / `caption`（VoiceDesignモード） |
 | 出力形式 | `CSV` または `JSONL` |
-| 話者ID | 固定の話者ラベル（任意） |
+| 話者ID / キャプション | 固定の話者ラベルまたはVoice Designキャプション（任意） |
 
 **パイプライン** — スライス → キャプションを一括実行します。
 
 **絵文字キャプション** — 各音声セグメントの音響特徴量（ピッチ・エネルギー・発話速度・MFCCデルタ・零交差率）を抽出し、LLM APIを呼び出してIrodori-TTS互換の絵文字スタイルアノテーションをテキストに付与します。
 
 対応API: `lm_studio` / `groq` / `openai` / `together`
+
+> 絵文字キャプション機能はCSV形式の出力のみ対応しており、メインのキャプションジョブ完了後に自動実行されます。
 
 対応絵文字アノテーション（38種）:
 
@@ -348,6 +377,14 @@ uv run python convert_checkpoint_to_safetensors.py outputs/checkpoint_final.pt -
 
 出力形式: `.safetensors`（推論用・推奨）または `.pt`。
 
+### タブ8: LoRAマージ（🧬）
+
+LoRA専用のマージ操作を行う2つのサブタブで構成されます。
+
+**サブタブ1: 通常LoRAマージ** — 2つのLoRAアダプタをベースモデルへの焼き込みなしで新しいアダプタにマージします。マージ手法はモデルマージと同じ（weighted average / slerp / task arithmetic）でグループ別部分マージにも対応。出力は `lora/lora_merged_*/` に保存されます。
+
+**サブタブ2: 本体モデルマージ（焼き込み）** — 1〜2つのLoRAアダプタ（各アダプタに個別スケール設定可）をベースモデルに焼き込み、焼き込み後に2つの結果間でポスト焼き込みマージを任意で実行します。アダプタごとの部分焼き込み（対象レイヤーグループを選択）とポスト焼き込みの部分マージにも対応。出力は `checkpoints/lora_merged/` に保存されます。
+
 ---
 
 ## 学習手順
@@ -404,7 +441,7 @@ uv run torchrun --nproc_per_node 4 train.py \
 
 ```bash
 uv run python lora_train.py \
-  --base-model checkpoints/Aratako_Irodori-TTS-500M/model.safetensors \
+  --base-model checkpoints/Aratako_Irodori-TTS-500M-v3/model.safetensors \
   --manifest data/train_manifest.jsonl \
   --output-dir lora/my_run \
   --lora-rank 16 \
@@ -431,10 +468,11 @@ Irodori-TTS/
 ├── prepare_manifest.py                   # 音声 → DACVAE潜在変換・マニフェスト生成
 ├── dataset_tools.py                      # 音声スライス / Whisperキャプション / 絵文字アノテーション
 ├── merge.py                              # モデルマージユーティリティ
+├── lora_merge.py                         # LoRAアダプタマージ・焼き込みユーティリティ
 ├── convert_checkpoint_to_safetensors.py  # .pt → .safetensors 変換
 ├── convert_lora_checkpoint.py            # LoRA _full → _ema 変換
 │
-├── irodori_tts/                          # コアライブラリ
+├── irodori_tts/                           # コアライブラリ
 │   ├── model.py                          # TextToLatentRFDiT アーキテクチャ
 │   ├── rf.py                             # Rectified Flow ユーティリティ・Euler CFGサンプリング
 │   ├── codec.py                          # DACVAE コーデックラッパー
@@ -452,9 +490,12 @@ Irodori-TTS/
 │
 ├── checkpoints/                          # ダウンロード済み・学習済みチェックポイント
 ├── lora/                                 # LoRAアダプタ出力
+├── speakers/                             # 名前付きスピーカープロファイル
 ├── logs/                                 # 学習ログファイル
-├── data/                                 # マニフェストファイルとDACVAE潜在表現
-└── gradio_outputs/                       # GUIで生成した音声ファイル
+├── my_dataset/                           # データセットを加工した出力先
+├── my_manifest/                          # マニフェストファイルとDACVAE潜在表現
+├── outputs_gradio/                       # GUIで生成した音声ファイル
+└── outputs_train/                        # 学習したモデルの出力先
 ```
 
 ---
@@ -488,7 +529,7 @@ Irodori-TTS/
 ## ライセンス
 
 - **コード**: [MIT License](LICENSE)
-- **モデル重み**: 商用利用禁止。詳細は[オリジナルモデルカード](https://huggingface.co/Aratako/Irodori-TTS-500M)を参照してください。
+- **モデル重み**: 商用利用禁止。詳細は[オリジナルモデルカード](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)を参照してください。
 
 ---
 

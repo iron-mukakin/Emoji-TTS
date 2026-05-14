@@ -1,6 +1,6 @@
 # Irodori-TTS (Fork)
 
-[![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Aratako/Irodori-TTS-500M)
+[![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)
 [![License: MIT](https://img.shields.io/badge/Code%20License-MIT-green.svg)](LICENSE)
 
 日本語版はこちら → [README_ja.md](README_ja.md)
@@ -10,20 +10,26 @@
 
 Training and inference code for **Irodori-TTS**, a Flow Matching-based Text-to-Speech model. The architecture and training design largely follow [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/), using [DACVAE](https://github.com/facebookresearch/dacvae) continuous latents as the generation target.
 
-For original model weights and audio samples, refer to the [model card](https://huggingface.co/Aratako/Irodori-TTS-500M).
+For original model weights and audio samples, refer to the [model card](https://huggingface.co/Aratako/Irodori-TTS-500M-v3).
 
 ---
 
 ## Features
 
 - **Flow Matching TTS** — Rectified Flow Diffusion Transformer (RF-DiT) over continuous DACVAE latents
+- **Multi-version Model Support** — v3 / v2 (latent dim 32) and v1 (latent dim 128) checkpoints; codec is auto-selected on model load
 - **Voice Cloning** — Zero-shot voice cloning from reference audio
+- **Speaker Library** — Register reference audio as named speaker profiles (`speakers/`) and reuse them across sessions
+- **Voice Design** — Caption-conditioned generation for describing voice style in text (supported by compatible model variants)
 - **Emotion Style Presets** — One-click style presets (Normal / Strong / Calm / Bright / Whisper) and fine-grained CFG control
 - **Multi-Candidate Generation** — Generate up to 8 audio candidates in a single run
-- **LoRA Fine-tuning** — Lightweight adapter training via `peft`; supports resume, EMA, Early Stopping
+- **Multiline Split Generation** — Generate per-line or concatenate lines with silence gaps in a single session
+- **LoRA Fine-tuning** — Lightweight adapter training via `peft`; supports resume, EMA, Early Stopping, per-module disable
 - **Full Fine-tuning** — Multi-GPU DDP training with Muon/AdamW/Lion/AdEMAMix optimizers, WSD/Cosine schedulers, gradient checkpointing
 - **Dataset Tools** — Audio slicing, Whisper captioning, emoji-style annotation via LLM API
 - **Model Merging** — Weighted Average, SLERP, Task Arithmetic, partial merge, LoRA-style injection
+- **LoRA Merging** — Merge two LoRA adapters together, or bake a LoRA adapter into a base model
+- **Dark Mode** — Toggle between light and dark themes in the UI
 - **Gradio Web UI** — All features accessible through a single GUI
 
 ---
@@ -36,7 +42,7 @@ The model consists of three main components:
 2. **Reference Latent Encoder** — Encodes patched reference audio latents for speaker/style conditioning via self-attention + SwiGLU layers
 3. **Diffusion Transformer** — Joint-attention DiT blocks with Low-Rank AdaLN (timestep-conditioned adaptive layer normalization), half-RoPE, and SwiGLU MLPs
 
-Audio is represented as continuous latent sequences via the DACVAE codec (128-dim), enabling high-quality 48 kHz waveform reconstruction.
+Audio is represented as continuous latent sequences via the DACVAE codec. v2/v3 models use 32-dim latents (48 kHz); v1 models use 128-dim latents.
 
 ---
 
@@ -61,7 +67,7 @@ uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
 ```
 
 Access the UI at `http://localhost:7860`.  
-On first launch, `Aratako/Irodori-TTS-500M` is downloaded automatically if no checkpoint is found.
+On first launch, `Aratako/Irodori-TTS-500M-v3` is downloaded automatically if no checkpoint is found.
 
 Optional flags:
 
@@ -76,7 +82,7 @@ Optional flags:
 
 ```bash
 uv run python infer.py \
-  --hf-checkpoint Aratako/Irodori-TTS-500M \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "今日はいい天気ですね。" \
   --ref-wav path/to/reference.wav \
   --output-wav outputs/sample.wav
@@ -86,7 +92,7 @@ Without reference audio (unconditional):
 
 ```bash
 uv run python infer.py \
-  --hf-checkpoint Aratako/Irodori-TTS-500M \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
   --text "今日はいい天気ですね。" \
   --no-ref \
   --output-wav outputs/sample.wav
@@ -143,15 +149,23 @@ uv run python infer.py \
 
 ### Tab 1: Inference (🔊)
 
-- **Model loading** — Select a checkpoint (`.pt` / `.safetensors`), device, and precision. Download models directly from HuggingFace by entering a repo ID.
-- **LoRA adapter** — Optionally load a LoRA adapter and adjust its scale (0.0–2.0).
-- **Audio generation** — Enter text and optionally upload a reference audio file.
+- **Model loading** — Select a checkpoint (`.pt` / `.safetensors`), device, and precision. Download models directly from HuggingFace by entering a repo ID. The codec repository (dim32 or dim128) is automatically selected based on the loaded model's `latent_dim`.
+- **LoRA adapter** — Optionally load a LoRA adapter, adjust its scale (0.0–2.0), and disable specific modules via a comma-separated list.
+- **Reference audio** — Three input methods available:
+  - **Direct upload** — Upload a WAV file for voice cloning.
+  - **Speaker library** — Select a pre-registered speaker profile from `speakers/`.
+  - **Speaker registration** — Encode a reference WAV with the DACVAE codec and save it as a named speaker profile (`ref.wav`, `ref.pt`, `profile.json`) in `speakers/{name}/`. Requires the model to be loaded first.
+- **Voice Design** — When a Voice Design-compatible model is loaded, a Caption text field and Caption CFG scale appear for style description in natural language.
 - **Emotion style presets** — Normal / Strong / Calm / Bright / Whisper buttons auto-configure CFG and style parameters.
 - **Style sliders** — Text expressiveness, emotion strength, speaker adherence, and expression range.
 - **Sampling settings** — Number of steps (1–120) and random seed.
 - **CFG settings** — Guidance mode (`independent` / `joint` / `alternating`), text CFG, speaker CFG.
 - **Advanced settings** — CFG timestep range, context KV cache, score rescaling, speaker KV scale.
-- **Multi-candidate generation** — Generate 1–8 candidates per run. Each candidate is saved as a separate WAV file.
+- **Multiline split generation** — Three modes:
+  - **Default** — Generate the entire text in a single pass.
+  - **Split by line (individual files)** — Generate each line separately and output as individual WAV files.
+  - **Split by line (concatenate)** — Generate each line separately and concatenate with configurable silence gaps (0.1–3.0 s) into a single WAV file.
+- **Multi-candidate generation** — Generate 1–8 candidates per run. Each candidate is saved as a separate WAV file under `gradio_outputs/`.
 
 ### Tab 2: Prepare Manifest (📂)
 
@@ -160,6 +174,15 @@ Converts audio data to DACVAE latents and produces a JSONL training manifest.
 Supported data sources: local CSV (`audiofolder` format), local JSONL, or HuggingFace dataset.
 
 Column names for audio, text, and speaker ID are detected automatically from the file header.
+
+Supported modes:
+
+| Mode | Codec | Description |
+|---|---|---|
+| `model_v3` | dim32 (recommended) | Speaker-conditioned, v3 model |
+| `model_v2` | dim32 | Speaker-conditioned, v2 model |
+| `model_v1` | dim128 | Speaker-conditioned, v1 model |
+| `voice_design` | dim32 | Caption-conditioned (caption column required) |
 
 ```bash
 # CLI equivalent
@@ -197,7 +220,7 @@ Key settings:
 | Validation | Validation split ratio, validation interval, Early Stopping |
 | EMA | Exponential Moving Average for inference-quality checkpoints |
 | Checkpoint | Save interval, EMA-only or EMA+Full |
-| Logging | W&B integration, log interval |
+| Logging | Local metrics log (JSONL to `logs/`), log interval, real-time loss graph |
 
 Single-GPU:
 
@@ -240,15 +263,18 @@ Key settings:
 
 Presets (YAML with a `lora:` section) can be saved and loaded from `configs/`.
 
+At inference time, per-module LoRA disable is supported: specify module names (comma-separated) in the **LoRA Disabled Modules** field in the Inference tab to zero-out selected LoRA weights without reloading the model.
+
 ### Tab 5: Dataset Creation (Dataset作成)
 
-**Slice** — Splits long audio files into segments using silence detection.
+**Slice** — Splits long audio files into segments using Silero VAD neural activity detection.
 
 | Parameter | Description |
 |---|---|
 | Min / Max duration (sec) | Acceptable segment length range |
-| Top dB | Silence threshold in dBFS |
-| Frame / Hop length | STFT window parameters |
+| VAD threshold | Speech detection sensitivity (0.5 recommended) |
+| Min silence duration (ms) | Minimum silence length to trigger a split |
+| Speech pad (ms) | Padding added before/after each speech segment |
 | Target sample rate | Optional resampling |
 | Recursive | Search subdirectories |
 
@@ -258,8 +284,9 @@ Presets (YAML with a `lora:` section) can be saved and loaded from `configs/`.
 |---|---|
 | Whisper model | `tiny` / `base` / `small` / `medium` / `large-v3` |
 | Language | Language code (e.g., `ja`) or auto-detect |
+| Speaker field mode | `speaker` (speaker_id column) or `caption` (Voice Design mode) |
 | Output format | `CSV` or `JSONL` |
-| Speaker ID | Optional fixed speaker label |
+| Speaker ID / Caption | Optional fixed speaker label or voice design caption |
 
 **Pipeline** — Runs slice → caption in sequence.
 
@@ -268,6 +295,8 @@ Presets (YAML with a `lora:` section) can be saved and loaded from `configs/`.
 Supported APIs: `lm_studio` / `groq` / `openai` / `together`.
 
 Emoji annotations supported (38 types), including: 👂 whisper, 😤 strong, 😌 calm, 🤭 laugh, 😭 crying, 😱 scream, ⏩ fast-speaking, 🐢 slow, 🎵 humming, and others.
+
+> Emoji Caption requires CSV output format and runs automatically after the main captioning job completes.
 
 ### Tab 6: Checkpoint Conversion (🔄)
 
@@ -307,6 +336,14 @@ Merges two model checkpoints (`.pt` or `.safetensors`) with architecture compati
 **LoRA-style injection** — Injects the difference between a donor and base model into a target model: `result = base + scale × (donor − base)`. Target groups are selectable independently.
 
 Output format: `.safetensors` (recommended for inference) or `.pt`.
+
+### Tab 8: LoRA Merge (🧬)
+
+Two sub-tabs for LoRA-specific merge operations.
+
+**Sub-tab 1: Standard LoRA Merge** — Merges two LoRA adapters into a new adapter without baking into the base model. Supports the same merge methods as model merge (weighted average / slerp / task arithmetic) and per-group partial merge. Output is placed in `lora/lora_merged_*/`.
+
+**Sub-tab 2: Bake into Base Model** — Fuses one or two LoRA adapters (each with an independent scale) into a base model checkpoint, then optionally applies a post-bake merge between two baked results. Supports partial baking (select target layer groups per adapter) and partial post-bake merge. Output is placed in `checkpoints/lora_merged/`.
 
 ---
 
@@ -364,7 +401,7 @@ uv run torchrun --nproc_per_node 4 train.py \
 
 ```bash
 uv run python lora_train.py \
-  --base-model checkpoints/Aratako_Irodori-TTS-500M/model.safetensors \
+  --base-model checkpoints/Aratako_Irodori-TTS-500M-v3/model.safetensors \
   --manifest data/train_manifest.jsonl \
   --output-dir lora/my_run \
   --lora-rank 16 \
@@ -391,6 +428,7 @@ Irodori-TTS/
 ├── prepare_manifest.py                   # Audio → DACVAE latent preprocessing
 ├── dataset_tools.py                      # Audio slice / Whisper caption / emoji annotation
 ├── merge.py                              # Model merge utilities
+├── lora_merge.py                         # LoRA adapter merge / bake-in utilities
 ├── convert_checkpoint_to_safetensors.py  # .pt → .safetensors conversion
 ├── convert_lora_checkpoint.py            # LoRA _full → _ema conversion
 │
@@ -412,9 +450,12 @@ Irodori-TTS/
 │
 ├── checkpoints/                          # Downloaded and trained model checkpoints
 ├── lora/                                 # LoRA adapter outputs
+├── speakers/                             # Named speaker profiles
 ├── logs/                                 # Training log files
-├── data/                                 # Manifest files and DACVAE latents
-└── gradio_outputs/                       # Generated audio files from the GUI
+├── my_dataset/                           # Output destination after dataset processingt
+├── my_manifes/                           # Manifest files and DACVAE latents
+└── outputs_gradio/                       # Generated audio files from the GUI
+└── outputs_train/                        # Output destination for the trained model
 ```
 
 ---
@@ -448,7 +489,7 @@ The default config is tuned for approximately 50 samples on an RTX 5060 Ti (16 G
 ## License
 
 - **Code**: [MIT License](LICENSE)
-- **Model Weights**: Non-commercial. See the [original model card](https://huggingface.co/Aratako/Irodori-TTS-500M) for details.
+- **Model Weights**: Non-commercial. See the [original model card](https://huggingface.co/Aratako/Irodori-TTS-500M-v3) for details.
 
 ---
 
