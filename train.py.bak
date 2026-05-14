@@ -1353,8 +1353,7 @@ def main() -> None:
             _has_duration = checkpoint_uses_duration_predictor(_sync_model_cfg_dict, _sync_state)
             _sync_overrides: dict = {}
             for _k in ("latent_dim", "latent_patch_size", "text_vocab_size", "text_dim", "model_dim",
-                        "num_layers", "num_heads", "adaln_rank", "text_tokenizer_repo", "text_add_bos",
-                        "speaker_dim", "speaker_layers", "speaker_heads", "speaker_patch_size"):
+                        "num_layers", "num_heads", "adaln_rank", "text_tokenizer_repo", "text_add_bos"):
                 if _k == "latent_dim" and cli_provided(raw_argv, "--latent-dim"):
                     continue
                 if _k == "latent_patch_size" and cli_provided(raw_argv, "--latent-patch-size"):
@@ -1549,28 +1548,13 @@ def main() -> None:
             if is_main_process:
                 print(f"Partial init from: {init_path} (missing={len(missing_keys)})")
         else:
-            # shape mismatch があると strict=False でも RuntimeError になるため、
-            # 事前に shape を確認して不一致があれば部分ロードにフォールバックする
-            _model_state = raw_model.state_dict()
-            _has_shape_mismatch = any(
-                k in _model_state and tuple(_model_state[k].shape) != tuple(v.shape)
-                for k, v in init_state.items()
-            )
-            if _has_shape_mismatch:
-                missing, skipped_shape, skipped_extra = load_model_state_partially(raw_model, init_state)
-                if is_main_process:
-                    print(f"Loaded weights from: {init_path} (partial: shape mismatch fallback)")
-                    print(f"  Shape mismatch skipped: {len(skipped_shape)} keys")
-                    if missing:
-                        print(f"  Missing keys: {len(missing)}")
-            else:
-                missing, unexpected = raw_model.load_state_dict(init_state, strict=False)
-                if is_main_process:
-                    print(f"Loaded weights from: {init_path}")
-                    if missing:
-                        print(f"  Missing keys: {len(missing)}")
-                    if unexpected:
-                        print(f"  Unexpected keys: {len(unexpected)}")
+            missing, unexpected = raw_model.load_state_dict(init_state, strict=False)
+            if is_main_process:
+                print(f"Loaded weights from: {init_path}")
+                if missing:
+                    print(f"  Missing keys: {len(missing)}")
+                if unexpected:
+                    print(f"  Unexpected keys: {len(unexpected)}")
         # caption embeddingをpretrained initializeする（v3アップグレード時）
         if _upgrade_caption and is_main_process:
             print(f"Initializing caption embedding from pretrained: {model_cfg.caption_tokenizer_repo_resolved}")

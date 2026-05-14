@@ -28,7 +28,7 @@ train:
   fixed_target_full_mask: true
   log_every: 10
   save_every: 100
-  wandb_enabled: true
+  wandb_enabled: false
   wandb_project: null
   wandb_run_name: null
   valid_ratio: 0.1

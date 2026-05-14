@@ -326,7 +326,7 @@ def main() -> None:
     parser.add_argument("--ademamix-alpha", type=float, default=5.0)
     parser.add_argument("--ademamix-beta3", type=float, default=0.9999)
     parser.add_argument("--metrics-log-dir", default=None,
-                        help="メトリクスログ(metrics_log.jsonl)の出力先ディレクトリ (デフォルト: <output_dir>/logs)。")
+                        help="メトリクスログ(lora_metrics_log.jsonl)の出力先ディレクトリ (デフォルト: <output_dir>/logs)。")
 
     args = parser.parse_args()
 
@@ -667,7 +667,7 @@ def main() -> None:
     else:
         _metrics_log_dir = output_dir / "logs"
     _metrics_log_dir.mkdir(parents=True, exist_ok=True)
-    _metrics_log_path = _metrics_log_dir / "metrics_log.jsonl"
+    _metrics_log_path = _metrics_log_dir / "lora_metrics_log.jsonl"
     _metrics_log_file = open(_metrics_log_path, "a", encoding="utf-8", buffering=1)
     print(f"ローカルメトリクスログ有効: {_metrics_log_path}")
 
@@ -683,7 +683,8 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
 
     accum_micro_steps = 0
-    accum_loss = torch.zeros((), device=device, dtype=torch.float32)
+    accum_loss    = torch.zeros((), device=device, dtype=torch.float32)
+    accum_rf_loss = torch.zeros((), device=device, dtype=torch.float32)
     epoch = 0
 
     print(f"学習開始: max_steps={args.max_steps} save_every={args.save_every}")
@@ -820,13 +821,16 @@ def main() -> None:
 
                 loss = rf_loss + float(train_cfg.duration_loss_weight) * duration_loss
                 (loss / float(accum_steps)).backward()
-                accum_loss += loss.detach()
+                accum_loss    += loss.detach()
+                accum_rf_loss += rf_loss.detach()
 
                 if not should_step:
                     continue
 
-                step_loss = (accum_loss / float(accum_steps)).item()
+                step_loss    = (accum_loss    / float(accum_steps)).item()
+                step_rf_loss = (accum_rf_loss / float(accum_steps)).item()
                 accum_loss.zero_()
+                accum_rf_loss.zero_()
 
                 torch.nn.utils.clip_grad_norm_(
                     trainable_params,
@@ -871,7 +875,7 @@ def main() -> None:
                     if wandb_run is not None:
                         wandb_run.log({"train/loss": step_loss, "train/lr": lr_val}, step=step)
                     if _metrics_log_file is not None:
-                        _wmetrics = {"type": "train", "step": step, "loss": step_loss, "lr": lr_val}
+                        _wmetrics = {"type": "train", "step": step, "loss": step_loss, "rf_loss": step_rf_loss, "lr": lr_val}
                         _metrics_log_file.write(json.dumps(_wmetrics) + "\n")
 
                 if step % args.save_every == 0:
@@ -897,7 +901,7 @@ def main() -> None:
                     if wandb_run is not None:
                         wandb_run.log({"valid/loss": v_loss}, step=step)
                     if _metrics_log_file is not None:
-                        _vmetrics = {"type": "valid", "step": step, "loss": v_loss, "rf_loss": valid_metrics["rf_loss"]}
+                        _vmetrics = {"type": "valid", "step": step, "loss": v_loss, "rf_loss": valid_metrics.get("rf_loss", 0.0)}
                         _metrics_log_file.write(json.dumps(_vmetrics) + "\n")
 
                     # ベストval保存

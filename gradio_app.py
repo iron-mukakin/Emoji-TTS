@@ -63,7 +63,7 @@ BASE_DIR         = Path(__file__).resolve().parent
 CHECKPOINTS_DIR  = BASE_DIR / "checkpoints"
 CONFIGS_DIR      = BASE_DIR / "configs"
 LOGS_DIR         = BASE_DIR / "logs"
-OUTPUTS_DIR      = BASE_DIR / "gradio_outputs"
+OUTPUTS_DIR      = BASE_DIR / "outputs_gradio"
 LORA_DIR         = BASE_DIR / "lora"
 DEFAULT_HF_REPO  = "Aratako/Irodori-TTS-500M-v3"
 DEFAULT_CONFIG   = "train_v2.yaml"
@@ -110,10 +110,15 @@ def _scan_configs() -> list[str]:
            sorted(str(p) for p in CONFIGS_DIR.glob("*.yml"))
 
 
+_METRICS_JSONL_NAMES = {"metrics_log.jsonl", "lora_metrics_log.jsonl"}
+
 def _scan_manifests() -> list[str]:
     _manifest_dir = BASE_DIR / "my_manifest"
     _manifest_dir.mkdir(parents=True, exist_ok=True)
-    return sorted(str(p) for p in _manifest_dir.glob("*.jsonl"))
+    return sorted(
+        str(p) for p in _manifest_dir.glob("*.jsonl")
+        if p.name not in _METRICS_JSONL_NAMES
+    )
 
 
 def _scan_train_checkpoints() -> list[str]:
@@ -1207,6 +1212,10 @@ def _config_from_ui(
     seed,
 ) -> dict:
     return {
+        "model": {
+            "text_heads": 8,
+            "speaker_heads": 8,
+        },
         "train": {
             "batch_size": int(batch_size),
             "gradient_accumulation_steps": int(grad_accum),
@@ -1320,6 +1329,11 @@ def _start_train(
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOGS_DIR / f"train_{stamp}.log"
+
+    # ローカルメトリクスログを有効化している場合は開始時にJSONLを初期化
+    _metrics_jsonl = LOGS_DIR / "metrics_log.jsonl"
+    if cfg_data.get("train", {}).get("wandb_enabled", False) and _metrics_jsonl.exists():
+        _metrics_jsonl.write_text("", encoding="utf-8")
 
     _TRAIN_ETA_INFO.clear()
 
@@ -1964,12 +1978,9 @@ def _build_lora_train_command(
             "--early-stopping-min-delta", str(float(es_min_delta)),
         ]
 
+    # ローカルメトリクスログ（wandb_enabled を流用）
     if wandb_enabled:
-        cmd += ["--wandb"]
-        if str(wandb_project).strip():
-            cmd += ["--wandb-project", str(wandb_project).strip()]
-        if str(wandb_run_name).strip():
-            cmd += ["--wandb-run-name", str(wandb_run_name).strip()]
+        cmd += ["--metrics-log-dir", str(LOGS_DIR)]
 
     if resume_enabled and str(resume_lora_path).strip():
         cmd += ["--resume-lora", str(resume_lora_path).strip()]
@@ -2001,6 +2012,15 @@ def _start_lora_train(*args) -> tuple[str, str]:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOGS_DIR / f"lora_train_{stamp}.log"
+
+    # ローカルメトリクスログを有効化している場合は開始時にJSONLを初期化
+    try:
+        _lora_metrics_enabled = bool(args[28])
+    except (IndexError, TypeError):
+        _lora_metrics_enabled = False
+    _lora_metrics_jsonl = LOGS_DIR / "lora_metrics_log.jsonl"
+    if _lora_metrics_enabled and _lora_metrics_jsonl.exists():
+        _lora_metrics_jsonl.write_text("", encoding="utf-8")
 
     _LORA_ETA_INFO.clear()
 
@@ -2097,6 +2117,78 @@ def _stop_lora_train() -> str:
     import threading as _thr
     _thr.Thread(target=_deferred_kill, daemon=True).start()
     return f"LoRA学習プロセス (PID {pid}) に停止シグナルを送信しました（最大5秒でシャットダウン）。"
+
+
+def _parse_lora_log_metrics():
+    """LoRA学習のメトリクスをJSONLまたはテキストログからパースして返す。
+    戻り値: (df_train, df_valid) — pandas未インストール時は (None, None)。
+    """
+    if not _PANDAS_AVAILABLE:
+        return None, None
+    with _LORA_TRAIN_LOG_LOCK:
+        path = _LORA_TRAIN_LOG_PATH
+
+    _empty_train = pd.DataFrame({"step": [], "loss": [], "rf_loss": [], "lr": []})
+    _empty_valid = pd.DataFrame({"step": [], "loss": [], "rf_loss": []})
+
+    # JSONL優先（LOGS_DIR/lora_metrics_log.jsonl）
+    jsonl_path = LOGS_DIR / "lora_metrics_log.jsonl"
+    if not jsonl_path.exists():
+        jsonl_path = None
+
+    train_rows: list[dict] = []
+    valid_rows: list[dict] = []
+
+    if jsonl_path is not None:
+        for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                rtype = rec.get("type", "train")
+                step  = int(rec["step"])
+                loss  = float(rec["loss"])
+                rf    = float(rec.get("rf_loss", 0.0))
+                if rtype == "train":
+                    lr = float(rec.get("lr", 0.0))
+                    train_rows.append({"step": step, "loss": loss, "rf_loss": rf, "lr": lr})
+                elif rtype == "valid":
+                    valid_rows.append({"step": step, "loss": loss, "rf_loss": rf})
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
+    elif path is not None and path.exists():
+        # テキストログからパース（JSONLなし時のフォールバック）
+        import re as _re_lora
+        _RE_STEP = _re_lora.compile(r"\bstep=(\d+)")
+        _RE_LOSS = _re_lora.compile(r"\bloss=([0-9.eE+\-]+)")
+        _RE_RF   = _re_lora.compile(r"\brf=([0-9.eE+\-]+)")
+        _RE_LR   = _re_lora.compile(r"\blr=([0-9.eE+\-]+)")
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "step=" not in line or "loss=" not in line:
+                continue
+            stripped = line.lstrip()
+            try:
+                m_step = _RE_STEP.search(line)
+                m_loss = _RE_LOSS.search(line)
+                if not m_step or not m_loss:
+                    continue
+                step = int(m_step.group(1))
+                loss = float(m_loss.group(1))
+                m_rf = _RE_RF.search(line)
+                rf   = float(m_rf.group(1)) if m_rf else float("nan")
+                if stripped.startswith("valid"):
+                    valid_rows.append({"step": step, "loss": loss, "rf_loss": rf})
+                elif not stripped.startswith("EarlyStopping"):
+                    m_lr = _RE_LR.search(line)
+                    lr   = float(m_lr.group(1)) if m_lr else 0.0
+                    train_rows.append({"step": step, "loss": loss, "rf_loss": rf, "lr": lr})
+            except (ValueError, AttributeError):
+                continue
+
+    df_train = pd.DataFrame(train_rows) if train_rows else _empty_train
+    df_valid = pd.DataFrame(valid_rows) if valid_rows else _empty_valid
+    return df_train, df_valid
 
 
 def _read_lora_train_log() -> str:
@@ -2920,11 +3012,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     pm_output_manifest = gr.Textbox(
                         label="出力マニフェストパス（.jsonl）",
-                        value=str(BASE_DIR / "my_manifest" / "train_manifest.jsonl"),
+                        value=str(BASE_DIR / "data" / "train_manifest.jsonl"),
                     )
                     pm_latent_dir = gr.Textbox(
                         label="ラテント保存フォルダ",
-                        value=str(BASE_DIR / "my_manifest" / "latents"),
+                        value=str(BASE_DIR / "data" / "latents"),
                     )
                     pm_device = gr.Dropdown(
                         label="使用デバイス", choices=device_choices, value=default_model_device,
@@ -3093,7 +3185,7 @@ def build_ui() -> gr.Blocks:
                     train_manifest_refresh = gr.Button("🔄", scale=1)
                 train_output_dir = gr.Textbox(
                     label="学習出力フォルダ（チェックポイント保存先）",
-                    value=str(BASE_DIR / "outputs" / "irodori_tts"),
+                    value=str(BASE_DIR / "outputs_train" / "irodori_tts"),
                 )
 
                 with gr.Row():
@@ -3127,7 +3219,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         resume_enabled = gr.Checkbox(
                             label="--resume を有効にする（追加学習 / チェックポイント再開）",
-                            value=False,
+                            value=True,
                             scale=1,
                         )
                     resume_checkpoint = gr.Textbox(
@@ -3459,7 +3551,7 @@ def build_ui() -> gr.Blocks:
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("🚀 LoRA学習"):
                 gr.Markdown(
-                    "## LoRA 差分学習\n"
+                    "## LoRA 学習\n"
                     "ベースモデルに対して LoRA アダプタを学習します。\n\n"
                     "> **必要ライブラリ**: `pip install peft`"
                 )
@@ -3489,8 +3581,8 @@ def build_ui() -> gr.Blocks:
                         label="ベースモデル (.pt / .safetensors)",
                         choices=initial_checkpoints,
                         value=(
-                            str(CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v2" / "model.safetensors")
-                            if (CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v2" / "model.safetensors").exists()
+                            str(CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors")
+                            if (CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors").exists()
                             else (initial_checkpoints[-1] if initial_checkpoints else None)
                         ),
                         allow_custom_value=True, scale=4,
@@ -3616,12 +3708,13 @@ def build_ui() -> gr.Blocks:
                         lora_es_patience = gr.Number(label="パティエンス", value=3, precision=0)
                         lora_es_min_delta = gr.Number(label="最小悪化量", value=0.01)
 
-                # ── W&B設定 ──
-                with gr.Accordion("📈 W&B設定", open=False):
+                # ── ローカルメトリクスログ設定 ──
+                with gr.Accordion("📊 ローカルメトリクスログ設定", open=False):
+                    gr.Markdown("*有効化するとlogsフォルダに`lora_metrics_log.jsonl`を書き出し、GUI上のグラフにリアルタイム反映します（クラウド不要）。*")
                     with gr.Row():
-                        lora_wandb_enabled = gr.Checkbox(label="W&Bを有効化", value=False)
-                        lora_wandb_project = gr.Textbox(label="W&Bプロジェクト名", value="")
-                        lora_wandb_run_name = gr.Textbox(label="W&B実行名（省略可）", value="")
+                        lora_wandb_enabled = gr.Checkbox(label="ローカルメトリクスログを有効化", value=False)
+                    lora_wandb_project  = gr.Textbox(value="", visible=False)
+                    lora_wandb_run_name = gr.Textbox(value="", visible=False)
 
                 lora_seed = gr.Number(label="乱数シード", value=0, precision=0)
 
@@ -3633,11 +3726,47 @@ def build_ui() -> gr.Blocks:
                     lora_stop_btn = gr.Button("⏹️ 停止", variant="stop")
                 lora_train_status = gr.Textbox(label="実行状況", interactive=False, lines=2)
 
-                gr.Markdown("### 📋 学習ログ")
+                gr.Markdown("### 📈 学習ログ・グラフ")
                 with gr.Row():
                     lora_log_interval = gr.Slider(label="自動更新間隔（秒）", minimum=2, maximum=60, value=5, step=1, scale=3)
                     lora_log_refresh_btn = gr.Button("🔄 手動更新", scale=1)
                 lora_log_text = gr.Textbox(label="LoRA学習ログ（末尾200行）", interactive=False, lines=15, max_lines=15)
+
+                if _PANDAS_AVAILABLE:
+                    gr.Markdown("*ログ・グラフは自動更新されます（手動更新ボタンでも即時反映可）。*")
+                    _lora_empty_train = pd.DataFrame({"step": [], "loss": [], "rf_loss": [], "lr": []})
+                    _lora_empty_valid = pd.DataFrame({"step": [], "loss": [], "rf_loss": []})
+                    with gr.Row():
+                        lora_loss_plot = gr.LinePlot(
+                            value=_lora_empty_train,
+                            label="Train Loss",
+                            x="step", y="loss",
+                            height=300,
+                        )
+                        lora_rf_loss_plot = gr.LinePlot(
+                            value=_lora_empty_train,
+                            label="Train RF Loss",
+                            x="step", y="rf_loss",
+                            height=300,
+                        )
+                    with gr.Row():
+                        lora_valid_loss_plot = gr.LinePlot(
+                            value=_lora_empty_valid,
+                            label="Valid Loss",
+                            x="step", y="loss",
+                            height=300,
+                        )
+                        lora_lr_plot = gr.LinePlot(
+                            value=_lora_empty_train,
+                            label="学習率曲線",
+                            x="step", y="lr",
+                            height=300,
+                        )
+                else:
+                    gr.Markdown(
+                        "⚠️ **グラフ表示には `pandas` が必要です。**\n"
+                        "`pip install pandas` を実行後に再起動してください。"
+                    )
 
                 # ── イベント配線 ──
                 _lora_exec_inputs = [
@@ -3709,9 +3838,31 @@ def build_ui() -> gr.Blocks:
                 lora_start_btn.click(_start_lora_train, inputs=_lora_exec_inputs,
                                      outputs=[lora_train_status, lora_cmd_preview])
                 lora_stop_btn.click(_stop_lora_train, outputs=[lora_train_status])
-                lora_log_refresh_btn.click(_read_lora_train_log, outputs=[lora_log_text])
-                _lora_timer = gr.Timer(value=5, active=True)
-                _lora_timer.tick(_read_lora_train_log, outputs=[lora_log_text])
+
+                if _PANDAS_AVAILABLE:
+                    def _do_lora_refresh():
+                        log = _read_lora_train_log()
+                        df_train, df_valid = _parse_lora_log_metrics()
+                        if df_train is None:
+                            df_train = pd.DataFrame({"step": [], "loss": [], "rf_loss": [], "lr": []})
+                        if df_valid is None:
+                            df_valid = pd.DataFrame({"step": [], "loss": [], "rf_loss": []})
+                        return log, df_train, df_train, df_valid, df_train
+
+                    lora_log_refresh_btn.click(
+                        _do_lora_refresh,
+                        outputs=[lora_log_text, lora_loss_plot, lora_rf_loss_plot, lora_valid_loss_plot, lora_lr_plot],
+                    )
+                    _lora_timer = gr.Timer(value=5, active=True)
+                    _lora_timer.tick(
+                        _do_lora_refresh,
+                        outputs=[lora_log_text, lora_loss_plot, lora_rf_loss_plot, lora_valid_loss_plot, lora_lr_plot],
+                    )
+                else:
+                    lora_log_refresh_btn.click(_read_lora_train_log, outputs=[lora_log_text])
+                    _lora_timer = gr.Timer(value=5, active=True)
+                    _lora_timer.tick(_read_lora_train_log, outputs=[lora_log_text])
+
                 lora_log_interval.change(lambda v: float(v), inputs=[lora_log_interval], outputs=[_lora_timer])
 
             # ═══════════════════════════════════════════════════════════════
