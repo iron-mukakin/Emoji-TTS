@@ -55,6 +55,9 @@ _DIM_TO_VERSION: dict[int, str] = {
     128: "v1 (dim128)",
 }
 
+
+# v3 は latent_dim=32 で v2 と同値のため、アーキテクチャ特徴で区別する。
+_V3_DURATION_ARCHITECTURE = "token_sum_adarn_zero_no_aux"
 _ADAPTER_STATES = ("adapter_model.safetensors", "adapter_model.bin")
 
 # LoRAアダプタのキー検索に使う優先順位付きパターン
@@ -76,39 +79,94 @@ _VERSION_KEY_PATTERNS = [
 # バージョン判定
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_v3_config(cfg: dict[str, Any]) -> bool:
+    """
+    model_config dict から v3 かどうかを判定する。
+    判定順:
+      1. use_duration_predictor == True
+      2. duration_architecture == _V3_DURATION_ARCHITECTURE
+    いずれかが True なら v3 と見なす。
+    """
+    if cfg.get("use_duration_predictor") is True:
+        return True
+    if cfg.get("duration_architecture") == _V3_DURATION_ARCHITECTURE:
+        return True
+    return False
+
+
+def _is_v3_safetensors(safe_path: "Path") -> bool:
+    """
+    adapter_model.safetensors のメタデータ・テンソルキーから v3 を判定する。
+    判定順（指定優先度に従う）:
+      1. safetensors metadata の config_json.use_duration_predictor == "true"
+      2. safetensors metadata の config_json.duration_architecture == _V3_DURATION_ARCHITECTURE
+      3. テンソルキーに "duration_predictor." prefix が存在する
+    Returns True if v3, False otherwise.
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(str(safe_path), framework="pt", device="cpu") as h:
+            meta = h.metadata() or {}
+            all_keys = list(h.keys())
+
+        config_json_str = meta.get("config_json") or meta.get("model_config") or ""
+        if config_json_str:
+            try:
+                import json as _json
+                cfg_meta = _json.loads(config_json_str)
+                udp = cfg_meta.get("use_duration_predictor")
+                if udp is True or str(udp).lower() == "true":
+                    return True
+                if cfg_meta.get("duration_architecture") == _V3_DURATION_ARCHITECTURE:
+                    return True
+            except Exception:
+                pass
+
+        if str(meta.get("use_duration_predictor", "")).lower() == "true":
+            return True
+        if meta.get("duration_architecture", "") == _V3_DURATION_ARCHITECTURE:
+            return True
+
+        if any(k.startswith("duration_predictor.") or ".duration_predictor." in k
+               for k in all_keys):
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
 def _version_label(cfg: dict[str, Any]) -> str:
-    """model_config から v1/v2 ラベルを返す。"""
+    """model_config から v1/v2/v3 ラベルを返す。"""
     dim = cfg.get("latent_dim")
     if dim is None:
         return "unknown"
+    if int(dim) == 32 and _is_v3_config(cfg):
+        return "v3 (dim32)"
     return _DIM_TO_VERSION.get(int(dim), f"unknown(dim={dim})")
-
 
 def _infer_adapter_version(adapter_dir: Path) -> str:
     """
     アダプタフォルダからバージョンを推定する。
 
     優先順位:
-    1. _full フォルダの train_state.json の base_model_config.latent_dim
-    2. adapter_model.safetensors の in_proj.lora_A shape（io グループ対象時）
-    3. adapter_model.safetensors の任意の lora_A shape からの推定
-    4. adapter_config.json の safetensors_metadata.latent_dim（あれば）
+    1. _full フォルダの train_state.json の base_model_config（latent_dim + v3判定）
+    2. adapter_model.safetensors の metadata / テンソルキーによる v3 判定
+    3. adapter_model.safetensors の in_proj.lora_A shape（dim判定）
+    4. adapter_config.json（判定不可のため現状スキップ）
 
-    Returns: "v2 (dim32)" / "v1 (dim128)" / "unknown"
+    Returns: "v3 (dim32)" / "v2 (dim32)" / "v1 (dim128)" / "unknown"
     """
     p = adapter_dir
 
-    # --- 優先1: 隣接 _full フォルダの train_state.json ---
-    # _ema フォルダの場合は対応する _full を探す
     full_candidates: list[Path] = []
     name = p.name
     if name.endswith("_ema"):
         full_name = name[:-4] + "_full"
         full_candidates.append(p.parent / full_name)
-    # _full 自体の場合
     if name.endswith("_full"):
         full_candidates.append(p)
-    # 同階層の任意の _full フォルダも探す
     for sib in sorted(p.parent.glob("*_full")):
         if sib not in full_candidates:
             full_candidates.append(sib)
@@ -121,12 +179,17 @@ def _infer_adapter_version(adapter_dir: Path) -> str:
                 cfg = ts.get("base_model_config", {})
                 dim = cfg.get("latent_dim")
                 if dim is not None:
+                    if int(dim) == 32 and _is_v3_config(cfg):
+                        return "v3 (dim32)"
                     return _DIM_TO_VERSION.get(int(dim), f"unknown(dim={dim})")
             except Exception:
                 pass
 
-    # --- 優先2 & 3: adapter_model.safetensors のテンソル shape から推定 ---
     safe_path = p / "adapter_model.safetensors"
+    if safe_path.is_file():
+        if _is_v3_safetensors(safe_path):
+            return "v3 (dim32)"
+
     if safe_path.is_file():
         try:
             from safetensors import safe_open
@@ -144,40 +207,30 @@ def _infer_adapter_version(adapter_dir: Path) -> str:
                     t = h.get_tensor(key)
                 feat = int(t.shape[axis])
 
-                # in_proj の場合: feat = latent_dim * patch_size
                 if mod_pat == "in_proj":
                     for known_dim in (32, 128):
                         if feat % known_dim == 0:
                             return _DIM_TO_VERSION.get(known_dim, f"unknown(dim={known_dim})")
-
-                # attention / MLP 重みの場合: feat = model_dim
-                # model_dim はアーキテクチャ依存だが、v1/v2 で値が固定されているなら判定可能
-                # ただし model_dim は latent_dim とは独立しているため直接判定不可
-                # → ここでは判定を行わず次パターンへ
                 continue
 
         except Exception:
             pass
 
-    # --- 優先4: adapter_config.json に irodori 独自メタデータがあれば ---
-    cfg_path = p / "adapter_config.json"
-    if cfg_path.is_file():
-        try:
-            ac = json.loads(cfg_path.read_text(encoding="utf-8"))
-            # 本家 Irodori-TTS の LoRA は target_modules が正規表現形式
-            # フォーク版は文字列リスト形式
-            # どちらも latent_dim は含まないため判定不可
-            pass
-        except Exception:
-            pass
-
     return "不明（train_state.json なし・in_proj 未学習）"
 
-
 def _get_adapter_latent_dim_from_train_state(adapter_dir: Path) -> int | None:
+    """後方互換ラッパー。latent_dim のみを返す。"""
+    info = _get_adapter_version_info_from_train_state(adapter_dir)
+    return info[0] if info is not None else None
+
+
+def _get_adapter_version_info_from_train_state(
+    adapter_dir: Path,
+) -> tuple[int, bool] | None:
     """
-    _full フォルダの train_state.json から latent_dim を取得する。
+    _full フォルダの train_state.json から (latent_dim, is_v3) を返す。
     _ema フォルダが渡された場合も対応する _full を探す。
+    Returns None if train_state.json が見つからない / latent_dim が読めない。
     """
     p = adapter_dir
     candidates: list[Path] = []
@@ -195,13 +248,13 @@ def _get_adapter_latent_dim_from_train_state(adapter_dir: Path) -> int | None:
         if ts_path.is_file():
             try:
                 ts = json.loads(ts_path.read_text(encoding="utf-8"))
-                dim = ts.get("base_model_config", {}).get("latent_dim")
+                cfg = ts.get("base_model_config", {})
+                dim = cfg.get("latent_dim")
                 if dim is not None:
-                    return int(dim)
+                    return int(dim), _is_v3_config(cfg)
             except Exception:
                 pass
     return None
-
 
 def _validate_adapter_vs_base(
     adapter_dir: Path,
@@ -210,15 +263,17 @@ def _validate_adapter_vs_base(
 ) -> tuple[bool, str]:
     """
     アダプタとベースモデルのバージョン互換性を検証する。
-    train_state.json が利用可能な場合はそちらを優先する。
+    v2/v3 は latent_dim が同じ 32 のため、is_v3 フラグで区別する。
     Returns (ok, error_message).
     """
     base_dim   = int(cfg_base.get("latent_dim", 0))
+    base_is_v3 = _is_v3_config(cfg_base)
     base_ver   = _version_label(cfg_base)
 
-    # train_state.json ベースの検証（最も確実）
-    adapter_dim = _get_adapter_latent_dim_from_train_state(adapter_dir)
-    if adapter_dim is not None:
+    # --- train_state.json ベースの検証（最も確実） ---
+    adapter_info = _get_adapter_version_info_from_train_state(adapter_dir)
+    if adapter_info is not None:
+        adapter_dim, adapter_is_v3 = adapter_info
         if adapter_dim != base_dim:
             adapter_ver = _DIM_TO_VERSION.get(adapter_dim, f"unknown(dim={adapter_dim})")
             return False, (
@@ -227,11 +282,29 @@ def _validate_adapter_vs_base(
                 f"   {label}: {adapter_ver} (latent_dim={adapter_dim})\n"
                 f"   同じバージョン同士の組み合わせを使用してください。"
             )
+        if adapter_dim == 32 and adapter_is_v3 != base_is_v3:
+            adapter_ver = "v3 (dim32)" if adapter_is_v3 else "v2 (dim32)"
+            return False, (
+                f"⚠️ バージョン不一致（ガードレール）: {label} とベースモデルの世代が異なります。\n"
+                f"   ベースモデル: {base_ver}\n"
+                f"   {label}: {adapter_ver}\n"
+                f"   v2 アダプタは v2 ベース、v3 アダプタは v3 ベースと組み合わせてください。"
+            )
         return True, ""
 
-    # train_state.json がない場合は in_proj shape で検証
+    # --- train_state.json がない場合: safetensors で v3 判定 + in_proj shape で dim 検証 ---
     safe_path = adapter_dir / "adapter_model.safetensors"
     if safe_path.is_file():
+        adapter_is_v3_safe = _is_v3_safetensors(safe_path)
+        if base_dim == 32 and adapter_is_v3_safe != base_is_v3:
+            adapter_ver = "v3 (dim32)" if adapter_is_v3_safe else "v2 (dim32)"
+            return False, (
+                f"⚠️ バージョン不一致（ガードレール）: {label} とベースモデルの世代が異なります。\n"
+                f"   ベースモデル: {base_ver}\n"
+                f"   {label}: {adapter_ver} （safetensors メタデータ/テンソルキーから推定）\n"
+                f"   v2 アダプタは v2 ベース、v3 アダプタは v3 ベースと組み合わせてください。"
+            )
+
         try:
             from safetensors import safe_open
             with safe_open(str(safe_path), framework="pt", device="cpu") as h:
@@ -260,10 +333,7 @@ def _validate_adapter_vs_base(
         except Exception as e:
             return False, f"❌ {label} の shape 検証中にエラーが発生しました: {e}"
 
-    # 検証できない場合は通過（.bin 等）
     return True, ""
-
-
 def _validate_adapters_mutual(
     adapter_dir_a: Path,
     adapter_dir_b: Path,
@@ -272,13 +342,14 @@ def _validate_adapters_mutual(
 ) -> tuple[bool, str]:
     """
     LoRAアダプタ同士のバージョン互換性を検証する（ベースモデルなし）。
-    train_state.json が双方にある場合は latent_dim を比較する。
-    片方または双方にない場合は adapter_config.json の target_modules と rank を比較。
+    v2/v3 は latent_dim が同じ 32 のため is_v3 フラグで区別する。
     """
-    dim_a = _get_adapter_latent_dim_from_train_state(adapter_dir_a)
-    dim_b = _get_adapter_latent_dim_from_train_state(adapter_dir_b)
+    info_a = _get_adapter_version_info_from_train_state(adapter_dir_a)
+    info_b = _get_adapter_version_info_from_train_state(adapter_dir_b)
 
-    if dim_a is not None and dim_b is not None:
+    if info_a is not None and info_b is not None:
+        dim_a, is_v3_a = info_a
+        dim_b, is_v3_b = info_b
         if dim_a != dim_b:
             ver_a = _DIM_TO_VERSION.get(dim_a, f"unknown(dim={dim_a})")
             ver_b = _DIM_TO_VERSION.get(dim_b, f"unknown(dim={dim_b})")
@@ -288,9 +359,32 @@ def _validate_adapters_mutual(
                 f"   {label_b}: {ver_b} (latent_dim={dim_b})\n"
                 f"   同じバージョン同士の組み合わせを使用してください。"
             )
+        if dim_a == 32 and is_v3_a != is_v3_b:
+            ver_a = "v3 (dim32)" if is_v3_a else "v2 (dim32)"
+            ver_b = "v3 (dim32)" if is_v3_b else "v2 (dim32)"
+            return False, (
+                f"⚠️ バージョン不一致（ガードレール）: {label_a} と {label_b} の世代が異なります。\n"
+                f"   {label_a}: {ver_a}\n"
+                f"   {label_b}: {ver_b}\n"
+                f"   v2 同士、または v3 同士の組み合わせを使用してください。"
+            )
         return True, ""
 
-    # train_state.json がない場合は adapter_config.json の target_modules を比較
+    safe_a = adapter_dir_a / "adapter_model.safetensors"
+    safe_b = adapter_dir_b / "adapter_model.safetensors"
+    if safe_a.is_file() and safe_b.is_file():
+        is_v3_a_safe = _is_v3_safetensors(safe_a)
+        is_v3_b_safe = _is_v3_safetensors(safe_b)
+        if is_v3_a_safe != is_v3_b_safe:
+            ver_a = "v3 (dim32)" if is_v3_a_safe else "v2/v1"
+            ver_b = "v3 (dim32)" if is_v3_b_safe else "v2/v1"
+            return False, (
+                f"⚠️ バージョン不一致（ガードレール）: {label_a} と {label_b} の世代が異なります。\n"
+                f"   {label_a}: {ver_a} （safetensors から推定）\n"
+                f"   {label_b}: {ver_b} （safetensors から推定）\n"
+                f"   v2 同士、または v3 同士の組み合わせを使用してください。"
+            )
+
     try:
         cfg_a_path = adapter_dir_a / "adapter_config.json"
         cfg_b_path = adapter_dir_b / "adapter_config.json"
@@ -299,8 +393,6 @@ def _validate_adapters_mutual(
             cfg_b = json.loads(cfg_b_path.read_text(encoding="utf-8"))
             tm_a = set(cfg_a.get("target_modules", []) or [])
             tm_b = set(cfg_b.get("target_modules", []) or [])
-            r_a  = cfg_a.get("r", None)
-            r_b  = cfg_b.get("r", None)
             mismatches = []
             if tm_a != tm_b:
                 mismatches.append(f"   target_modules: {label_a}={sorted(tm_a)} / {label_b}={sorted(tm_b)}")
@@ -314,8 +406,6 @@ def _validate_adapters_mutual(
         pass
 
     return True, ""
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # アダプタロード
 # ─────────────────────────────────────────────────────────────────────────────

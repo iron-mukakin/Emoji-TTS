@@ -38,13 +38,23 @@ ARCH_CRITICAL_KEYS = {
     "text_dim", "text_layers", "text_heads",
     "speaker_dim", "speaker_layers", "speaker_heads",
     "latent_dim", "latent_patch_size",
+    # v3 対応追加: 重みshapeに直結するフィールド
+    "adaln_rank",
+    "duration_architecture",
+    "duration_aux_dim",
+    "mlp_ratio",
+    "text_mlp_ratio",
+    "speaker_mlp_ratio",
+    "speaker_patch_size",
+    "timestep_embed_dim",
+    "use_caption_condition",
 }
 
 # SLERP ゼロベクトル判定閾値
 SLERP_NORM_THRESHOLD = 1e-6
 
 # Task Arithmetic デフォルトベースモデルパス
-DEFAULT_BASE_PATH = CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M" / "model.safetensors"
+DEFAULT_BASE_PATH = CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors"
 
 # 部分マージ グループ定義（キープレフィックス）
 LAYER_GROUPS: dict[str, list[str]] = {
@@ -416,7 +426,8 @@ def _format_compat_error(
     互換性エラーメッセージを生成する。
     latent_dim の不一致が含まれる場合は v1/v2 の混在であることを明示する。
     """
-    _DIM_TO_VERSION = {32: "v2 (dim32)", 128: "v1 (dim128)"}
+    # v2/v3 は同じ dim32 のため latent_dim のみでは区別不可
+    _DIM_TO_VERSION = {32: "v2/v3 (dim32)", 128: "v1 (dim128)"}
 
     dim_a = cfg_a.get("latent_dim")
     dim_b = cfg_b.get("latent_dim")
@@ -428,9 +439,9 @@ def _format_compat_error(
         ver_a = _DIM_TO_VERSION.get(int(dim_a), f"unknown(dim={dim_a})")
         ver_b = _DIM_TO_VERSION.get(int(dim_b), f"unknown(dim={dim_b})")
         lines = [
-            f"❌ モデルバージョン互換性エラー{ctx}: v1/v2 混在のためマージ不可",
+            f"❌ モデルバージョン互換性エラー{ctx}: v1 / v2・v3 混在のためマージ不可",
             f"   {label_a}: {ver_a}  /  {label_b}: {ver_b}",
-            "   同じバージョン（どちらも v2 または どちらも v1）のモデル同士を選択してください。",
+            "   同じバージョン（どちらも v2/v3(dim32) または どちらも v1(dim128)）のモデル同士を選択してください。",
         ]
         other = [m for m in mismatches if "latent_dim" not in m]
         if other:
