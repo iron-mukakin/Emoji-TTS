@@ -246,6 +246,8 @@ class SamplingRequest:
     speaker_kv_min_t: float | None = None
     speaker_kv_max_layers: int | None = None
     seed: int | None = None
+    t_schedule_mode: str = "linear"
+    sway_coeff: float = -1.0
     trim_tail: bool = True
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
@@ -1083,6 +1085,8 @@ class InferenceRuntime:
                     speaker_kv_scale=speaker_kv_scale,
                     speaker_kv_max_layers=speaker_kv_max_layers,
                     speaker_kv_min_t=speaker_kv_min_t,
+                    t_schedule_mode=str(req.t_schedule_mode),
+                    sway_coeff=float(req.sway_coeff),
                 )
                 stage_sec = _measure_end(self.model_device, t0)
                 stage_timings.append(("sample_rf", stage_sec))
@@ -1119,11 +1123,6 @@ class InferenceRuntime:
                             if flattening_samples > 0:
                                 max_samples = min(max_samples, flattening_samples)
                         audio_i = audio_i[:, :max_samples]
-                        if bool(req.trim_tail):
-                            audio_i = trim_trailing_silence(
-                                audio_i,
-                                sample_rate=int(self.codec.sample_rate),
-                            )
                         trimmed_audios.append(audio_i)
                 else:
                     for i in range(num_candidates):
@@ -1142,11 +1141,6 @@ class InferenceRuntime:
                             if flattening_samples > 0:
                                 max_samples = min(max_samples, flattening_samples)
                         audio_i = audio_i[:, :max_samples]
-                        if bool(req.trim_tail):
-                            audio_i = trim_trailing_silence(
-                                audio_i,
-                                sample_rate=int(self.codec.sample_rate),
-                            )
                         trimmed_audios.append(audio_i)
                 stage_sec = _measure_end(self.model_device, t0, self.codec_device)
                 stage_timings.append(("decode_latent", stage_sec))

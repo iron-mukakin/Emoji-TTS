@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 
 from .model import TextToLatentRFDiT
@@ -140,6 +141,8 @@ def sample_euler_rf_cfg(
     speaker_kv_scale: float | None = None,
     speaker_kv_max_layers: int | None = None,
     speaker_kv_min_t: float | None = None,
+    t_schedule_mode: str = "linear",
+    sway_coeff: float = -1.0,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -178,7 +181,23 @@ def sample_euler_rf_cfg(
         )
 
     init_scale = 0.999
-    t_schedule = torch.linspace(1.0, 0.0, num_steps + 1, device=device) * init_scale
+    t_schedule_mode_norm = str(t_schedule_mode).strip().lower()
+    sway_coeff_value = float(sway_coeff)
+    if not math.isfinite(sway_coeff_value):
+        raise ValueError(f"sway_coeff must be finite, got {sway_coeff!r}.")
+    if t_schedule_mode_norm == "linear":
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+    elif t_schedule_mode_norm == "sway":
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        u = u + sway_coeff_value * (torch.cos(0.5 * math.pi * u) + u - 1.0)
+        u = u.clamp(0.0, 1.0)
+    else:
+        raise ValueError(
+            f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'."
+        )
+    t_schedule = (1.0 - u) * init_scale
+    if not bool(torch.all(t_schedule[:-1] > t_schedule[1:]).item()):
+        raise ValueError("t_schedule must be strictly decreasing; adjust num_steps or sway_coeff.")
     use_independent_cfg = cfg_guidance_mode == "independent"
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"

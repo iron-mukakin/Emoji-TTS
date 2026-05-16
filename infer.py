@@ -169,7 +169,7 @@ def main() -> None:
             "(default: enabled)."
         ),
     )
-    parser.add_argument("--codec-repo", default="facebook/dacvae-watermarked")
+    parser.add_argument("--codec-repo", default="Aratako/Semantic-DACVAE-Japanese-32dim")
     parser.add_argument(
         "--lora-path",
         default=None,
