@@ -5,13 +5,18 @@
   ├── adapter_config.json
   ├── adapter_model.safetensors  ← EMA適用前の生重み
   ├── ema_shadow.pt              ← EMA shadow重み
-  └── train_state.json
+  └── trainer_state.pt
 
 出力: lora/run_name/lora_checkpoint_XXXXXXX_ema/（新規）
   ├── adapter_config.json        ← コピー
   └── adapter_model.safetensors  ← EMA平滑化済み重み
 """
 from __future__ import annotations
+
+import sys
+import io
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 
 import argparse
 import inspect
@@ -102,20 +107,68 @@ def convert_lora_checkpoint(
             matched += 1
 
     if matched == 0:
-        # フォールバック: キーのプレフィックスを調整してマッチを試みる
+        # フォールバック: 正規化ベースのキーマッチ
+        #
+        # 吸収する差異:
+        #   1. peft バージョン差: ".default." セグメントの有無
+        #      例: lora_A.weight  <->  lora_A.default.weight
+        #   2. モデル構造差: 中間セグメント挿入（text_encoder 等）
+        #      例: blocks.0.attention.wk  <->  text_encoder.blocks.0.attention.wk
+        #
+        # 手順:
+        #   1. ".default." を除去して正規化
+        #   2. 共通プレフィックス (base_model.model) を除去
+        #   3. 残りセグメントで完全一致 → なければ末尾セグメント一致
+        #   4. 候補が一意の場合のみ採用（複数は警告してスキップ）
+
+        from collections import defaultdict as _defaultdict
+
+        def _norm(k: str) -> list:
+            segs = k.replace(".default.", ".").split(".")
+            # base_model.model. プレフィックスを除去
+            if len(segs) >= 2 and segs[0] == "base_model" and segs[1] == "model":
+                segs = segs[2:]
+            return segs
+
         raw_keys = list(raw_weights.keys())
         shadow_keys = list(ema_shadow.keys())
-        print(f"  直接マッチ失敗。キーの例:")
-        print(f"  adapter_model: {raw_keys[:3]}")
-        print(f"  ema_shadow:    {shadow_keys[:3]}")
-        # prefix除去してマッチ
+        print("  キー形式の差異を検出。正規化マッチに切り替えます。")
+        print(f"  adapter_model キー例: {raw_keys[:3]}")
+        print(f"  ema_shadow    キー例: {shadow_keys[:3]}")
+
+        # 正規化済みセグメントタプル → 元の shadow_key のマップ
+        _norm_map: dict = _defaultdict(list)
+        for _sk in shadow_keys:
+            _norm_map[tuple(_norm(_sk))].append(_sk)
+
         for raw_key in raw_keys:
-            for shadow_key in shadow_keys:
-                if raw_key.endswith(shadow_key) or shadow_key.endswith(raw_key):
-                    tensor = ema_shadow[shadow_key].to(raw_weights[raw_key].dtype).contiguous()
-                    ema_tensors[raw_key] = tensor
-                    matched += 1
-                    break
+            _raw_segs = _norm(raw_key)
+            # 完全一致
+            _exact = _norm_map.get(tuple(_raw_segs), [])
+            if len(_exact) == 1:
+                tensor = ema_shadow[_exact[0]].to(raw_weights[raw_key].dtype).contiguous()
+                ema_tensors[raw_key] = tensor
+                matched += 1
+                continue
+            if len(_exact) > 1:
+                print(f"  warning: キー '{raw_key}' に完全一致候補が複数: {_exact}")
+                continue
+            # 末尾セグメント一致（raw_segs が shadow_segs の末尾に含まれる）
+            _suffix_cands = [
+                _sk
+                for _segs_t, _sks in _norm_map.items()
+                for _sk in _sks
+                if list(_segs_t)[-len(_raw_segs):] == _raw_segs
+            ]
+            if len(_suffix_cands) == 1:
+                tensor = ema_shadow[_suffix_cands[0]].to(raw_weights[raw_key].dtype).contiguous()
+                ema_tensors[raw_key] = tensor
+                matched += 1
+            elif len(_suffix_cands) > 1:
+                print(
+                    f"  warning: キー '{raw_key}' にサフィックス候補が複数存在するためスキップ: "
+                    f"{_suffix_cands}"
+                )
 
     if matched == 0:
         raise ValueError(
