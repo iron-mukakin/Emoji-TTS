@@ -14,7 +14,7 @@ file_name,text
 Attentionバックエンド切り替え
 --attention-backend sdpa      # デフォルト、PyTorch標準
 --attention-backend flash2    # 要: pip install flash-attn（最速）
---attention-backend eager      # フォールバック用
+--attention-backend eager     # フォールバック用
 
 勾配チェックポイント（VRAM節約）
 --grad-checkpoint

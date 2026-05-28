@@ -186,8 +186,18 @@ def save_lora_final(
     output_dir: Path,
     model,
     ema_model: EMAModel | None,
+    save_full: bool = False,
+    optimizer: "torch.optim.Optimizer | None" = None,
+    scheduler=None,
+    base_model_path: str = "",
+    base_model_cfg: dict | None = None,
+    lora_cfg_dict: dict | None = None,
+    step: int = 0,
 ) -> None:
-    """学習完了時に lora_checkpoint_final_ema/ を保存する。"""
+    """学習完了時に lora_checkpoint_final_ema/ を保存する。
+
+    save_full=True の場合は lora_checkpoint_final_full/ も出力する。
+    """
     final_dir = output_dir / "lora_checkpoint_final_ema"
     final_dir.mkdir(parents=True, exist_ok=True)
     if ema_model is not None:
@@ -196,6 +206,40 @@ def save_lora_final(
         ema_model.restore(model)
     else:
         _save_lora_adapter_safetensors(model, final_dir)
+
+    if save_full:
+        full_dir = output_dir / "lora_checkpoint_final_full"
+        full_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生重みで adapter 保存
+        _save_lora_adapter_safetensors(model, full_dir)
+
+        # trainer_state.pt
+        torch.save(
+            {
+                "step": step,
+                "optimizer": optimizer.state_dict() if optimizer is not None else None,
+                "scheduler": None if scheduler is None else scheduler.state_dict(),
+                "model_config": base_model_cfg or {},
+                "train_config": lora_cfg_dict or {},
+                "base_init": {"mode": "checkpoint", "checkpoint_path": base_model_path},
+                "ema_decay": ema_model.decay if ema_model is not None else None,
+            },
+            full_dir / LORA_TRAINER_STATE_NAME,
+        )
+
+        # lora_metadata.json
+        (full_dir / LORA_METADATA_NAME).write_text(
+            json.dumps(
+                {"base_init": {"mode": "checkpoint", "checkpoint_path": base_model_path}},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        # EMA shadow 重み
+        if ema_model is not None:
+            torch.save(ema_model.shadow, full_dir / "ema_shadow.pt")
 
 
 def save_lora_best_val(
@@ -920,8 +964,22 @@ def main() -> None:
 
         # 最終チェックポイント保存
         print("最終チェックポイントを保存中...")
-        save_lora_final(output_dir, model, ema_model)
-        print(f"学習完了 (step={step}): {output_dir / 'lora_checkpoint_final_ema'}")
+        save_lora_final(
+            output_dir=output_dir,
+            model=model,
+            ema_model=ema_model,
+            save_full=args.save_full,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            base_model_path=args.base_model,
+            base_model_cfg=base_model_cfg_dict,
+            lora_cfg_dict=lora_cfg_dict,
+            step=step,
+        )
+        _final_dirs = ["lora_checkpoint_final_ema"]
+        if args.save_full:
+            _final_dirs.append("lora_checkpoint_final_full")
+        print(f"学習完了 (step={step}): " + ", ".join(_final_dirs))
 
         if wandb_run is not None:
             wandb_run.summary["train/final_step"] = step
