@@ -161,10 +161,7 @@ def save_lora_checkpoint(
 
         # EMA shadow 重みを独立保存（フォーク拡張）
         if ema_model is not None:
-            torch.save(
-                {"shadow": ema_model.shadow, "step_count": ema_model.step_count},
-                full_dir / "ema_shadow.pt",
-            )
+            torch.save(ema_model.shadow, full_dir / "ema_shadow.pt")
 
 
 def _save_lora_adapter_safetensors(model, out_dir: Path) -> None:
@@ -242,10 +239,7 @@ def save_lora_final(
 
         # EMA shadow 重み
         if ema_model is not None:
-            torch.save(
-                {"shadow": ema_model.shadow, "step_count": ema_model.step_count},
-                full_dir / "ema_shadow.pt",
-            )
+            torch.save(ema_model.shadow, full_dir / "ema_shadow.pt")
 
 
 def save_lora_best_val(
@@ -664,7 +658,6 @@ def main() -> None:
         class LoRAEMAModel(EMAModel):
             def __init__(self, model, decay):
                 self.decay = decay
-                self.step_count: int = 0
                 self.shadow: dict[str, torch.Tensor] = {}
                 self.backup: dict[str, torch.Tensor] = {}
                 for name, param in model.named_parameters():
@@ -677,15 +670,7 @@ def main() -> None:
         if args.resume_lora:
             shadow_path = Path(args.resume_lora) / "ema_shadow.pt"
             if shadow_path.exists():
-                _ema_state = torch.load(str(shadow_path), map_location="cpu", weights_only=True)
-                # 旧形式（tensor dict 直接保存）との後方互換
-                if isinstance(_ema_state, dict) and "shadow" in _ema_state:
-                    ema_model.shadow = _ema_state["shadow"]
-                    ema_model.step_count = int(_ema_state.get("step_count", 0))
-                else:
-                    # 旧形式: shadow tensors が直接保存されている
-                    ema_model.shadow = _ema_state
-                    ema_model.step_count = 0
+                ema_model.shadow = torch.load(str(shadow_path), map_location="cpu", weights_only=True)
                 print("EMA shadow重みを復元しました。")
 
         print(f"EMA有効 (decay={args.ema_decay})")

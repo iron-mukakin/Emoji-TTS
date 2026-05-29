@@ -14,9 +14,6 @@ from irodori_tts.inference_runtime import (
     save_wav,
 )
 
-FIXED_SECONDS = 30.0
-
-
 def _parse_optional_float(value: str) -> float | None:
     raw = str(value).strip().lower()
     if raw in {"none", "null", "off", "disable", "disabled"}:
@@ -203,6 +200,21 @@ def main() -> None:
             "Maximum token length for caption conditioning. "
             "Defaults to checkpoint metadata max_caption_len when available, else max_text_len."
         ),
+    )
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help=(
+            "手動で出力秒数を指定する。省略時は duration predictor が使用される。"
+            "duration predictor が無いチェックポイントは 30 秒にフォールバックする。"
+        ),
+    )
+    parser.add_argument(
+        "--duration-scale",
+        type=float,
+        default=1.0,
+        help="duration predictor の予測秒数に掛けるスケール係数 (>1 長め, <1 短め)。デフォルト: 1.0。",
     )
     parser.add_argument("--num-steps", type=int, default=40)
     parser.add_argument(
@@ -421,7 +433,8 @@ def main() -> None:
             ref_ensure_max=bool(args.ref_ensure_max),
             num_candidates=int(args.num_candidates),
             decode_mode=str(args.decode_mode),
-            seconds=FIXED_SECONDS,
+            seconds=None if args.seconds is None else float(args.seconds),
+            duration_scale=float(args.duration_scale),
             max_ref_seconds=float(args.max_ref_seconds)
             if args.max_ref_seconds is not None
             else None,

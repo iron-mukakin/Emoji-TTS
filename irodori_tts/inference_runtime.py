@@ -488,18 +488,26 @@ def _validate_lora_adapter(
 
 
 def _apply_lora_settings(
-    model: TextToLatentRFDiT,
+    model: torch.nn.Module,
     lora_scale: float,
     lora_disabled_modules: tuple[str, ...],
+    snapshot: dict[str, dict[str, float]],
 ) -> None:
+    # lora_scale はスナップショット値（peft が lora_alpha/r から計算した値）への
+    # 乗数として扱う。絶対値上書きではない。
+    # snapshot が空の場合（旧形式）は base=1.0 にフォールバックする。
     disabled_set = set(lora_disabled_modules) if lora_disabled_modules else set()
     applied = 0
     for name, module in model.named_modules():
         if not hasattr(module, "scaling"):
             continue
-        effective_scale = 0.0 if name in disabled_set else lora_scale
+        module_snap = snapshot.get(name, {})
         for adapter_name in list(getattr(module, "scaling", {})):
-            module.scaling[adapter_name] = effective_scale
+            if name in disabled_set:
+                module.scaling[adapter_name] = 0.0
+            else:
+                base = module_snap.get(adapter_name, 1.0)
+                module.scaling[adapter_name] = base * lora_scale
             applied += 1
     if applied == 0:
         import warnings
@@ -510,11 +518,38 @@ def _apply_lora_settings(
         )
 
 
-def _restore_lora_defaults(model: TextToLatentRFDiT) -> None:
-    for module in model.modules():
-        if hasattr(module, "scaling"):
-            for adapter_name in list(getattr(module, "scaling", {})):
-                module.scaling[adapter_name] = 1.0
+def _snapshot_lora_defaults(model: torch.nn.Module) -> dict[str, dict[str, float]]:
+    """Save current LoRA adapter scaling as {module_name: {adapter_name: scale}}.
+
+    Call immediately after PeftModel.from_pretrained to capture
+    the initial scaling set by peft (lora_alpha/r, or lora_alpha/sqrt(r)
+    when use_rslora=True).
+    """
+    snapshot: dict[str, dict[str, float]] = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "scaling") and getattr(module, "scaling", {}):
+            snapshot[name] = {k: float(v) for k, v in module.scaling.items()}
+    return snapshot
+
+
+def _restore_lora_snapshot(
+    model: torch.nn.Module,
+    snapshot: dict[str, dict[str, float]],
+) -> None:
+    """Restore LoRA scaling to the values captured by _snapshot_lora_defaults.
+
+    Restores lora_alpha/r exactly instead of a fixed 1.0, so repeated
+    calls to synthesize() produce consistent effective scales.
+    """
+    for name, module in model.named_modules():
+        if not hasattr(module, "scaling"):
+            continue
+        module_snap = snapshot.get(name)
+        if module_snap is None:
+            continue
+        for adapter_name, default_scale in module_snap.items():
+            if adapter_name in module.scaling:
+                module.scaling[adapter_name] = default_scale
 
 
 class InferenceRuntime:
@@ -569,10 +604,15 @@ class InferenceRuntime:
         model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
             Path(key.checkpoint)
         )
-        model_cfg = ModelConfig(**model_cfg_dict)
+        # チェックポイントの model_config に ModelConfig に存在しないキーが
+        # 含まれる場合そのまま展開すると TypeError になるため
+        # dataclass フィールドでフィルタしてから展開する。
+        _mc_fields = ModelConfig.__dataclass_fields__
+        model_cfg = ModelConfig(**{k: v for k, v in model_cfg_dict.items()
+                                   if hasattr(ModelConfig, k) or k in _mc_fields})
 
         model = TextToLatentRFDiT(model_cfg).to(model_device)
-        model.load_state_dict(model_state)
+        model.load_state_dict(model_state, strict=False)
         model = model.to(dtype=model_dtype)
         model.eval()
         model = _maybe_compile_inference_model(
@@ -608,6 +648,9 @@ class InferenceRuntime:
             )
             model = model.to(dtype=model_dtype)
             model.eval()
+            # ロード直後の scaling (lora_alpha/r) を保存する。
+            # synthesize() の finally でこのスナップショットを使って復元する。
+            model._lora_scaling_snapshot = _snapshot_lora_defaults(model)
             print(f"[lora] loaded ({lora_origin})", flush=True)
 
         tokenizer_cache_dir = (
@@ -930,8 +973,19 @@ class InferenceRuntime:
             lora_active = self.key.lora_path is not None and any(
                 hasattr(module, "scaling") for module in self.model.modules()
             )
+            # ロード時に保存したスナップショットを取得する。
+            # ない場合（旧形式チェックポイント等）は None として
+            # 復元時にフォールバック処理で対応する。
+            _lora_snapshot: dict | None = getattr(
+                self.model, "_lora_scaling_snapshot", None
+            )
             if lora_active:
-                _apply_lora_settings(self.model, req.lora_scale, req.lora_disabled_modules)
+                _apply_lora_settings(
+                    self.model,
+                    req.lora_scale,
+                    req.lora_disabled_modules,
+                    _lora_snapshot or {},
+                )
             try:
                 t0 = _measure_start(self.model_device)
                 text_ids, text_mask = self.tokenizer.batch_encode(
@@ -1168,7 +1222,15 @@ class InferenceRuntime:
                 _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
             finally:
                 if lora_active:
-                    _restore_lora_defaults(self.model)
+                    if _lora_snapshot is not None:
+                        # ロード時の lora_alpha/r 初期値に正確に復元する。
+                        _restore_lora_snapshot(self.model, _lora_snapshot)
+                    else:
+                        # スナップショットがない場合は 1.0 固定復元にフォールバック。
+                        for _m in self.model.modules():
+                            if hasattr(_m, "scaling"):
+                                for _a in list(getattr(_m, "scaling", {})):
+                                    _m.scaling[_a] = 1.0
 
         _log("[runtime] done synthesize")
         return SamplingResult(

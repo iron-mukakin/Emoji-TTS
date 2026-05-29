@@ -63,6 +63,7 @@ class EMAModel:
 
     def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
         self.decay = decay
+        self.step_count: int = 0  # bias correction 用ステップカウンタ
         self.shadow: dict[str, torch.Tensor] = {}
         self.backup: dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
@@ -71,6 +72,7 @@ class EMAModel:
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
+        self.step_count += 1
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.shadow[name].mul_(self.decay).add_(
@@ -78,11 +80,24 @@ class EMAModel:
                 )
 
     def apply_shadow(self, model: torch.nn.Module) -> None:
-        """EMAの重みをモデルに適用（チェックポイント保存用）"""
+        """EMAの重みをモデルに適用（チェックポイント保存用）。
+
+        step_count > 0 の場合は bias correction を適用し、
+        初期値への引きずりを除去した正確な EMA 値を書き込む。
+        bias correction: corrected = shadow / (1 - decay^step_count)
+        """
+        if self.step_count > 0:
+            correction = 1.0 - self.decay ** self.step_count
+        else:
+            correction = None  # update 未実施: shadowは初期値そのもの
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name].to(param.dtype))
+                if correction is not None:
+                    corrected = self.shadow[name] / correction
+                else:
+                    corrected = self.shadow[name]
+                param.data.copy_(corrected.to(param.dtype))
 
     def restore(self, model: torch.nn.Module) -> None:
         """学習用の元の重みに戻す"""
@@ -92,11 +107,13 @@ class EMAModel:
         self.backup.clear()
 
     def state_dict(self) -> dict:
-        return {"decay": self.decay, "shadow": self.shadow}
+        return {"decay": self.decay, "shadow": self.shadow, "step_count": self.step_count}
 
     def load_state_dict(self, state: dict) -> None:
         self.decay = state["decay"]
         self.shadow = state["shadow"]
+        # step_count は旧チェックポイントに存在しない場合がある（後方互換）
+        self.step_count = int(state.get("step_count", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +805,21 @@ def run_validation(
     distributed: bool,
 ) -> dict[str, float]:
     was_training = model.training
-    model_cfg: ModelConfig = model.module.cfg if isinstance(model, DDP) else model.cfg
+    # PeftModel は .cfg を直接持たないため base_model.model 経由で取得する。
+    # DDP > PeftModel > TextToLatentRFDiT の順にアンラップして cfg を取得する。
+    def _unwrap_cfg(m) -> "ModelConfig":
+        from torch.nn.parallel import DistributedDataParallel as _DDP
+        inner = m.module if isinstance(m, _DDP) else m
+        # peft.PeftModel / peft.PeftModelForFeatureExtraction など
+        try:
+            from peft import PeftModel as _PeftModel
+            if isinstance(inner, _PeftModel):
+                inner = inner.base_model.model
+        except ImportError:
+            pass
+        return inner.cfg
+
+    model_cfg: ModelConfig = _unwrap_cfg(model)
     duration_only = str(train_cfg.train_mode).strip().lower() == "duration_only"
     model.eval()
     totals = torch.zeros(6, device=device, dtype=torch.float64)

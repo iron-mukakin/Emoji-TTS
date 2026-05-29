@@ -14,8 +14,8 @@ train:
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_eps: 1.0e-08
-  lr_scheduler: wsd
-  warmup_steps: 300
+  lr_scheduler: cosine
+  warmup_steps: 100
   stable_steps: 2100
   min_lr_scale: 0.01
   max_steps: 3000
@@ -33,7 +33,7 @@ train:
   wandb_run_name: null
   valid_ratio: 0.1
   valid_every: 100
-  seed: 0
+  seed: 42
 model:
   text_heads: 8
   speaker_heads: 8
