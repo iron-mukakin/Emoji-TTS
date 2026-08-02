@@ -600,6 +600,13 @@ def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tenso
         checkpoint_model_cfg = None
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             metadata = dict(handle.metadata() or {})
+        from irodori_tts.quantization import parse_quantization_metadata
+        if parse_quantization_metadata(metadata) is not None:
+            raise ValueError(
+                "Quantized checkpoints are inference-only and cannot be used with "
+                "--init-checkpoint. Train LoRA against the matching full-precision "
+                "base model, then merge and quantize it for inference."
+            )
         config_json = metadata.get(SAFETENSORS_CONFIG_META_KEY)
         if config_json:
             parsed = json.loads(config_json)
@@ -702,6 +709,16 @@ def checkpoint_uses_duration_predictor(
         if checkpoint_cfg.use_duration_predictor:
             return True
     return any(key.startswith("duration_predictor.") for key in state_dict)
+
+
+def _summarize_missing_keys(missing, max_examples: int = 10) -> None:
+    """欠けているキーをトップレベルのモジュール名ごとに集計して表示する。"""
+    from collections import Counter as _Counter
+    prefixes = _Counter(str(k).split(".")[0] for k in missing)
+    for prefix, count in sorted(prefixes.items(), key=lambda x: (-x[1], x[0])):
+        print(f"    - {prefix}: {count}")
+    for example_key in list(missing)[:max_examples]:
+        print(f"      e.g. {example_key}")
 
 
 def load_model_state_partially(
@@ -1399,7 +1416,8 @@ def main() -> None:
                         "speaker_dim", "speaker_layers", "speaker_heads", "speaker_patch_size",
                         "text_encoder_type", "pretrained_projector_type",
                         "pretrained_projector_hidden_ratio", "pretrained_projector_dropout",
-                        "use_speaker_condition"):
+                        "use_speaker_condition", "text_layers", "text_heads",
+                        "text_mlp_ratio"):
                 if _k == "latent_dim" and cli_provided(raw_argv, "--latent-dim"):
                     continue
                 if _k == "latent_patch_size" and cli_provided(raw_argv, "--latent-patch-size"):
@@ -1608,12 +1626,14 @@ def main() -> None:
                     print(f"  Shape mismatch skipped: {len(skipped_shape)} keys")
                     if missing:
                         print(f"  Missing keys: {len(missing)}")
+                        _summarize_missing_keys(missing)
             else:
                 missing, unexpected = raw_model.load_state_dict(init_state, strict=False)
                 if is_main_process:
                     print(f"Loaded weights from: {init_path}")
                     if missing:
                         print(f"  Missing keys: {len(missing)}")
+                        _summarize_missing_keys(missing)
                     if unexpected:
                         print(f"  Unexpected keys: {len(unexpected)}")
         # caption embeddingをpretrained initializeする（v3アップグレード時）

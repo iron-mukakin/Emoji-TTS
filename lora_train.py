@@ -816,10 +816,13 @@ def main() -> None:
                 text_cond_drop = torch.rand(bsz, device=device) < args.text_condition_dropout
 
                 caption_drop_for_model = None
+                duration_has_caption = None
                 if use_caption:
                     caption_cond_drop = torch.rand(bsz, device=device) < args.caption_condition_dropout
                     use_cap = has_caption & (~caption_cond_drop)
                     caption_drop_for_model = ~use_cap
+                    duration_caption_drop = torch.rand(bsz, device=device) < train_cfg.duration_caption_dropout
+                    duration_has_caption = has_caption & (~duration_caption_drop)
                     if not use_duration:
                         caption_mask = caption_mask & use_cap[:, None]
 
@@ -856,6 +859,7 @@ def main() -> None:
                             caption_condition_dropout=caption_drop_for_model,
                             duration_features=duration_features,
                             duration_has_speaker=duration_has_speaker,
+                            duration_has_caption=duration_has_caption,
                         )
                     else:
                         # v1/v2: duration predictor なし
