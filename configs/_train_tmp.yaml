@@ -1,7 +1,7 @@
 train:
   batch_size: 2
   gradient_accumulation_steps: 2
-  num_workers: 2
+  num_workers: 1
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 2
   allow_tf32: true
@@ -14,8 +14,8 @@ train:
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_eps: 1.0e-08
-  lr_scheduler: cosine
-  warmup_steps: 100
+  lr_scheduler: wsd
+  warmup_steps: 300
   stable_steps: 2100
   min_lr_scale: 0.01
   max_steps: 3000
@@ -33,7 +33,7 @@ train:
   wandb_run_name: null
   valid_ratio: 0.1
   valid_every: 100
-  seed: 42
+  seed: 0
 model:
   text_heads: 8
   speaker_heads: 8

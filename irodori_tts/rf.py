@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+
 import torch
 
 from .model import TextToLatentRFDiT
+from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES
 
 
 def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.device]:
@@ -66,11 +68,6 @@ def rf_velocity_target(x0: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
     return noise - x0
 
 
-def rf_predict_x0(x_t: torch.Tensor, v_pred: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    # x_t = x0 + t * v  =>  x0 = x_t - t * v
-    return x_t - t[:, None, None] * v_pred
-
-
 def temporal_score_rescale(
     v_pred: torch.Tensor,
     x_t: torch.Tensor,
@@ -125,6 +122,9 @@ def sample_euler_rf_cfg(
     sequence_length: int,
     caption_input_ids: torch.Tensor | None = None,
     caption_mask: torch.Tensor | None = None,
+    speaker_state_override: torch.Tensor | None = None,
+    speaker_mask_override: torch.Tensor | None = None,
+    speaker_uncond_mode: str = "mask",
     num_steps: int = 40,
     cfg_scale_text: float = 3.0,
     cfg_scale_caption: float = 3.0,
@@ -169,9 +169,15 @@ def sample_euler_rf_cfg(
         cfg_scale_text = float(cfg_scale)
         cfg_scale_caption = float(cfg_scale)
         cfg_scale_speaker = float(cfg_scale)
-    if not model.cfg.use_speaker_condition:
+    if not model.cfg.use_speaker_condition_resolved:
         cfg_scale_speaker = 0.0
         speaker_kv_scale = None
+    speaker_uncond_mode = str(speaker_uncond_mode).strip().lower()
+    if speaker_uncond_mode not in SPEAKER_INVERSION_UNCOND_MODES:
+        raise ValueError(
+            f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, "
+            f"got {speaker_uncond_mode!r}"
+        )
 
     cfg_guidance_mode = str(cfg_guidance_mode).strip().lower()
     if cfg_guidance_mode not in {"independent", "joint", "alternating"}:
@@ -188,6 +194,8 @@ def sample_euler_rf_cfg(
     if t_schedule_mode_norm == "linear":
         u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
     elif t_schedule_mode_norm == "sway":
+        # F5-TTS-style Sway Sampling. Negative sway_coeff densifies the noise
+        # side of the schedule (early steps); positive densifies the data side.
         u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
         u = u + sway_coeff_value * (torch.cos(0.5 * math.pi * u) + u - 1.0)
         u = u.clamp(0.0, 1.0)
@@ -216,18 +224,33 @@ def sample_euler_rf_cfg(
         ref_mask=ref_mask,
         caption_input_ids=caption_input_ids,
         caption_mask=caption_mask,
+        speaker_state_override=speaker_state_override,
+        speaker_mask_override=speaker_mask_override,
+        speaker_uncond_mode=speaker_uncond_mode,
     )
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
     speaker_state_uncond = None
     speaker_mask_uncond = None
-    if model.cfg.use_speaker_condition:
+    if model.cfg.use_speaker_condition_resolved:
         if speaker_state_cond is None or speaker_mask_cond is None:
             raise RuntimeError(
                 "Speaker conditioning is enabled but encoded speaker state is missing."
             )
-        speaker_state_uncond = torch.zeros_like(speaker_state_cond)
-        speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
+        if speaker_uncond_mode == "noise":
+            speaker_noise = torch.randn(
+                speaker_state_cond.shape,
+                device=rng_device,
+                dtype=speaker_state_cond.dtype,
+                generator=rng,
+            )
+            if rng_device != device:
+                speaker_noise = speaker_noise.to(device=device)
+            speaker_state_uncond = speaker_noise * speaker_state_cond.std().clamp_min(1e-6)
+            speaker_mask_uncond = torch.ones_like(speaker_mask_cond)
+        else:
+            speaker_state_uncond = torch.zeros_like(speaker_state_cond)
+            speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
     caption_state_uncond = None
     caption_mask_uncond = None
     if model.cfg.use_caption_condition:

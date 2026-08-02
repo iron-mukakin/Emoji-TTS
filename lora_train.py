@@ -430,7 +430,7 @@ def main() -> None:
     # v3モデル判定
     use_caption = bool(getattr(model_cfg, "use_caption_condition", False))
     use_duration = bool(getattr(model_cfg, "use_duration_predictor", False))
-    use_speaker = bool(getattr(model_cfg, "use_speaker_condition", True))
+    use_speaker = bool(model_cfg.use_speaker_condition_resolved)
     if use_caption:
         print(f"v3 caption conditioning enabled: {model_cfg.caption_tokenizer_repo_resolved}")
     if use_duration:

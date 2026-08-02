@@ -1060,7 +1060,7 @@ def _build_manifest_command(
 
     mode = str(prepare_mode).strip().lower()
     auto_codec_repo = str(codec_repo).strip()
-    if mode in {"model_v3", "model_v2", "voice_design"}:
+    if mode in {"model_v4", "model_v3", "model_v2", "voice_design"}:
         auto_codec_repo = "Aratako/Semantic-DACVAE-Japanese-32dim"
     elif mode == "model_v1":
         auto_codec_repo = "facebook/dacvae-watermarked"
@@ -1285,7 +1285,13 @@ def _build_train_command(
         cmd += ["--ema-decay", str(ema_decay)]
 
     if resume_enabled and str(resume_checkpoint).strip():
-        cmd += ["--resume", str(resume_checkpoint)]
+        resume_checkpoint_path = str(resume_checkpoint).strip()
+        if Path(resume_checkpoint_path).suffix.lower() == ".safetensors":
+            # .safetensors は推論用重みのみ(optimizer/scheduler/step無し)。
+            # train.py の仕様上 --resume ではなく --init-checkpoint が必要。
+            cmd += ["--init-checkpoint", resume_checkpoint_path]
+        else:
+            cmd += ["--resume", resume_checkpoint_path]
 
     if str(save_mode) in ("Fullのみ", "EMA + Full両方"):
         cmd += ["--save-full"]
@@ -2964,9 +2970,9 @@ def build_ui() -> gr.Blocks:
                 )
                 pm_prepare_mode = gr.Dropdown(
                     label="モード",
-                    choices=["model_v3", "model_v2", "model_v1", "voice_design"],
+                    choices=["model_v4", "model_v3", "model_v2", "model_v1", "voice_design"],
                     value="model_v3",
-                    info="model_v3=dim32(推奨), model_v2=dim32, model_v1=dim128, voice_design=dim32 + caption列",
+                    info="model_v4=dim32(未確認: latent_dimを要確認), model_v3=dim32(推奨), model_v2=dim32, model_v1=dim128, voice_design=dim32 + caption列",
                 )
 
                 with gr.Group() as pm_local_group:
@@ -3054,8 +3060,9 @@ def build_ui() -> gr.Blocks:
                         "voice_design: caption列を使用 / codec dim32"
                         if is_voice
                         else ("model_v1: speaker_id列を使用 / codec dim128" if mode_key == "model_v1"
-                              else ("model_v3: speaker_id列を使用 / codec dim32(推奨)" if mode_key == "model_v3"
-                                    else "model_v2: speaker_id列を使用 / codec dim32"))
+                              else ("model_v4: speaker_id列を使用 / codec dim32(未確認)" if mode_key == "model_v4"
+                                    else ("model_v3: speaker_id列を使用 / codec dim32(推奨)" if mode_key == "model_v3"
+                                          else "model_v2: speaker_id列を使用 / codec dim32")))
                     )
                     return (
                         gr.update(visible=not is_voice, interactive=not is_voice, value="" if is_voice else None),

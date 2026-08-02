@@ -47,7 +47,7 @@ CHECKPOINT_BEST_VAL_LOSS_RE = re.compile(
     r"^checkpoint_best_val_loss_(\d+)_(-?\d+(?:\.\d+)?)(?:\.pt)?$"
 )
 SAFETENSORS_CONFIG_META_KEY = "config_json"
-SAFETENSORS_INFERENCE_CONFIG_KEYS = {"max_text_len", "max_caption_len", "fixed_target_latent_steps"}
+SAFETENSORS_INFERENCE_CONFIG_KEYS = {"max_text_len", "max_caption_len", "fixed_target_latent_steps", "ref_max_seconds"}
 
 # pyファイル基準のcheckpointsフォルダ（トークナイザー等のHFキャッシュ先）
 _PROJECT_CHECKPOINTS_DIR = Path(__file__).resolve().parent / "checkpoints"
@@ -536,7 +536,9 @@ def validate_text_backbone_dim(
             f"Could not read hidden_size from pretrained config: {model_cfg.text_tokenizer_repo}"
         )
     hidden_size = int(hidden_size)
-    if hidden_size != model_cfg.text_dim:
+    # use_pretrained_text_encoder の場合は PretrainedConditionProjector が
+    # backbone hidden_size -> text_dim の次元変換を担うため、一致は要求しない。
+    if not model_cfg.use_pretrained_text_encoder and hidden_size != model_cfg.text_dim:
         raise ValueError(
             f"text_dim mismatch: model text_dim={model_cfg.text_dim} but pretrained hidden_size={hidden_size} "
             f"for repo {model_cfg.text_tokenizer_repo}."
@@ -833,11 +835,14 @@ def run_validation(
             if model_cfg.use_caption_condition:
                 caption_ids = batch["caption_ids"].to(device, non_blocking=True)
                 caption_mask = batch["caption_mask"].to(device, non_blocking=True)
+                has_caption = batch["has_caption"].to(device, non_blocking=True)
+            else:
+                has_caption = None
             num_frames = batch["num_frames"].to(device, non_blocking=True)
             duration_features = batch["duration_features"].to(device, non_blocking=True)
             ref_latent = None
             ref_mask = None
-            if model_cfg.use_speaker_condition:
+            if model_cfg.use_speaker_condition_resolved:
                 ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
                 ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
                 has_speaker = batch["has_speaker"].to(device, non_blocking=True)
@@ -866,7 +871,7 @@ def run_validation(
                 x_t = rf_interpolate(x0, noise, t)
                 v_target = rf_velocity_target(x0, noise)
 
-            if model_cfg.use_speaker_condition:
+            if model_cfg.use_speaker_condition_resolved:
                 use_speaker = has_speaker
                 duration_has_speaker = use_speaker
                 duration_features = set_duration_has_speaker_feature(
@@ -874,6 +879,10 @@ def run_validation(
                 )
             else:
                 duration_has_speaker = None
+            if model_cfg.use_caption_condition:
+                duration_has_caption = has_caption
+            else:
+                duration_has_caption = None
 
             with (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -889,6 +898,7 @@ def run_validation(
                         latent_mask=None,
                         duration_features=duration_features,
                         duration_has_speaker=duration_has_speaker,
+                        duration_has_caption=duration_has_caption,
                         duration_only=True,
                     )
                     v_pred = None
@@ -901,10 +911,11 @@ def run_validation(
                         latent_mask=x_mask,
                         duration_features=duration_features,
                         duration_has_speaker=duration_has_speaker,
+                        duration_has_caption=duration_has_caption,
                     )
                 else:
                     # v2以前: speaker conditioningは手動マスク
-                    if model_cfg.use_speaker_condition:
+                    if model_cfg.use_speaker_condition_resolved:
                         ref_mask = ref_mask & use_speaker[:, None]
                         ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
                     v_pred = model(
@@ -1385,7 +1396,10 @@ def main() -> None:
             _sync_overrides: dict = {}
             for _k in ("latent_dim", "latent_patch_size", "text_vocab_size", "text_dim", "model_dim",
                         "num_layers", "num_heads", "adaln_rank", "text_tokenizer_repo", "text_add_bos",
-                        "speaker_dim", "speaker_layers", "speaker_heads", "speaker_patch_size"):
+                        "speaker_dim", "speaker_layers", "speaker_heads", "speaker_patch_size",
+                        "text_encoder_type", "pretrained_projector_type",
+                        "pretrained_projector_hidden_ratio", "pretrained_projector_dropout",
+                        "use_speaker_condition"):
                 if _k == "latent_dim" and cli_provided(raw_argv, "--latent-dim"):
                     continue
                 if _k == "latent_patch_size" and cli_provided(raw_argv, "--latent-patch-size"):
@@ -1469,7 +1483,7 @@ def main() -> None:
         latent_dim=model_cfg.latent_dim,
         max_latent_steps=train_cfg.max_latent_steps,
         enable_caption_condition=model_cfg.use_caption_condition,
-        enable_speaker_condition=model_cfg.use_speaker_condition,
+        enable_speaker_condition=model_cfg.use_speaker_condition_resolved,
     )
     train_dataset = full_dataset
     valid_dataset = None
@@ -1483,7 +1497,7 @@ def main() -> None:
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=train_indices,
             enable_caption_condition=model_cfg.use_caption_condition,
-            enable_speaker_condition=model_cfg.use_speaker_condition,
+            enable_speaker_condition=model_cfg.use_speaker_condition_resolved,
         )
         valid_dataset = LatentTextDataset(
             manifest_path=train_cfg.manifest_path,
@@ -1491,7 +1505,7 @@ def main() -> None:
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=valid_indices,
             enable_caption_condition=model_cfg.use_caption_condition,
-            enable_speaker_condition=model_cfg.use_speaker_condition,
+            enable_speaker_condition=model_cfg.use_speaker_condition_resolved,
         )
         if is_main_process:
             print(
@@ -1782,7 +1796,7 @@ def main() -> None:
                 duration_features = batch["duration_features"].to(device, non_blocking=True)
                 ref_latent = None
                 ref_mask = None
-                if raw_model.cfg.use_speaker_condition:
+                if raw_model.cfg.use_speaker_condition_resolved:
                     ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
                     ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
                     has_speaker = batch["has_speaker"].to(device, non_blocking=True)
@@ -1814,16 +1828,19 @@ def main() -> None:
                 # ── Conditioning dropout ────────────────────────────────
                 text_cond_drop = torch.rand(bsz, device=device) < train_cfg.text_condition_dropout
                 caption_drop_for_model = None
+                duration_has_caption = None
                 if raw_model.cfg.use_caption_condition:
                     caption_cond_drop = torch.rand(bsz, device=device) < train_cfg.caption_condition_dropout
                     use_caption = has_caption & (~caption_cond_drop)
                     caption_drop_for_model = ~use_caption
+                    duration_caption_drop = torch.rand(bsz, device=device) < train_cfg.duration_caption_dropout
+                    duration_has_caption = has_caption & (~duration_caption_drop)
                     if not raw_model.cfg.use_duration_predictor:
                         caption_mask = caption_mask & use_caption[:, None]
 
                 speaker_drop_for_model = None
                 duration_has_speaker = None
-                if raw_model.cfg.use_speaker_condition:
+                if raw_model.cfg.use_speaker_condition_resolved:
                     speaker_cond_drop = torch.rand(bsz, device=device) < train_cfg.speaker_condition_dropout
                     use_speaker = has_speaker & (~speaker_cond_drop)
                     speaker_drop_for_model = ~use_speaker
@@ -1859,6 +1876,7 @@ def main() -> None:
                                 latent_mask=None,
                                 duration_features=duration_features,
                                 duration_has_speaker=duration_has_speaker,
+                                duration_has_caption=duration_has_caption,
                                 duration_only=True,
                             )
                             v_pred = None
@@ -1874,6 +1892,7 @@ def main() -> None:
                                 caption_condition_dropout=caption_drop_for_model,
                                 duration_features=duration_features,
                                 duration_has_speaker=duration_has_speaker,
+                                duration_has_caption=duration_has_caption,
                             )
                         else:
                             # v2以前
