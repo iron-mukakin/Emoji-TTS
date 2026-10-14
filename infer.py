@@ -361,6 +361,14 @@ def main() -> None:
         "--ref-latent", default=None, help="Reference latent (.pt) path for speaker conditioning."
     )
     ref_group.add_argument(
+        "--ref-embed",
+        default=None,
+        help=(
+            "Speaker Inversion embedding (.speaker.safetensors) path for speaker conditioning. "
+            "Speaker Inversion 学習で生成された話者埋め込みを直接指定する。"
+        ),
+    )
+    ref_group.add_argument(
         "--no-ref", action="store_true", help="Run without speaker reference conditioning."
     )
     args = parser.parse_args()
@@ -428,6 +436,7 @@ def main() -> None:
             caption=None if args.caption is None else str(args.caption),
             ref_wav=args.ref_wav,
             ref_latent=args.ref_latent,
+            ref_embed=args.ref_embed,
             no_ref=bool(args.no_ref),
             ref_normalize_db=args.ref_normalize_db,
             ref_ensure_max=bool(args.ref_ensure_max),

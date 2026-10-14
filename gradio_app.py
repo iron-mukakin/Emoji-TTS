@@ -56,6 +56,8 @@ from irodori_tts.inference_runtime import (
     save_wav,
 )
 
+from irodori_tts import model_version
+
 # ─────────────────────────────────────────────────────────────────────────────
 # パス定数
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,12 +67,18 @@ CONFIGS_DIR      = BASE_DIR / "configs"
 LOGS_DIR         = BASE_DIR / "logs"
 OUTPUTS_DIR      = BASE_DIR / "outputs_gradio"
 LORA_DIR         = BASE_DIR / "lora"
-DEFAULT_HF_REPO  = "Aratako/Irodori-TTS-500M-v3"
-DEFAULT_CONFIG   = "train_v2.yaml"
+DEFAULT_HF_REPO  = "Aratako/Irodori-TTS-v4.1-Small"
+DEFAULT_CONFIG   = "train_v4_small.yaml"
 DEFAULT_PREPARE_CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 PREPARE_CODEC_REPO_CHOICES = [
-    "Aratako/Semantic-DACVAE-Japanese-32dim",  # v2 (dim32)
+    "Aratako/Semantic-DACVAE-Japanese-32dim",  # v2/v3/v4 (dim32)
     "facebook/dacvae-watermarked",             # v1 (dim128)
+]
+# 追加学習・LoRA のデフォルトベースモデル探索順（新しい世代から）
+DEFAULT_BASE_MODEL_CANDIDATES = [
+    "Aratako_Irodori-TTS-v4.1-Small",
+    "Aratako_Irodori-TTS-v4-Small",
+    "Aratako_Irodori-TTS-500M-v3",
 ]
 FIXED_SECONDS    = 30.0
 DATASET_TOOLS    = BASE_DIR / "dataset_tools.py"
@@ -163,6 +171,17 @@ def _scan_speakers() -> list[str]:
     )
 
 
+def _scan_speaker_inversion_embeds() -> list[str]:
+    """*.speaker.safetensors（Speaker Inversion 学習出力）を列挙。"""
+    result: list[str] = []
+    for root in (OUTPUTS_DIR, CHECKPOINTS_DIR):
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*.speaker.safetensors")):
+            result.append(str(p))
+    return result
+
+
 def _run_create_speaker(
     char_name: str,
     wav_path: str,
@@ -224,7 +243,7 @@ def _run_create_speaker(
 
     # モデルバージョン情報を取得してログに含める
     ldim = int(_cached_runtime.model_cfg.latent_dim)
-    version_label = "v2" if ldim == 32 else ("v1" if ldim == 128 else f"unknown(dim={ldim})")
+    version_label = _model_version_label(_cached_runtime.model_cfg)
 
     try:
         wav, sr = torchaudio.load(wav_path)
@@ -308,6 +327,8 @@ def _lora_config_from_ui(
     valid_ratio, valid_every,
     wandb_enabled, wandb_project, wandb_run_name,
     seed,
+    model_version_choice="auto",
+    modules_to_save="auto",
 ) -> dict:
     return {
         "lora": {
@@ -315,6 +336,8 @@ def _lora_config_from_ui(
             "lora_alpha": float(lora_alpha),
             "lora_dropout": float(lora_dropout),
             "target_modules": str(target_modules),
+            "modules_to_save": str(modules_to_save),
+            "model_version": str(model_version_choice),
             "save_mode": str(save_mode),
             "attention_backend": str(attention_backend),
             "use_early_stopping": bool(use_early_stopping),
@@ -366,7 +389,7 @@ def _load_lora_config(config_path: str) -> dict:
 def _load_lora_preset(config_path: str):
     if not config_path:
         return (
-            16, 32.0, 0.05, "wq,wk,wv,wo",
+            16, 32.0, 0.05, "auto",
             "EMAのみ", "sdpa",
             False, 3, 0.01,
             True, 0.9999,
@@ -376,6 +399,7 @@ def _load_lora_preset(config_path: str):
             0.0, 100,
             False, "", "",
             0,
+            "auto", "auto",
         )
     cfg = _load_lora_config(config_path)
     def g(k, fb):
@@ -384,7 +408,7 @@ def _load_lora_preset(config_path: str):
         g("lora_rank", 16),
         g("lora_alpha", 32.0),
         g("lora_dropout", 0.05),
-        g("target_modules", "wq,wk,wv,wo"),
+        g("target_modules", "auto"),
         g("save_mode", "EMAのみ"),
         g("attention_backend", "sdpa"),
         g("use_early_stopping", False),
@@ -407,6 +431,8 @@ def _load_lora_preset(config_path: str):
         g("wandb_project", "") or "",
         g("wandb_run_name", "") or "",
         g("seed", 0),
+        g("model_version", "auto"),
+        g("modules_to_save", "auto"),
     )
 
 
@@ -419,6 +445,35 @@ def _save_lora_preset(name: str, *cfg_args):
 # 以降は元のコードと同じ（_ensure_default_model から build_ui まで）
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _default_base_checkpoint() -> str:
+    """追加学習・LoRA既定のベースモデルパス（存在する最新世代）。無ければ v4.1 想定パス。"""
+    for name in DEFAULT_BASE_MODEL_CANDIDATES:
+        candidate = CHECKPOINTS_DIR / name / "model.safetensors"
+        if candidate.is_file():
+            return str(candidate)
+    return str(CHECKPOINTS_DIR / DEFAULT_BASE_MODEL_CANDIDATES[0] / "model.safetensors")
+
+
+def _model_version_info_from_cfg(model_cfg):
+    """ModelConfig（dataclass）からモデル世代情報を取得。判定不能なら None。"""
+    cfg_dict = {
+        "latent_dim": getattr(model_cfg, "latent_dim", None),
+        "text_encoder_type": getattr(model_cfg, "text_encoder_type", None),
+        "use_duration_predictor": getattr(model_cfg, "use_duration_predictor", False),
+        "use_caption_condition": getattr(model_cfg, "use_caption_condition", False),
+    }
+    return model_version.classify_model_version(cfg_dict)
+
+
+def _model_version_label(model_cfg) -> str:
+    """UI表示用の短いバージョンラベル（例: v4-Small/v4.1-Small）。"""
+    info = _model_version_info_from_cfg(model_cfg)
+    if info is not None:
+        return info.label
+    ldim = int(getattr(model_cfg, "latent_dim", 0))
+    return f"unknown(dim={ldim})"
+
+
 def _detect_model_version_from_runtime() -> tuple[str, str, int] | None:
     """キャッシュ済み runtime からモデルバージョン情報を取得する。
     戻り値: (version_label, codec_repo, latent_dim) または None"""
@@ -427,7 +482,7 @@ def _detect_model_version_from_runtime() -> tuple[str, str, int] | None:
     if runtime is None:
         return None
     ldim = int(runtime.model_cfg.latent_dim)
-    version = "v2" if ldim == 32 else ("v1" if ldim == 128 else f"unknown(dim={ldim})")
+    version = _model_version_label(runtime.model_cfg)
     return version, runtime.key.codec_repo, ldim
 
 
@@ -712,7 +767,7 @@ def _clear_runtime_cache_ui():
 def _run_generation(
     checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
     lora_adapter, lora_scale, lora_disabled_modules_raw,
-    text, caption_text, uploaded_audio, spk_ref_latent_path,
+    text, caption_text, uploaded_audio, spk_ref_latent_path, spk_ref_embed_path,
     num_steps, seed_raw, cfg_guidance_mode, cfg_scale_text, cfg_scale_speaker,
     cfg_scale_caption,
     cfg_scale_raw, cfg_min_t, cfg_max_t, context_kv_cache,
@@ -757,12 +812,17 @@ def _run_generation(
         if _disabled_raw else ()
     )
 
-    # 参照音声の優先順位: スピーカーライブラリ > 直接アップロード > no-reference
+    # 参照音声の優先順位: Speaker Inversion embedding > スピーカーライブラリ > 直接アップロード > no-reference
+    _spk_embed = str(spk_ref_embed_path).strip() if spk_ref_embed_path else ""
     _spk_pt = str(spk_ref_latent_path).strip() if spk_ref_latent_path else ""
     ref_latent_path: str | None = None
+    ref_embed_path: str | None = None
     ref_wav: str | None = None
 
-    if _spk_pt and Path(_spk_pt).is_file():
+    if _spk_embed and Path(_spk_embed).is_file():
+        ref_embed_path = _spk_embed
+        no_ref = False
+    elif _spk_pt and Path(_spk_pt).is_file():
         ref_latent_path = _spk_pt
         no_ref = False
     elif uploaded_audio and str(uploaded_audio).strip():
@@ -813,6 +873,7 @@ def _run_generation(
         return runtime.synthesize(
             SamplingRequest(
                 text=str(line_text), ref_wav=ref_wav, ref_latent=ref_latent_path, no_ref=bool(no_ref),
+                ref_embed=ref_embed_path,
                 seconds=request_seconds, duration_scale=1.0, max_ref_seconds=30.0, max_text_len=None,
                 caption=caption_value or None,
                 max_caption_len=max_caption_len,
@@ -1076,6 +1137,14 @@ def _build_manifest_command(
         "--codec-repo",      auto_codec_repo,
     ]
     if mode == "voice_design":
+        cap = _s(caption_col)
+        if cap:
+            cmd += ["--caption-column", cap]
+    elif mode == "model_v4":
+        # v4系は speaker + caption の両条件。両列を渡す。
+        spk = _s(speaker_col)
+        if spk:
+            cmd += ["--speaker-column", spk]
         cap = _s(caption_col)
         if cap:
             cmd += ["--caption-column", cap]
@@ -1933,6 +2002,8 @@ def _build_lora_train_command(
     valid_ratio, valid_every,
     wandb_enabled, wandb_project, wandb_run_name,
     seed,
+    model_version_choice="auto",
+    modules_to_save="auto",
 ) -> list[str]:
     cmd = [sys.executable, str(BASE_DIR / "lora_train.py")]
     cmd += ["--base-model", str(base_model)]
@@ -1949,7 +2020,9 @@ def _build_lora_train_command(
         "--lora-rank", str(int(lora_rank)),
         "--lora-alpha", str(float(lora_alpha)),
         "--lora-dropout", str(float(lora_dropout)),
-        "--target-modules", str(target_modules).strip(),
+        "--target-modules", str(target_modules).strip() or "auto",
+        "--modules-to-save", str(modules_to_save).strip() or "auto",
+        "--model-version", str(model_version_choice).strip() or "auto",
         "--batch-size", str(int(batch_size)),
         "--gradient-accumulation-steps", str(int(grad_accum)),
         "--lr", str(float(lr)),
@@ -2474,6 +2547,8 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("🎤 参照音声（省略するとno-referenceモードで生成）", open=False) as infer_ref_accordion:
                     # スピーカーライブラリ選択時のref_latentパスを保持する隠しフィールド
                     spk_ref_latent_path = gr.Textbox(visible=False, value="")
+                    # Speaker Inversion embedding選択時のref_embedパスを保持する隠しフィールド
+                    spk_ref_embed_path = gr.Textbox(visible=False, value="")
 
                     with gr.Tabs():
                         # ── タブ1: 直接アップロード ──────────────────────
@@ -2481,9 +2556,9 @@ def build_ui() -> gr.Blocks:
                             infer_audio = gr.Audio(label="参照音声", type="filepath")
                             # アップロード時はスピーカーライブラリの選択をクリア
                             infer_audio.change(
-                                lambda v: "",
+                                lambda v: ("", ""),
                                 inputs=[infer_audio],
-                                outputs=[spk_ref_latent_path],
+                                outputs=[spk_ref_latent_path, spk_ref_embed_path],
                             )
 
                         # ── タブ2: スピーカーライブラリ ──────────────────
@@ -2502,7 +2577,7 @@ def build_ui() -> gr.Blocks:
 
                             def _on_spk_select(name):
                                 if not name or name == "（使用しない）":
-                                    return "", ""
+                                    return "", "", ""
                                 pt = SPEAKERS_DIR / name / "ref.pt"
                                 profile_p = SPEAKERS_DIR / name / "profile.json"
                                 pt_str = str(pt) if pt.exists() else ""
@@ -2516,12 +2591,12 @@ def build_ui() -> gr.Blocks:
                                         )
                                     except Exception:
                                         pass
-                                return pt_str, info
+                                return pt_str, info, ""
 
                             spk_select.change(
                                 _on_spk_select,
                                 inputs=[spk_select],
-                                outputs=[spk_ref_latent_path, spk_info],
+                                outputs=[spk_ref_latent_path, spk_info, spk_ref_embed_path],
                             )
                             spk_lib_refresh.click(
                                 lambda: gr.Dropdown(choices=_scan_speakers()),
@@ -2564,6 +2639,44 @@ def build_ui() -> gr.Blocks:
                             spk_reg_btn.click(
                                 lambda: gr.Dropdown(choices=_scan_speakers()),
                                 outputs=[spk_select],
+                            )
+
+                        # ── タブ4: Speaker Inversion embedding ─────────────
+                        with gr.Tab("🧬 Speaker Inversion"):
+                            gr.Markdown(
+                                "`--speaker-inversion` 学習で生成された `*.speaker.safetensors` を\n"
+                                "話者条件として直接使用します（参照音声のエンコード不要）。\n\n"
+                                "> 学習済みモデル（v4系）でのみ利用できます。選択時は他の参照音声指定と排他です。"
+                            )
+                            with gr.Row():
+                                si_embed_select = gr.Dropdown(
+                                    label="embeddingファイル",
+                                    choices=["（使用しない）"] + _scan_speaker_inversion_embeds(),
+                                    value="（使用しない）",
+                                    scale=4, allow_custom_value=True,
+                                )
+                                si_embed_refresh = gr.Button("🔄", scale=1)
+
+                            def _on_si_embed_select(path):
+                                if not path or path == "（使用しない）":
+                                    return "", gr.update()
+                                p = Path(str(path).strip())
+                                if not p.is_file():
+                                    return "", gr.update()
+                                # embedding選択時は他の参照指定をクリア
+                                return str(p), None
+
+                            si_embed_select.change(
+                                _on_si_embed_select,
+                                inputs=[si_embed_select],
+                                outputs=[spk_ref_embed_path, infer_audio],
+                            )
+                            si_embed_refresh.click(
+                                lambda: gr.Dropdown(
+                                    choices=["（使用しない）"] + _scan_speaker_inversion_embeds(),
+                                    value="（使用しない）",
+                                ),
+                                outputs=[si_embed_select],
                             )
 
                 # ── 感情スタイルプリセット ──────────────────────────────
@@ -2941,7 +3054,7 @@ def build_ui() -> gr.Blocks:
                     inputs=[
                         infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
                         infer_lora_adapter, infer_lora_scale, infer_lora_disabled_modules,
-                        infer_text, caption_input_vd, infer_audio, spk_ref_latent_path,
+                        infer_text, caption_input_vd, infer_audio, spk_ref_latent_path, spk_ref_embed_path,
                         num_steps, seed_raw, cfg_guidance_mode,
                         cfg_scale_text, cfg_scale_speaker, cfg_scale_caption, cfg_scale_raw, cfg_min_t, cfg_max_t,
                         context_kv_cache, max_caption_len_raw, truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
@@ -2971,8 +3084,8 @@ def build_ui() -> gr.Blocks:
                 pm_prepare_mode = gr.Dropdown(
                     label="モード",
                     choices=["model_v4", "model_v3", "model_v2", "model_v1", "voice_design"],
-                    value="model_v3",
-                    info="model_v4=dim32(未確認: latent_dimを要確認), model_v3=dim32(推奨), model_v2=dim32, model_v1=dim128, voice_design=dim32 + caption列",
+                    value="model_v4",
+                    info="model_v4=v4/v4.1用 dim32 + caption列（推奨）, model_v3=dim32, model_v2=dim32, model_v1=dim128, voice_design=dim32 + caption列",
                 )
 
                 with gr.Group() as pm_local_group:
@@ -3051,22 +3164,28 @@ def build_ui() -> gr.Blocks:
                 def _on_pm_prepare_mode_change(mode: str):
                     mode_key = str(mode).strip().lower()
                     is_voice = mode_key == "voice_design"
+                    is_v4 = mode_key == "model_v4"
                     codec_repo = (
                         "facebook/dacvae-watermarked"
                         if mode_key == "model_v1"
                         else "Aratako/Semantic-DACVAE-Japanese-32dim"
                     )
-                    status = (
-                        "voice_design: caption列を使用 / codec dim32"
-                        if is_voice
-                        else ("model_v1: speaker_id列を使用 / codec dim128" if mode_key == "model_v1"
-                              else ("model_v4: speaker_id列を使用 / codec dim32(未確認)" if mode_key == "model_v4"
-                                    else ("model_v3: speaker_id列を使用 / codec dim32(推奨)" if mode_key == "model_v3"
-                                          else "model_v2: speaker_id列を使用 / codec dim32")))
-                    )
+                    if is_v4:
+                        status = "model_v4: speaker_id列 + caption列を使用 / codec dim32 (v4/v4.1推奨)"
+                    elif is_voice:
+                        status = "voice_design: caption列を使用 / codec dim32"
+                    elif mode_key == "model_v1":
+                        status = "model_v1: speaker_id列を使用 / codec dim128"
+                    elif mode_key == "model_v3":
+                        status = "model_v3: speaker_id列を使用 / codec dim32"
+                    else:
+                        status = "model_v2: speaker_id列を使用 / codec dim32"
                     return (
-                        gr.update(visible=not is_voice, interactive=not is_voice, value="" if is_voice else None),
-                        gr.update(visible=is_voice),
+                        gr.update(
+                            visible=(not is_voice), interactive=(not is_voice),
+                            value="" if is_voice else None,
+                        ),
+                        gr.update(visible=(is_voice or is_v4)),
                         gr.update(value=codec_repo),
                         status,
                     )
@@ -3210,14 +3329,13 @@ def build_ui() -> gr.Blocks:
                     )
 
                 with gr.Accordion("🔁 ベースモデル・追加学習設定", open=True):
-                    _default_safetensors = str(
-                        CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors"
-                    )
+                    _default_safetensors = _default_base_checkpoint()
                     gr.Markdown(
                         "**--resume オプション設定**\n\n"
                         "- **オフ（スクラッチ学習）**: モデルを最初からランダム初期化して学習します。\n"
-                        "- **オン・パス未入力**: `checkpoints/Aratako_Irodori-TTS-500M-v3/model.safetensors` が"
-                        "存在すれば自動でロードして追加学習します（デフォルト動作）。\n"
+                        "- **オン・パス未入力**: `checkpoints/` 配下の最新世代モデル"
+                        "（v4.1-Small → v4-Small → v3 の順で探索）が存在すれば"
+                        "自動でロードして追加学習します（デフォルト動作）。\n"
                         "- **オン・パス入力**: 指定したファイルをベースに追加学習します。"
                         "`.safetensors` を指定するとstep=0から学習開始、`.pt` チェックポイントを指定すると"
                         "step/optimizer状態を引き継いで再開します。"
@@ -3587,8 +3705,8 @@ def build_ui() -> gr.Blocks:
                         label="ベースモデル (.pt / .safetensors)",
                         choices=initial_checkpoints,
                         value=(
-                            str(CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors")
-                            if (CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors").exists()
+                            _default_base_checkpoint()
+                            if Path(_default_base_checkpoint()).is_file()
                             else (initial_checkpoints[-1] if initial_checkpoints else None)
                         ),
                         allow_custom_value=True, scale=4,
@@ -3637,10 +3755,23 @@ def build_ui() -> gr.Blocks:
                         lora_rank = gr.Slider(label="LoRAランク", minimum=1, maximum=128, value=16, step=1)
                         lora_alpha = gr.Number(label="lora_alpha", value=32.0)
                         lora_dropout = gr.Slider(label="lora_dropout", minimum=0.0, maximum=0.5, value=0.05, step=0.01)
+                    with gr.Row():
+                        lora_model_version = gr.Dropdown(
+                            label="モデルバージョン（LoRA既定値の選択）",
+                            choices=list(model_version.VERSION_CHOICES),
+                            value=model_version.VERSION_AUTO,
+                            info="auto=ベースチェックポイントから自動判別。v4系は拡散attention限定LoRA+duration_predictor全学習が既定。",
+                        )
                     lora_target_modules = gr.Textbox(
-                        label="ターゲットモジュール（カンマ区切り）",
-                        value="wq,wk,wv,wo",
-                        info="デフォルト: wq,wk,wv,wo / 拡張: wq,wk,wv,wo,wk_text,wv_text,wk_speaker,wv_speaker,w1,w2,w3",
+                        label="ターゲットモジュール（カンマ区切り / 正規表現）",
+                        value="auto",
+                        info="auto=バージョン既定値 (v1〜v3: wq,wk,wv,wo / v4: 拡散attention限定regex)。"
+                             "カンマ区切り list や ^ 始まりの正規表現1本の直接指定も可能です。",
+                    )
+                    lora_modules_to_save = gr.Textbox(
+                        label="modules_to_save（指定モジュールはLoRAなしで全パラメータ学習）",
+                        value="auto",
+                        info="auto=バージョン既定値 (v4: duration_predictor / その他: none)。none=無効、カンマ区切り指定可。",
                     )
 
                 # ── Resume設定 ──
@@ -3788,6 +3919,7 @@ def build_ui() -> gr.Blocks:
                     lora_valid_ratio, lora_valid_every,
                     lora_wandb_enabled, lora_wandb_project, lora_wandb_run_name,
                     lora_seed,
+                    lora_model_version, lora_modules_to_save,
                 ]
 
                 # プリセット読み込み・保存対象コンポーネント
@@ -3803,6 +3935,7 @@ def build_ui() -> gr.Blocks:
                     lora_valid_ratio, lora_valid_every,
                     lora_wandb_enabled, lora_wandb_project, lora_wandb_run_name,
                     lora_seed,
+                    lora_model_version, lora_modules_to_save,
                 ]
 
                 def _update_lora_cmd(*args):
@@ -3813,6 +3946,7 @@ def build_ui() -> gr.Blocks:
 
                 for comp in [lora_base_model, lora_manifest, lora_output_dir, lora_run_name,
                               lora_rank, lora_alpha, lora_dropout, lora_target_modules,
+                              lora_model_version, lora_modules_to_save,
                               lora_save_mode, lora_attention_backend,
                               lora_use_ema, lora_ema_decay, lora_max_steps]:
                     comp.change(_update_lora_cmd, inputs=_lora_exec_inputs, outputs=[lora_cmd_preview])

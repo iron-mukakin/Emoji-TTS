@@ -1,0 +1,41 @@
+# LoRA学習プリセット: Irodori-TTS-v4-Small / v4.1-Small 向け。
+# Gradio の LoRA学習タブ「プリセット読み込み」で利用可能。
+# target_modules/modules_to_save = auto の場合、lora_train.py が
+# ベースチェックポイントからバージョンを自動判別し、v4系既定
+# （拡散attention限定LoRA + duration_predictor全パラメータ学習）を使用します。
+#
+# CLIで直接実行する場合の例:
+#   .venv\Scripts\python.exe lora_train.py ^
+#     --base-model checkpoints/Aratako_Irodori-TTS-v4.1-Small/model.safetensors ^
+#     --manifest path/to/manifest.jsonl ^
+#     --target-modules auto --modules-to-save auto ^
+#     --lora-rank 16 --lora-alpha 32 ...
+lora:
+  lora_rank: 16
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  model_version: v4
+  target_modules: auto
+  modules_to_save: auto
+  save_mode: EMAのみ
+  attention_backend: sdpa
+  use_early_stopping: false
+  es_patience: 3
+  es_min_delta: 0.01
+  use_ema: true
+  ema_decay: 0.9999
+  batch_size: 4
+  grad_accum: 2
+  lr: 0.0001
+  optimizer: adamw
+  lr_scheduler: none
+  warmup_steps: 0
+  max_steps: 2000
+  save_every: 200
+  log_every: 10
+  valid_ratio: 0.0
+  valid_every: 100
+  wandb_enabled: false
+  wandb_project: ''
+  wandb_run_name: ''
+  seed: 0

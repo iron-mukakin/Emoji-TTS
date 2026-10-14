@@ -946,6 +946,47 @@ class InferenceRuntime:
         )
         return ref_latent_patched, ref_mask
 
+    def _load_speaker_embedding_condition(
+        self,
+        *,
+        req: SamplingRequest,
+        batch_size: int,
+        messages: list[str],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Speaker Inversion embedding (ref_embed) から話者条件を構築する。未指定なら (None, None)。"""
+        if req.ref_embed is None:
+            return None, None
+        if not self.model_cfg.use_speaker_condition_resolved:
+            messages.append(
+                "info: speaker conditioning is disabled for this checkpoint; ignoring speaker embedding."
+            )
+            return None, None
+        if (
+            req.ref_wav is not None
+            or req.ref_wavs
+            or req.ref_latent is not None
+            or req.ref_latents
+            or req.no_ref
+        ):
+            raise ValueError(
+                "ref_embed/--ref-embed cannot be combined with reference inputs or no_ref. "
+                "Use exactly one speaker conditioning source."
+            )
+
+        runtime_dtype = next(self.model.parameters()).dtype
+        speaker_embedding = load_speaker_inversion_payload(req.ref_embed)["speaker_embedding"]
+        state, mask = speaker_inversion_batch_tensors(
+            speaker_embedding,
+            batch_size=batch_size,
+            device=self.model_device,
+            dtype=runtime_dtype,
+        )
+        messages.append(
+            "info: using speaker inversion embedding "
+            f"tokens={state.shape[1]} uncond_mode={req.speaker_uncond_mode}."
+        )
+        return state, mask
+
     def synthesize(
         self,
         req: SamplingRequest,
@@ -1143,11 +1184,22 @@ class InferenceRuntime:
 
                 t0 = _measure_start(self.model_device, self.codec_device)
                 msg_count_before_ref = len(messages)
-                ref_latent, ref_mask = self._load_reference_latent(
+                (
+                    speaker_state_override,
+                    speaker_mask_override,
+                ) = self._load_speaker_embedding_condition(
                     req=req,
                     batch_size=num_candidates,
                     messages=messages,
                 )
+                if speaker_state_override is None:
+                    ref_latent, ref_mask = self._load_reference_latent(
+                        req=req,
+                        batch_size=num_candidates,
+                        messages=messages,
+                    )
+                else:
+                    ref_latent, ref_mask = None, None
                 stage_sec = _measure_end(self.model_device, t0, self.codec_device)
                 stage_timings.append(("prepare_reference", stage_sec))
                 for msg in messages[msg_count_before_ref:]:
@@ -1174,7 +1226,9 @@ class InferenceRuntime:
                     has_speaker_duration = torch.zeros(
                         (num_candidates,), dtype=torch.bool, device=self.model_device
                     )
-                    if self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
+                    if speaker_mask_override is not None:
+                        has_speaker_duration = speaker_mask_override.any(dim=1)
+                    elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
                         has_speaker_duration = ref_mask.any(dim=1)
                     duration_features = build_duration_features(
                         [normalized_text] * num_candidates,
@@ -1196,6 +1250,8 @@ class InferenceRuntime:
                         ref_mask=ref_mask,
                         caption_input_ids=caption_ids,
                         caption_mask=caption_mask,
+                        speaker_state_override=speaker_state_override,
+                        speaker_mask_override=speaker_mask_override,
                         speaker_uncond_mode=req.speaker_uncond_mode,
                     )
                     pred_log_frames = self.model.predict_duration_log_frames(
@@ -1262,6 +1318,8 @@ class InferenceRuntime:
                     sequence_length=patched_steps,
                     caption_input_ids=caption_ids,
                     caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
                     speaker_uncond_mode=req.speaker_uncond_mode,
                     num_steps=int(req.num_steps),
                     cfg_scale_text=cfg_scale_text,

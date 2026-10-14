@@ -47,6 +47,7 @@ CHECKPOINT_BEST_VAL_LOSS_RE = re.compile(
     r"^checkpoint_best_val_loss_(\d+)_(-?\d+(?:\.\d+)?)(?:\.pt)?$"
 )
 SAFETENSORS_CONFIG_META_KEY = "config_json"
+SAFETENSORS_TEXT_ENCODER_CONFIG_META_KEY = "text_encoder_config_json"
 SAFETENSORS_INFERENCE_CONFIG_KEYS = {"max_text_len", "max_caption_len", "fixed_target_latent_steps", "ref_max_seconds"}
 
 # pyファイル基準のcheckpointsフォルダ（トークナイザー等のHFキャッシュ先）
@@ -320,6 +321,34 @@ def compute_rf_loss(
     raise ValueError(f"Unsupported rf_loss_mode={mode!r}. Expected 'echo' or 'utterance_mean'.")
 
 
+def freeze_for_speaker_inversion(model: torch.nn.Module) -> tuple[int, int]:
+    """Speaker Inversion embedding 以外を凍結する（上流 train.py 相当）。"""
+    trainable_params = 0
+    frozen_params = 0
+    for key, param in model.named_parameters():
+        if str(key).startswith("speaker_inversion."):
+            param.requires_grad_(True)
+            trainable_params += param.numel()
+        else:
+            param.requires_grad_(False)
+            frozen_params += param.numel()
+    return trainable_params, frozen_params
+
+
+PRETRAINED_PROJECTOR_PARAM_PREFIXES = ("text_encoder.", "caption_encoder.")
+
+
+def _clear_non_pretrained_projector_grads(model: torch.nn.Module) -> None:
+    """pretrained projector（text_encoder/caption_encoder）の勾配だけを残す（上流相当）。"""
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith(PRETRAINED_PROJECTOR_PARAM_PREFIXES):
+            continue
+        if param.grad is not None:
+            param.grad = None
+
+
 def save_checkpoint(
     path: str | Path,
     model: TextToLatentRFDiT,
@@ -330,6 +359,7 @@ def save_checkpoint(
     train_cfg: TrainConfig,
     ema_model: "EMAModel | None" = None,
     save_full: bool = False,
+    text_encoder_config: dict | None = None,
 ) -> None:
     """チェックポイントを保存する。
 
@@ -339,9 +369,21 @@ def save_checkpoint(
         checkpoint_XXXXXXX_full.pt ... フルサイズ版（追加学習用）--save-full指定時のみ
     - EMAが無効な場合:
         checkpoint_XXXXXXX.pt      ... 従来通りフルサイズのみ
+    - Speaker Inversion 学習時は 追加で <path>.speaker.safetensors を保存する。
+    - v4系では事前学習テキストエンコーダ設定(text_encoder_config)を .pt に埋め込む。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    if train_cfg.speaker_inversion_enabled:
+        from irodori_tts.speaker_inversion import save_speaker_inversion_checkpoint
+        if ema_model is not None:
+            ema_model.apply_shadow(model)
+        save_speaker_inversion_checkpoint(
+            path.with_name(path.stem + ".speaker.safetensors"), model=model
+        )
+        if ema_model is not None:
+            ema_model.restore(model)
 
     if ema_model is not None:
         # EMA版を _ema.pt で保存（推論用・軽量）
@@ -352,6 +394,8 @@ def save_checkpoint(
             "model": model.state_dict(),
             "model_config": asdict(model_cfg),
         }
+        if text_encoder_config is not None:
+            ema_payload["text_encoder_config"] = text_encoder_config
         torch.save(ema_payload, ema_path)
         ema_model.restore(model)
 
@@ -367,6 +411,8 @@ def save_checkpoint(
                 "train_config": asdict(train_cfg),
                 "ema": ema_model.state_dict(),
             }
+            if text_encoder_config is not None:
+                full_payload["text_encoder_config"] = text_encoder_config
             torch.save(full_payload, full_path)
     else:
         # EMA無効時は従来通りフルサイズのみ保存
@@ -378,6 +424,8 @@ def save_checkpoint(
             "model_config": asdict(model_cfg),
             "train_config": asdict(train_cfg),
         }
+        if text_encoder_config is not None:
+            payload["text_encoder_config"] = text_encoder_config
         torch.save(payload, path)
 
 
@@ -451,6 +499,7 @@ def maybe_save_best_val_loss_checkpoint(
     train_cfg: TrainConfig,
     ema_model: "EMAModel | None" = None,
     save_full: bool = False,
+    text_encoder_config: dict | None = None,
 ) -> tuple[list[tuple[float, int, Path]], Path | None]:
     if keep_best_n <= 0:
         return checkpoints, None
@@ -480,6 +529,7 @@ def maybe_save_best_val_loss_checkpoint(
         train_cfg=train_cfg,
         ema_model=ema_model,
         save_full=save_full,
+        text_encoder_config=text_encoder_config,
     )
     checkpoints.append((float(val_loss), int(step), path))
     checkpoints = prune_best_val_loss_checkpoints(checkpoints, keep_best_n)
@@ -592,12 +642,21 @@ def initialize_text_embedding_from_pretrained(
     del text_backbone
 
 
-def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict | None, dict | None]:
+def _load_model_state_from_checkpoint(
+    path: Path,
+) -> tuple[dict[str, torch.Tensor], dict | None, dict | None, dict | None]:
+    """チェックポイントから (state, model_config, train_config, text_encoder_config) を読み出す。
+
+    text_encoder_config は v4 系 (text_encoder_type='pretrained') の事前学習
+    バックボーン設定で、safetensors では 'text_encoder_config_json' メタデータ、
+    .pt では 'text_encoder_config' キーに保存される。無い場合は None。
+    """
     if path.suffix.lower() == ".safetensors":
         from safetensors import safe_open
         from safetensors.torch import load_file as load_safetensors_file
 
         checkpoint_model_cfg = None
+        text_encoder_config = None
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             metadata = dict(handle.metadata() or {})
         from irodori_tts.quantization import parse_quantization_metadata
@@ -616,7 +675,12 @@ def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tenso
                     for key, value in parsed.items()
                     if key not in SAFETENSORS_INFERENCE_CONFIG_KEYS
                 }
-        return load_safetensors_file(str(path), device="cpu"), checkpoint_model_cfg, None
+        text_encoder_json = metadata.get(SAFETENSORS_TEXT_ENCODER_CONFIG_META_KEY)
+        if text_encoder_json:
+            parsed_te = json.loads(text_encoder_json)
+            if isinstance(parsed_te, dict):
+                text_encoder_config = parsed_te
+        return load_safetensors_file(str(path), device="cpu"), checkpoint_model_cfg, None, text_encoder_config
 
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
@@ -634,7 +698,10 @@ def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tenso
     checkpoint_train_cfg = payload.get("train_config")
     if checkpoint_train_cfg is not None and not isinstance(checkpoint_train_cfg, dict):
         raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
-    return raw_model, checkpoint_model_cfg, checkpoint_train_cfg
+    text_encoder_config = payload.get("text_encoder_config")
+    if text_encoder_config is not None and not isinstance(text_encoder_config, dict):
+        raise ValueError(f"Checkpoint text_encoder_config must be a dictionary when present: {path}")
+    return raw_model, checkpoint_model_cfg, checkpoint_train_cfg, text_encoder_config
 
 
 def _check_model_config_compatibility(
@@ -1050,6 +1117,34 @@ def main() -> None:
         "--caption-warmup-steps", type=int, default=0,
         help="Number of optimizer steps to run caption-only warmup for when caption_warmup is enabled.",
     )
+    parser.add_argument(
+        "--pretrained-text-encoder-lr", type=float, default=None,
+        help="Separate learning rate for the pretrained text backbone (v4, text_encoder_type='pretrained').",
+    )
+    parser.add_argument(
+        "--pretrained-text-encoder-optimizer", choices=["adamw"], default=None,
+        help="Optimizer used for the pretrained text backbone parameters (this fork: adamw only).",
+    )
+    parser.add_argument(
+        "--pretrained-projector-warmup-steps", type=int, default=0,
+        help="For the first N optimizer steps, update only the pretrained text/caption projectors.",
+    )
+    speaker_inversion_group = parser.add_mutually_exclusive_group()
+    speaker_inversion_group.add_argument(
+        "--speaker-inversion", dest="speaker_inversion_enabled", action="store_true",
+        help="Train Speaker Inversion embedding tokens only (all other parameters frozen).",
+    )
+    speaker_inversion_group.add_argument(
+        "--no-speaker-inversion", dest="speaker_inversion_enabled", action="store_false",
+        help="Disable Speaker Inversion training.",
+    )
+    parser.set_defaults(speaker_inversion_enabled=None)
+    parser.add_argument("--speaker-inversion-tokens", type=int, default=None,
+                        help="Number of Speaker Inversion embedding tokens (default from config: 16).")
+    parser.add_argument("--speaker-inversion-init-std", type=float, default=None,
+                        help="Stddev for Speaker Inversion embedding initialization.")
+    parser.add_argument("--speaker-inversion-init-embedding", default=None,
+                        help="Path to a .speaker.safetensors embedding to initialize Speaker Inversion from.")
     parser.add_argument("--stable-steps", type=int, default=0)
     parser.add_argument("--min-lr-scale", type=float, default=0.1)
     parser.add_argument("--latent-dim", type=int, default=128)
@@ -1228,6 +1323,20 @@ def main() -> None:
         train_cfg = replace(train_cfg, caption_warmup=bool(args.caption_warmup))
     if cli_provided(raw_argv, "--caption-warmup-steps"):
         train_cfg = replace(train_cfg, caption_warmup_steps=args.caption_warmup_steps)
+    if cli_provided(raw_argv, "--pretrained-text-encoder-lr"):
+        train_cfg = replace(train_cfg, pretrained_text_encoder_learning_rate=args.pretrained_text_encoder_lr)
+    if cli_provided(raw_argv, "--pretrained-text-encoder-optimizer"):
+        train_cfg = replace(train_cfg, pretrained_text_encoder_optimizer=args.pretrained_text_encoder_optimizer)
+    if cli_provided(raw_argv, "--pretrained-projector-warmup-steps"):
+        train_cfg = replace(train_cfg, pretrained_projector_warmup_steps=args.pretrained_projector_warmup_steps)
+    if args.speaker_inversion_enabled is not None:
+        train_cfg = replace(train_cfg, speaker_inversion_enabled=bool(args.speaker_inversion_enabled))
+    if cli_provided(raw_argv, "--speaker-inversion-tokens"):
+        train_cfg = replace(train_cfg, speaker_inversion_tokens=args.speaker_inversion_tokens)
+    if cli_provided(raw_argv, "--speaker-inversion-init-std"):
+        train_cfg = replace(train_cfg, speaker_inversion_init_std=args.speaker_inversion_init_std)
+    if cli_provided(raw_argv, "--speaker-inversion-init-embedding"):
+        train_cfg = replace(train_cfg, speaker_inversion_init_embedding=args.speaker_inversion_init_embedding)
     if cli_provided(raw_argv, "--stable-steps"):
         train_cfg = replace(train_cfg, stable_steps=args.stable_steps)
     if cli_provided(raw_argv, "--min-lr-scale"):
@@ -1387,13 +1496,16 @@ def main() -> None:
     # ── --init-checkpoint からモデル設定を自動判別して model_cfg を更新 ──────
     # --resume (.pt) も同様に model_cfg を自動同期する
     _sync_checkpoint_path: Path | None = None
+    _text_encoder_config: dict | None = None  # v4系 事前学習テキストエンコーダ設定
     if args.init_checkpoint is not None:
         _sync_checkpoint_path = Path(args.init_checkpoint).expanduser()
     elif args.resume is not None:
         _sync_checkpoint_path = Path(args.resume).expanduser()
     else:
-        # デフォルト候補: v3 → v2 の順で自動参照
+        # デフォルト候補: v4.1 → v4 → v3 → v2 の順で自動参照
         _DEFAULT_PRETRAINED_SAFETENSORS_CANDIDATES = [
+            _PROJECT_CHECKPOINTS_DIR / "Aratako_Irodori-TTS-v4.1-Small" / "model.safetensors",
+            _PROJECT_CHECKPOINTS_DIR / "Aratako_Irodori-TTS-v4-Small" / "model.safetensors",
             _PROJECT_CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v3" / "model.safetensors",
             _PROJECT_CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M-v2" / "model.safetensors",
             _PROJECT_CHECKPOINTS_DIR / "Aratako_Irodori-TTS-500M" / "model.safetensors",
@@ -1406,7 +1518,9 @@ def main() -> None:
             args.init_checkpoint = str(_auto)
 
     if _sync_checkpoint_path is not None and _sync_checkpoint_path.exists():
-        _sync_state, _sync_model_cfg_dict, _ = _load_model_state_from_checkpoint(_sync_checkpoint_path)
+        _sync_state, _sync_model_cfg_dict, _sync_train_cfg_dict, _sync_te_cfg = _load_model_state_from_checkpoint(_sync_checkpoint_path)
+        if _sync_te_cfg is not None:
+            _text_encoder_config = _sync_te_cfg
         if _sync_model_cfg_dict is not None:
             _has_caption = checkpoint_uses_caption_condition(_sync_model_cfg_dict, _sync_state)
             _has_duration = checkpoint_uses_duration_predictor(_sync_model_cfg_dict, _sync_state)
@@ -1444,10 +1558,72 @@ def main() -> None:
             if _sync_overrides:
                 model_cfg = replace(model_cfg, **_sync_overrides)
                 if is_main_process:
-                    _ver = "v3" if (_has_caption or _has_duration) else "v2/v1"
-                    print(f"Model version detected: {_ver} (caption={_has_caption}, duration={_has_duration})")
+                    from irodori_tts import model_version as _mv
+                    _ver_info = _mv.classify_model_version(_sync_model_cfg_dict, _sync_state.keys())
+                    if _ver_info is not None:
+                        print(f"Model version detected: {_mv.describe_model_version(_ver_info)}")
+                    else:
+                        _ver = "v3" if (_has_caption or _has_duration) else "v2/v1"
+                        print(f"Model version detected: {_ver} (caption={_has_caption}, duration={_has_duration})")
+                    if _text_encoder_config is not None:
+                        print("Embedded text_encoder_config found; building pretrained backbone without HF download.")
                     print(f"Synchronized model_cfg from checkpoint: {_sync_checkpoint_path}")
         del _sync_state
+
+    # ── v4 / Speaker Inversion 関連のバリデーション（model_cfg 同期後） ────
+    if str(train_cfg.pretrained_text_encoder_optimizer).strip().lower() != "adamw":
+        raise ValueError(
+            "pretrained_text_encoder_optimizer must be 'adamw' in this fork, "
+            f"got {train_cfg.pretrained_text_encoder_optimizer!r}."
+        )
+    if train_cfg.pretrained_projector_warmup_steps < 0:
+        raise ValueError(
+            "pretrained_projector_warmup_steps must be >= 0, "
+            f"got {train_cfg.pretrained_projector_warmup_steps}"
+        )
+    if train_cfg.pretrained_projector_warmup_steps > 0 and not model_cfg.use_pretrained_text_encoder:
+        raise ValueError(
+            "pretrained_projector_warmup_steps requires model.text_encoder_type='pretrained'."
+        )
+    if train_cfg.pretrained_projector_warmup_steps > 0 and train_cfg.caption_warmup:
+        raise ValueError("pretrained_projector_warmup_steps and caption_warmup cannot be combined.")
+    if train_cfg.speaker_inversion_enabled:
+        if not model_cfg.use_speaker_condition_resolved:
+            raise ValueError(
+                "speaker_inversion_enabled=True requires a speaker-conditioned model config."
+            )
+        if args.init_checkpoint is None and args.resume is None:
+            raise ValueError(
+                "speaker_inversion_enabled=True requires --init-checkpoint so the frozen "
+                "base model is loaded first."
+            )
+        if args.resume is not None:
+            raise ValueError(
+                "speaker_inversion_enabled=True saves embedding-only checkpoints; "
+                "--resume is not supported. Use --speaker-inversion-init-embedding "
+                "to continue from a saved embedding."
+            )
+        if train_cfg.train_mode != "rf":
+            raise ValueError("speaker_inversion_enabled=True supports train_mode='rf' only.")
+        if train_cfg.caption_warmup or train_cfg.pretrained_projector_warmup_steps > 0:
+            raise ValueError(
+                "speaker_inversion_enabled=True does not support caption_warmup or "
+                "pretrained_projector_warmup_steps."
+            )
+        if train_cfg.optimizer != "adamw":
+            raise ValueError(
+                "speaker_inversion_enabled=True supports optimizer='adamw' "
+                f"(got {train_cfg.optimizer!r}) because only the embedding tokens are trained."
+            )
+        if train_cfg.speaker_inversion_tokens <= 0:
+            raise ValueError(
+                f"speaker_inversion_tokens must be > 0, got {train_cfg.speaker_inversion_tokens}"
+            )
+        if train_cfg.speaker_inversion_init_std < 0:
+            raise ValueError(
+                "speaker_inversion_init_std must be >= 0, "
+                f"got {train_cfg.speaker_inversion_init_std}"
+            )
 
     # ── tokenizer / caption tokenizer ────────────────────────────────────
     if distributed:
@@ -1593,12 +1769,22 @@ def main() -> None:
             print(f"Checkpoint retention: validation disabled, keep latest {periodic_checkpoint_keep} periodic checkpoints.")
 
     # ── モデル構築 ───────────────────────────────────────────────────────
-    raw_model = TextToLatentRFDiT(model_cfg).to(device)
+    # v4系でチェックポイントに text_encoder_config が埋め込まれている場合は、
+    # HFから事前学習重みをダウンロードせず空構築して重みを流し込む。
+    raw_model = TextToLatentRFDiT(
+        model_cfg,
+        pretrained_backbone_config=_text_encoder_config,
+        load_pretrained_backbone_weights=not (
+            model_cfg.use_pretrained_text_encoder and _text_encoder_config is not None
+        ),
+    ).to(device)
 
     # --init-checkpoint または自動参照: モデル重みのみロード
     if args.init_checkpoint is not None:
         init_path = Path(args.init_checkpoint).expanduser()
-        init_state, init_model_cfg_dict, _ = _load_model_state_from_checkpoint(init_path)
+        init_state, init_model_cfg_dict, _, _init_te_cfg = _load_model_state_from_checkpoint(init_path)
+        if _text_encoder_config is None and _init_te_cfg is not None:
+            _text_encoder_config = _init_te_cfg
         _has_caption_ckpt = checkpoint_uses_caption_condition(init_model_cfg_dict, init_state)
         _has_duration_ckpt = checkpoint_uses_duration_predictor(init_model_cfg_dict, init_state)
         _current_has_caption = bool(model_cfg.use_caption_condition)
@@ -1637,7 +1823,8 @@ def main() -> None:
                     if unexpected:
                         print(f"  Unexpected keys: {len(unexpected)}")
         # caption embeddingをpretrained initializeする（v3アップグレード時）
-        if _upgrade_caption and is_main_process:
+        # pretrainedテキストエンコーダ(v4)はcaption_encoderがprojectorのため対象外。
+        if _upgrade_caption and is_main_process and not model_cfg.use_pretrained_text_encoder:
             print(f"Initializing caption embedding from pretrained: {model_cfg.caption_tokenizer_repo_resolved}")
             try:
                 from transformers import AutoModel as _AM
@@ -1651,10 +1838,46 @@ def main() -> None:
             except Exception as _e:
                 print(f"  warning: caption embedding init failed: {_e}")
     elif args.resume is None:
-        # スクラッチ: text embeddingをpretrained初期化
+        # スクラッチ: text embeddingをpretrained初期化（pretrained TE(v4)は対象外）
+        if model_cfg.use_pretrained_text_encoder:
+            if is_main_process:
+                print("Scratch training with text_encoder_type='pretrained'; "
+                      "backbone weights loaded from HF at construction.")
+        else:
+            if is_main_process:
+                print(f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}")
+            initialize_text_embedding_from_pretrained(raw_model, model_cfg, local_files_only=False)
+
+    # ── Speaker Inversion 学習: embedding トークン追加 + 他パラメータ凍結 ──
+    if train_cfg.speaker_inversion_enabled:
+        from irodori_tts.speaker_inversion import (
+            SPEAKER_EMBEDDING_KEY,
+            load_speaker_inversion_payload,
+        )
+        _si_init_embedding = None
+        if train_cfg.speaker_inversion_init_embedding is not None:
+            _si_payload = load_speaker_inversion_payload(train_cfg.speaker_inversion_init_embedding)
+            _si_init_embedding = _si_payload[SPEAKER_EMBEDDING_KEY]
+            if is_main_process:
+                print(f"Loaded Speaker Inversion init embedding: {train_cfg.speaker_inversion_init_embedding}")
+        _speaker_inversion = raw_model.enable_speaker_inversion(
+            num_tokens=train_cfg.speaker_inversion_tokens,
+            init_std=train_cfg.speaker_inversion_init_std,
+            init_embedding=_si_init_embedding,
+        )
+        _speaker_inversion.to(device)
         if is_main_process:
-            print(f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}")
-        initialize_text_embedding_from_pretrained(raw_model, model_cfg, local_files_only=False)
+            print(
+                f"Speaker Inversion parameters initialized: "
+                f"embedding={tuple(_speaker_inversion.embedding.shape)}."
+            )
+        _trainable_si, _frozen_si = freeze_for_speaker_inversion(raw_model)
+        if _trainable_si == 0:
+            raise RuntimeError("No Speaker Inversion parameters were found.")
+        if is_main_process:
+            print(
+                f"Speaker Inversion freeze applied: trainable={_trainable_si:,} frozen={_frozen_si:,}."
+            )
 
     train_model = raw_model
     if train_cfg.compile_model:
@@ -1734,7 +1957,15 @@ def main() -> None:
         resume_path = Path(args.resume).expanduser()
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         raw_model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except (ValueError, KeyError, TypeError) as exc:
+            # pretrained text encoder optimizer 分割など、optimizer 構成が変わった場合
+            if is_main_process:
+                print(
+                    "Warning: optimizer state does not match the current optimizer configuration; "
+                    f"continuing without restoring optimizer state ({exc})."
+                )
         step = int(ckpt["step"])
         if scheduler is not None:
             scheduler_state = ckpt.get("scheduler")
@@ -1771,6 +2002,18 @@ def main() -> None:
     )
     if caption_warmup_active and is_main_process:
         print(f"Caption warmup active: caption-only parameters only for first {train_cfg.caption_warmup_steps} optimizer steps.")
+
+    # pretrained projector warmup: text/caption projector のみ最初のN stepだけ更新
+    pretrained_projector_warmup_active = bool(
+        model_cfg.use_pretrained_text_encoder
+        and train_cfg.pretrained_projector_warmup_steps > 0
+        and step < train_cfg.pretrained_projector_warmup_steps
+    )
+    if pretrained_projector_warmup_active and is_main_process:
+        print(
+            f"Pretrained projector warmup active: projectors only for first "
+            f"{train_cfg.pretrained_projector_warmup_steps} optimizer steps."
+        )
 
     # ETA推定用
     _step_times: list[float] = []
@@ -1862,12 +2105,21 @@ def main() -> None:
                 duration_has_speaker = None
                 if raw_model.cfg.use_speaker_condition_resolved:
                     speaker_cond_drop = torch.rand(bsz, device=device) < train_cfg.speaker_condition_dropout
-                    use_speaker = has_speaker & (~speaker_cond_drop)
-                    speaker_drop_for_model = ~use_speaker
+                    if train_cfg.speaker_inversion_enabled:
+                        # Speaker Inversion は1つの学習済みembeddingを全サンプルで共有するため、
+                        # マニフェストに speaker_id が無くても全サンプル話者条件付きとして扱う。
+                        use_speaker = ~speaker_cond_drop
+                        speaker_drop_for_model = speaker_cond_drop
+                    else:
+                        use_speaker = has_speaker & (~speaker_cond_drop)
+                        speaker_drop_for_model = ~use_speaker
                     duration_speaker_drop = torch.rand(bsz, device=device) < train_cfg.duration_speaker_dropout
-                    duration_has_speaker = has_speaker & (~duration_speaker_drop)
+                    if train_cfg.speaker_inversion_enabled:
+                        duration_has_speaker = ~duration_speaker_drop
+                    else:
+                        duration_has_speaker = has_speaker & (~duration_speaker_drop)
                     duration_features = set_duration_has_speaker_feature(duration_features, duration_has_speaker)
-                    if not raw_model.cfg.use_duration_predictor:
+                    if not raw_model.cfg.use_duration_predictor and not train_cfg.speaker_inversion_enabled:
                         # v2以前: 手動マスク
                         ref_mask = ref_mask & use_speaker[:, None]
                         ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
@@ -1922,6 +2174,9 @@ def main() -> None:
                                 ref_latent=ref_latent, ref_mask=ref_mask,
                                 caption_input_ids=caption_ids, caption_mask=caption_mask,
                                 latent_mask=x_mask,
+                                speaker_condition_dropout=(
+                                    speaker_drop_for_model if train_cfg.speaker_inversion_enabled else None
+                                ),
                             )
                             duration_pred = None
 
@@ -1945,6 +2200,10 @@ def main() -> None:
                     else:
                         loss = rf_loss + float(train_cfg.duration_loss_weight) * duration_loss
                     (loss / float(accum_steps)).backward()
+
+                    # pretrained projector warmup: text/caption projector のgradだけ残す
+                    if pretrained_projector_warmup_active:
+                        _clear_non_pretrained_projector_grads(raw_model)
 
                     # caption warmup: caption以外のgradをゼロ化
                     if caption_warmup_active:
@@ -1989,6 +2248,14 @@ def main() -> None:
                     if is_main_process:
                         progress.write("Caption warmup complete; all parameters are now updating.")
 
+                if (
+                    pretrained_projector_warmup_active
+                    and step >= train_cfg.pretrained_projector_warmup_steps
+                ):
+                    pretrained_projector_warmup_active = False
+                    if is_main_process:
+                        progress.write("Pretrained projector warmup complete; all parameters are now updating.")
+
                 # ── ログ出力 ──────────────────────────────────────────────
                 if step <= 5 or step % train_cfg.log_every == 0:
                     loss_value = reduce_mean(step_loss, world_size, distributed).item()
@@ -2028,6 +2295,7 @@ def main() -> None:
                         output_dir / f"checkpoint_{step:07d}.pt",
                         raw_model, optimizer, scheduler, step, model_cfg, train_cfg,
                         ema_model=ema_model, save_full=save_full,
+                        text_encoder_config=_text_encoder_config,
                     )
                     enforce_periodic_checkpoint_limit(output_dir=output_dir, keep_count=periodic_checkpoint_keep)
 
@@ -2055,6 +2323,7 @@ def main() -> None:
                             model=raw_model, optimizer=optimizer, scheduler=scheduler,
                             model_cfg=model_cfg, train_cfg=train_cfg,
                             ema_model=ema_model, save_full=save_full,
+                            text_encoder_config=_text_encoder_config,
                         )
                         if best_path is not None:
                             progress.write(f"saved best val checkpoint: {best_path.name} (loss={valid_metrics['loss']:.6f})")
@@ -2070,6 +2339,7 @@ def main() -> None:
                                     output_dir / f"checkpoint_early_stop_{step:07d}.pt",
                                     raw_model, optimizer, scheduler, step, model_cfg, train_cfg,
                                     ema_model=ema_model, save_full=save_full,
+                                    text_encoder_config=_text_encoder_config,
                                 )
 
                 if step >= train_cfg.max_steps:
@@ -2101,6 +2371,7 @@ def main() -> None:
                     model=raw_model, optimizer=optimizer, scheduler=scheduler,
                     model_cfg=model_cfg, train_cfg=train_cfg,
                     ema_model=ema_model, save_full=save_full,
+                    text_encoder_config=_text_encoder_config,
                 )
                 if best_path is not None:
                     progress.write(f"saved best val checkpoint: {best_path.name} (loss={valid_metrics['loss']:.6f})")
@@ -2110,6 +2381,7 @@ def main() -> None:
                 output_dir / "checkpoint_final.pt",
                 raw_model, optimizer, scheduler, step, model_cfg, train_cfg,
                 ema_model=ema_model, save_full=save_full,
+                text_encoder_config=_text_encoder_config,
             )
             if _metrics_log_file is not None:
                 pass  # final_step はログ行から取得可能なため summary 不要

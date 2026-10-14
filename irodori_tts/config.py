@@ -146,6 +146,7 @@ class TrainConfig:
     train_mode: str = "rf"
     learning_rate: float = 1e-4
     pretrained_text_encoder_learning_rate: float = 1e-5
+    pretrained_text_encoder_optimizer: str = "adamw"
     weight_decay: float = 0.01
     optimizer: str = "muon"
     adam_beta1: float = 0.9

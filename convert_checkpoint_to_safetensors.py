@@ -11,6 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 CONFIG_META_KEY = "config_json"
+TEXT_ENCODER_CONFIG_META_KEY = "text_encoder_config_json"
 INFERENCE_CONFIG_KEYS = ("max_text_len", "fixed_target_latent_steps")
 
 
@@ -86,10 +87,29 @@ def _build_flat_config(payload: dict[str, Any]) -> dict[str, Any]:
     return flat_cfg
 
 
-def _build_safetensors_metadata(*, flat_config: dict[str, Any]) -> dict[str, str]:
-    return {
+def _extract_text_encoder_config(payload: dict[str, Any]) -> dict[str, Any] | None:
+    text_encoder_config = payload.get("text_encoder_config")
+    if text_encoder_config is None:
+        return None
+    if not isinstance(text_encoder_config, dict):
+        raise ValueError("Checkpoint 'text_encoder_config' must be a dictionary when present.")
+    return text_encoder_config
+
+
+def _build_safetensors_metadata(
+    *,
+    flat_config: dict[str, Any],
+    text_encoder_config: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    metadata = {
         CONFIG_META_KEY: json.dumps(flat_config, ensure_ascii=False, separators=(",", ":")),
     }
+    if text_encoder_config:
+        # v4系 pretrained text encoder の構成。推論時にHF設定の再取得を不要にする。
+        metadata[TEXT_ENCODER_CONFIG_META_KEY] = json.dumps(
+            text_encoder_config, ensure_ascii=False, separators=(",", ":"),
+        )
+    return metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,9 +149,11 @@ def main() -> None:
     payload = _load_checkpoint(input_path)
     model_state = _extract_model_state(payload)
     flat_config = _build_flat_config(payload)
+    text_encoder_config = _extract_text_encoder_config(payload)
 
     metadata = _build_safetensors_metadata(
         flat_config=flat_config,
+        text_encoder_config=text_encoder_config,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +164,8 @@ def main() -> None:
     print(f"Input: {input_path}")
     print(f"Saved: {output_path}")
     print(f"Tensors: {len(model_state)}")
+    if text_encoder_config:
+        print(f"Embedded text_encoder_config_json: model_type={text_encoder_config.get('model_type')}")
     print(f"Total params: {total_params:,}")
     print(f"Approx tensor bytes: {total_bytes / (1024**3):.2f} GiB")
 

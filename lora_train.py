@@ -31,6 +31,8 @@ from irodori_tts.config import (
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
 from irodori_tts.duration import set_duration_has_speaker_feature
 from irodori_tts.model import TextToLatentRFDiT
+from irodori_tts import model_version
+from irodori_tts.model_version import describe_model_version
 from irodori_tts.optim import build_optimizer_extended, build_scheduler, current_lr
 from irodori_tts.progress import TrainProgress
 from irodori_tts.rf import (
@@ -268,14 +270,19 @@ def save_lora_best_val(
     return best_dir
 
 
-def _load_base_model(base_model_path: str, device: torch.device) -> tuple[TextToLatentRFDiT, dict]:
-    """ベースモデルをロードして (model, model_cfg_dict) を返す。"""
+def _load_base_model(
+    base_model_path: str,
+    device: torch.device,
+    *,
+    version_choice: str = model_version.VERSION_AUTO,
+) -> tuple[TextToLatentRFDiT, dict, "model_version.ModelVersionInfo | None"]:
+    """ベースモデルをロードして (model, model_cfg_dict, version_info) を返す。"""
     p = Path(base_model_path)
     if not p.is_file():
         raise FileNotFoundError(f"Base model not found: {base_model_path}")
 
     # train.py の共通関数でモデル重みと設定を読み込む
-    model_state, checkpoint_model_cfg, _ = _load_model_state_from_checkpoint(p)
+    model_state, checkpoint_model_cfg, _, text_encoder_config = _load_model_state_from_checkpoint(p)
 
     if checkpoint_model_cfg is None:
         raise ValueError(
@@ -284,18 +291,37 @@ def _load_base_model(base_model_path: str, device: torch.device) -> tuple[TextTo
             f".pt files require 'model_config' key: {p}"
         )
 
+    version_info = model_version.resolve_model_version(
+        version_choice,
+        checkpoint_model_cfg,
+        model_state.keys(),
+    )
+
     # SAFETENSORS_INFERENCE_CONFIG_KEYS (train.py と共有) を除外してモデル設定を取得
     model_cfg_dict = {k: v for k, v in checkpoint_model_cfg.items() if k not in SAFETENSORS_INFERENCE_CONFIG_KEYS}
     model_cfg = ModelConfig(**{k: v for k, v in model_cfg_dict.items() if hasattr(ModelConfig, k) or k in ModelConfig.__dataclass_fields__})
 
-    model = TextToLatentRFDiT(model_cfg).to(device)
-    missing, unexpected = model.load_state_dict(model_state, strict=False)
+    if model_cfg.use_pretrained_text_encoder:
+        # v4系: 埋め込まれた text encoder config から構築し、重みはチェックポイント復元で満たす
+        # （HFからbackbone重みを再ダウンロードしない）。
+        model = TextToLatentRFDiT(
+            model_cfg,
+            pretrained_backbone_config=text_encoder_config,
+            load_pretrained_backbone_weights=False,
+        )
+        missing, unexpected = model.load_state_dict(
+            model_state, strict=False, assign=True,
+        )
+        model = model.to(device)
+    else:
+        model = TextToLatentRFDiT(model_cfg).to(device)
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
     if missing:
         print(f"  Base model missing keys: {len(missing)}")
     if unexpected:
         print(f"  Base model unexpected keys: {len(unexpected)}")
 
-    return model, model_cfg_dict
+    return model, model_cfg_dict, version_info
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +340,16 @@ def main() -> None:
                         help="LoRA スケール (デフォルト: 32)。")
     parser.add_argument("--lora-dropout", type=float, default=0.05,
                         help="LoRA ドロップアウト率 (デフォルト: 0.05)。")
-    parser.add_argument("--target-modules", default="wq,wk,wv,wo",
-                        help="LoRA適用モジュール カンマ区切り (デフォルト: wq,wk,wv,wo)。")
+    parser.add_argument("--target-modules", default="auto",
+                        help="LoRA適用モジュール カンマ区切り、または ^ で始まる正規表現1本。"
+                             "'auto' でベースモデルの世代に応じた既定値 "
+                             "(v1〜v3: wq,wk,wv,wo / v4: 拡散ブロックattention限定)。")
+    parser.add_argument("--modules-to-save", default="auto",
+                        help="LoRAとは別に全パラメータを学習するモジュール カンマ区切り。"
+                             "'auto' で世代に応じた既定値 (v4: duration_predictor / その他: none)。")
+    parser.add_argument("--model-version", choices=list(model_version.VERSION_CHOICES),
+                        default=model_version.VERSION_AUTO,
+                        help="ベースモデルの世代指定。'auto' はチェックポイントから自動判別。")
     parser.add_argument("--run-name", default=None,
                         help="出力サブフォルダ名 (デフォルト: タイムスタンプ自動生成)。")
     parser.add_argument("--resume-lora", default=None,
@@ -410,7 +444,9 @@ def main() -> None:
 
     # ── ベースモデルロード ─────────────────────────────────────────
     print("ベースモデルをロード中...")
-    raw_model, base_model_cfg_dict = _load_base_model(args.base_model, device)
+    raw_model, base_model_cfg_dict, version_info = _load_base_model(
+        args.base_model, device, version_choice=args.model_version,
+    )
     # base_model_cfg_dict には SAFETENSORS_INFERENCE_CONFIG_KEYS 除外のみが施されており、
     # ModelConfig の dataclass フィールドに存在しないキーが残っている可能性がある。
     # _load_base_model 内部と同様にフィルタしてから展開する。
@@ -426,6 +462,8 @@ def main() -> None:
     # ── 勾配チェックポイント ───────────────────────────────────────
     if args.grad_checkpoint:
         apply_gradient_checkpointing(raw_model)
+
+    print(describe_model_version(version_info))
 
     # v3モデル判定
     use_caption = bool(getattr(model_cfg, "use_caption_condition", False))
@@ -444,12 +482,49 @@ def main() -> None:
             "peft ライブラリが必要です。`pip install peft` を実行してください。"
         ) from exc
 
-    target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
+    # LoRA対象モジュール解決（フォーク版仕様: カンマ区切りlist または ^ 始まりの正規表現1本）
+    target_spec = str(args.target_modules).strip()
+    if target_spec.lower() == "auto":
+        target_spec = (
+            version_info.lora_target_modules
+            if version_info is not None
+            else "wq,wk,wv,wo"
+        )
+    use_regex = target_spec.startswith("^")
+    if use_regex:
+        target_modules: list[str] = [target_spec]
+    else:
+        target_modules = [m.strip() for m in target_spec.split(",") if m.strip()]
+    if not target_modules:
+        raise ValueError(f"Invalid --target-modules: {args.target_modules!r}")
+
+    modules_save_spec = str(args.modules_to_save).strip()
+    if modules_save_spec.lower() == "auto":
+        modules_save_spec = (
+            version_info.lora_modules_to_save
+            if version_info is not None
+            else "none"
+        )
+    modules_to_save: list[str] | None = None
+    if modules_save_spec and modules_save_spec.lower() != "none":
+        modules_to_save = [m.strip() for m in modules_save_spec.split(",") if m.strip()] or None
+    if modules_to_save and "duration_predictor" in modules_to_save and not use_duration:
+        raise ValueError(
+            "--modules-to-save duration_predictor を指定しましたが、ベースモデルにduration predictorがありません。"
+        )
+    if use_regex:
+        print(f"LoRA target regex: {target_spec}")
+    else:
+        print(f"LoRA target modules: {', '.join(target_modules)}")
+    if modules_to_save:
+        print(f"LoRA modules_to_save (full-parameter training): {', '.join(modules_to_save)}")
+
     lora_cfg_dict = {
         "r": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
-        "target_modules": target_modules,
+        "target_modules": target_spec if use_regex else target_modules,
+        "modules_to_save": modules_to_save,
     }
 
     step = 0
@@ -484,13 +559,22 @@ def main() -> None:
             print(f"Resume (train_state.json legacy): step={step} を復元")
     else:
         # 新規LoRA学習
-        lora_config = LoraConfig(
+        lora_kwargs = dict(
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
+            modules_to_save=modules_to_save,
             bias="none",
         )
+        if use_regex:
+            try:
+                # peft 0.11〜0.18系: use_regex=True + list
+                lora_config = LoraConfig(target_modules=[target_spec], use_regex=True, **lora_kwargs)
+            except TypeError:
+                # peft>=0.19: target_modules へ正規表現文字列を直接渡す
+                lora_config = LoraConfig(target_modules=target_spec, **lora_kwargs)
+        else:
+            lora_config = LoraConfig(target_modules=target_modules, **lora_kwargs)
         model = get_peft_model(raw_model, lora_config)
 
     model.print_trainable_parameters()

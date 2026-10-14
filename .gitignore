@@ -47,6 +47,9 @@ Thumbs.db
 *.zip
 *.rar
 
+#AI
+.opencode/
+
 開発用ファイル/
 コマンド早見表.txt
 logs/tensorboard/

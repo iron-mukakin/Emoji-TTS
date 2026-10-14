@@ -7,6 +7,41 @@ import torch
 from .config import TrainConfig
 
 
+class OptimizerChain:
+    """複数のオプティマイザを1つにまとめて学習ループから扱えるようにする。
+
+    param_groups は main のグループを先に並べる（current_lr が param_groups[0] を参照するため）。
+    """
+
+    def __init__(self, optimizers: list):
+        if len(optimizers) < 2:
+            raise ValueError("OptimizerChain requires at least two optimizers.")
+        self.optimizers = list(optimizers)
+        self.param_groups = []
+        for opt in self.optimizers:
+            self.param_groups.extend(opt.param_groups)
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self) -> None:
+        for opt in self.optimizers:
+            opt.step()
+
+    def state_dict(self) -> dict:
+        return {"parts": [opt.state_dict() for opt in self.optimizers]}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        parts = state_dict.get("parts")
+        if not isinstance(parts, list) or len(parts) != len(self.optimizers):
+            raise ValueError(
+                "OptimizerChain state_dict must contain 'parts' matching the chained optimizers."
+            )
+        for opt, part in zip(self.optimizers, parts, strict=True):
+            opt.load_state_dict(part)
+
+
 class MuonWithAuxAdamW:
     """
     Simple single-process wrapper:
@@ -136,6 +171,7 @@ def _partition_adamw_params(
 
 def _partition_muon_params(
     model: torch.nn.Module,
+    exclude_ids: set[int] | None = None,
 ) -> tuple[
     list[torch.nn.Parameter],
     list[torch.nn.Parameter],
@@ -152,6 +188,8 @@ def _partition_muon_params(
     aux_no_decay: list[torch.nn.Parameter] = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
+            continue
+        if exclude_ids is not None and id(p) in exclude_ids:
             continue
         # Muon is intended for hidden matrix-like weights.
         # Keep embeddings/output heads/bias-like params on Adam.
@@ -172,15 +210,94 @@ def _partition_muon_params(
     return muon_decay, muon_no_decay, aux_decay, aux_no_decay
 
 
+def _is_pretrained_text_backbone_name(name: str) -> bool:
+    return name.startswith("pretrained_text_backbone.") or ".pretrained_text_backbone." in name
+
+
+def _trainable_pretrained_backbone_ids(model: torch.nn.Module) -> set[int]:
+    """学習対象になっている事前学習テキストバックボーンパラメータの id 集合。"""
+    return {
+        id(p)
+        for name, p in model.named_parameters()
+        if p.requires_grad and _is_pretrained_text_backbone_name(name)
+    }
+
+
+def _pretrained_text_encoder_lr(cfg) -> float:
+    lr = getattr(cfg, "pretrained_text_encoder_learning_rate", None)
+    return float(lr) if lr is not None else float(cfg.learning_rate)
+
+
+def _build_pretrained_text_encoder_optimizer(
+    params: list[torch.nn.Parameter],
+    cfg,
+) -> torch.optim.Optimizer:
+    """事前学習テキストバックボーン専用のオプティマイザを作る（フォーク版: AdamW 固定）。"""
+    pre_lr = _pretrained_text_encoder_lr(cfg)
+    opt_name = str(getattr(cfg, "pretrained_text_encoder_optimizer", "adamw") or "adamw").strip().lower()
+    if opt_name != "adamw":
+        raise ValueError(
+            "pretrained_text_encoder_optimizer must be 'adamw' in this fork, "
+            f"got {cfg.pretrained_text_encoder_optimizer!r}"
+        )
+    wd_params = [p for p in params if p.dim() >= 2]
+    no_wd_params = [p for p in params if p.dim() < 2]
+    param_groups = []
+    if wd_params:
+        param_groups.append({"params": wd_params, "weight_decay": cfg.weight_decay})
+    if no_wd_params:
+        param_groups.append({"params": no_wd_params, "weight_decay": 0.0})
+    return torch.optim.AdamW(
+        param_groups,
+        lr=pre_lr,
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        eps=cfg.adam_eps,
+    )
+
+
+def _split_params_by_ids(
+    params: list[torch.nn.Parameter],
+    pre_ids: set[int],
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    base: list[torch.nn.Parameter] = []
+    pretrained: list[torch.nn.Parameter] = []
+    for p in params:
+        if id(p) in pre_ids:
+            pretrained.append(p)
+        else:
+            base.append(p)
+    return base, pretrained
+
+
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
     opt_name = cfg.optimizer.lower()
+    pre_ids = _trainable_pretrained_backbone_ids(model)
     if opt_name == "adamw":
         decay, no_decay = _partition_adamw_params(model)
+        pre_params = [p for name, p in model.named_parameters() if id(p) in pre_ids]
+        if pre_params:
+            pre_set = {id(p) for p in pre_params}
+            decay = [p for p in decay if id(p) not in pre_set]
+            no_decay = [p for p in no_decay if id(p) not in pre_set]
         param_groups = []
         if decay:
             param_groups.append({"params": decay, "weight_decay": cfg.weight_decay})
         if no_decay:
             param_groups.append({"params": no_decay, "weight_decay": 0.0})
+        if pre_params:
+            pre_lr = _pretrained_text_encoder_lr(cfg)
+            pre_opt = _build_pretrained_text_encoder_optimizer(pre_params, cfg)
+            print(f"Pretrained text encoder optimizer: AdamW (lr={pre_lr:.3e}, params={len(pre_params)})")
+            if not param_groups:
+                return pre_opt
+            main_opt = torch.optim.AdamW(
+                param_groups,
+                lr=cfg.learning_rate,
+                weight_decay=0.0,
+                betas=(cfg.adam_beta1, cfg.adam_beta2),
+                eps=cfg.adam_eps,
+            )
+            return OptimizerChain([main_opt, pre_opt])
         return torch.optim.AdamW(
             param_groups if param_groups else model.parameters(),
             lr=cfg.learning_rate,
@@ -200,7 +317,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
                 f"got {adjust_lr_fn!r}"
             )
 
-        muon_decay, muon_no_decay, aux_decay, aux_no_decay = _partition_muon_params(model)
+        muon_decay, muon_no_decay, aux_decay, aux_no_decay = _partition_muon_params(model, exclude_ids=pre_ids)
         muon_param_groups = []
         if muon_decay:
             muon_param_groups.append({"params": muon_decay, "weight_decay": cfg.weight_decay})
@@ -230,7 +347,14 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
                 betas=(cfg.adam_beta1, cfg.adam_beta2),
                 eps=cfg.adam_eps,
             )
-        return MuonWithAuxAdamW(muon_opt=muon_opt, aux_opt=aux_opt)
+        wrapped = MuonWithAuxAdamW(muon_opt=muon_opt, aux_opt=aux_opt)
+        if pre_ids:
+            pre_params = [p for name, p in model.named_parameters() if id(p) in pre_ids]
+            pre_lr = _pretrained_text_encoder_lr(cfg)
+            pre_opt = _build_pretrained_text_encoder_optimizer(pre_params, cfg)
+            print(f"Pretrained text encoder optimizer: AdamW (lr={pre_lr:.3e}, params={len(pre_params)})")
+            return OptimizerChain([wrapped, pre_opt])
+        return wrapped
 
     raise ValueError(f"Unsupported optimizer: {cfg.optimizer}")
 
@@ -295,6 +419,21 @@ def build_optimizer_extended(
         params = [p for p in trainable_params_override if p.requires_grad]
     else:
         params = [p for p in model.parameters() if p.requires_grad]
+    # 事前学習テキストバックボーン（v4系）は別学習率の専用オプティマイザへ分離する。
+    pre_ids = _trainable_pretrained_backbone_ids(model)
+    params, pre_params = _split_params_by_ids(params, pre_ids)
+
+    def _maybe_chain(main_opt):
+        if not pre_params:
+            return main_opt
+        pre_lr = _pretrained_text_encoder_lr(train_cfg)
+        pre_opt = _build_pretrained_text_encoder_optimizer(pre_params, train_cfg)
+        print(
+            f"Pretrained text encoder optimizer: AdamW "
+            f"(lr={pre_lr:.3e}, params={sum(p.numel() for p in pre_params):,})"
+        )
+        return OptimizerChain([main_opt, pre_opt])
+
     wd_params = [p for p in params if p.dim() >= 2]
     no_wd_params = [p for p in params if p.dim() < 2]
     param_groups = [
@@ -307,7 +446,7 @@ def build_optimizer_extended(
             from lion_pytorch import Lion
             opt = Lion(param_groups, lr=train_cfg.learning_rate, betas=lion_betas)
             print(f"Optimizer: Lion (betas={lion_betas})")
-            return opt
+            return _maybe_chain(opt)
         except ImportError:
             print(
                 "warning: lion_pytorch未インストール。"
@@ -327,7 +466,7 @@ def build_optimizer_extended(
                 weight_decay=train_cfg.weight_decay,
             )
             print(f"Optimizer: AdEMAMix (alpha={ademamix_alpha}, beta3={ademamix_beta3})")
-            return opt
+            return _maybe_chain(opt)
         except ImportError:
             print(
                 "warning: optimi未インストール。"
@@ -343,7 +482,7 @@ def build_optimizer_extended(
             nesterov=True,
         )
         print("Optimizer: SGD (momentum=0.9, nesterov=True)")
-        return opt
+        return _maybe_chain(opt)
 
     if name == "adamw":
         opt = torch.optim.AdamW(
@@ -355,7 +494,7 @@ def build_optimizer_extended(
             fused=torch.cuda.is_available(),
         )
         print(f"Optimizer: AdamW (fused={torch.cuda.is_available()})")
-        return opt
+        return _maybe_chain(opt)
 
     # muon / その他はオリジナルの build_optimizer に委譲
     return build_optimizer(model, train_cfg)
