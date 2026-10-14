@@ -216,7 +216,11 @@ def main() -> None:
         default=1.0,
         help="duration predictor の予測秒数に掛けるスケール係数 (>1 長め, <1 短め)。デフォルト: 1.0。",
     )
-    parser.add_argument("--num-steps", type=int, default=40)
+    parser.add_argument(
+        "--num-steps", type=int, default=None,
+        help="サンプリングステップ数。未指定時は flow_parameterization に応じて"
+             " meanflow=4 / rf_velocity=40。",
+    )
     parser.add_argument(
         "--num-candidates",
         type=int,
@@ -449,7 +453,7 @@ def main() -> None:
             else None,
             max_text_len=None if args.max_text_len is None else int(args.max_text_len),
             max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
-            num_steps=int(args.num_steps),
+            num_steps=None if args.num_steps is None else int(args.num_steps),
             cfg_scale_text=cfg_scale_text,
             cfg_scale_caption=cfg_scale_caption,
             cfg_scale_speaker=cfg_scale_speaker,

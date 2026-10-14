@@ -19,6 +19,7 @@ from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig, merge_dataclass_overrides
 from .duration import build_duration_features
 from .model import TextToLatentRFDiT
+from .meanflow import sample_euler_meanflow
 from .quantization import (
     is_torchao_quantized_state_dict,
     parse_quantization_metadata,
@@ -242,7 +243,7 @@ class SamplingRequest:
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
     max_caption_len: int | None = None
-    num_steps: int = 40
+    num_steps: int | None = None
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
     cfg_scale_speaker: float = 5.0
@@ -998,6 +999,10 @@ class InferenceRuntime:
                 log_fn(msg)
 
         messages: list[str] = []
+        is_meanflow = self.model_cfg.flow_parameterization == "meanflow"
+        num_steps = (4 if is_meanflow else 40) if req.num_steps is None else int(req.num_steps)
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be > 0, got {req.num_steps}")
         _log(
             (
                 "[runtime] start synthesize "
@@ -1012,7 +1017,7 @@ class InferenceRuntime:
                 self._uses_silentcipher_watermark,
                 req.cfg_guidance_mode,
                 req.seconds,
-                req.num_steps,
+                num_steps,
                 "random" if req.seed is None else int(req.seed),
                 req.num_candidates,
                 req.decode_mode,
@@ -1106,22 +1111,37 @@ class InferenceRuntime:
                         f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
                     )
 
-        cfg_mode = str(req.cfg_guidance_mode).strip().lower()
-        if cfg_mode not in {"independent", "joint", "alternating"}:
-            raise ValueError(
-                f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
-                "Expected one of: independent, joint, alternating."
-            )
+        if is_meanflow:
+            cfg_mode = "independent"
+            cfg_scale_text = 0.0
+            cfg_scale_caption = 0.0
+            cfg_scale_speaker = 0.0
+            scale_messages = [
+                f"info: MeanFlow checkpoint uses fused training-time CFG with "
+                f"{num_steps} NFE; runtime CFG and RF sampler controls are ignored."
+            ]
+            speaker_kv_scale = None
+            speaker_kv_min_t = None
+            speaker_kv_max_layers = None
+        else:
+            cfg_mode = str(req.cfg_guidance_mode).strip().lower()
+            if cfg_mode not in {"independent", "joint", "alternating"}:
+                raise ValueError(
+                    f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
+                    "Expected one of: independent, joint, alternating."
+                )
 
-        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
-            cfg_guidance_mode=cfg_mode,
-            cfg_scale_text=req.cfg_scale_text,
-            cfg_scale_caption=req.cfg_scale_caption,
-            cfg_scale_speaker=req.cfg_scale_speaker,
-            cfg_scale=req.cfg_scale,
-            use_caption_condition=has_caption_text,
-            use_speaker_condition=use_speaker_for_request,
-        )
+            cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = (
+                resolve_cfg_scales(
+                    cfg_guidance_mode=cfg_mode,
+                    cfg_scale_text=req.cfg_scale_text,
+                    cfg_scale_caption=req.cfg_scale_caption,
+                    cfg_scale_speaker=req.cfg_scale_speaker,
+                    cfg_scale=req.cfg_scale,
+                    use_caption_condition=has_caption_text,
+                    use_speaker_condition=use_speaker_for_request,
+                )
+            )
         messages.extend(scale_messages)
         for msg in scale_messages:
             _log(msg)
@@ -1309,39 +1329,57 @@ class InferenceRuntime:
                         _log(msg)
 
                 t0 = _measure_start(self.model_device)
-                z_patched = sample_euler_rf_cfg(
-                    model=self.model,
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    sequence_length=patched_steps,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                    num_steps=int(req.num_steps),
-                    cfg_scale_text=cfg_scale_text,
-                    cfg_scale_caption=cfg_scale_caption,
-                    cfg_scale_speaker=cfg_scale_speaker,
-                    cfg_guidance_mode=cfg_mode,
-                    cfg_min_t=float(req.cfg_min_t),
-                    cfg_max_t=float(req.cfg_max_t),
-                    seed=used_seed,
-                    truncation_factor=truncation_factor,
-                    rescale_k=rescale_k,
-                    rescale_sigma=rescale_sigma,
-                    use_context_kv_cache=bool(req.context_kv_cache),
-                    speaker_kv_scale=speaker_kv_scale,
-                    speaker_kv_max_layers=speaker_kv_max_layers,
-                    speaker_kv_min_t=speaker_kv_min_t,
-                    t_schedule_mode=str(req.t_schedule_mode),
-                    sway_coeff=float(req.sway_coeff),
-                )
+                if is_meanflow:
+                    z_patched = sample_euler_meanflow(
+                        model=self.model,
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        sequence_length=patched_steps,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        speaker_state_override=speaker_state_override,
+                        speaker_mask_override=speaker_mask_override,
+                        speaker_uncond_mode=req.speaker_uncond_mode,
+                        num_steps=num_steps,
+                        seed=used_seed,
+                    )
+                else:
+                    z_patched = sample_euler_rf_cfg(
+                        model=self.model,
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        sequence_length=patched_steps,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        speaker_state_override=speaker_state_override,
+                        speaker_mask_override=speaker_mask_override,
+                        speaker_uncond_mode=req.speaker_uncond_mode,
+                        num_steps=num_steps,
+                        cfg_scale_text=cfg_scale_text,
+                        cfg_scale_caption=cfg_scale_caption,
+                        cfg_scale_speaker=cfg_scale_speaker,
+                        cfg_guidance_mode=cfg_mode,
+                        cfg_min_t=float(req.cfg_min_t),
+                        cfg_max_t=float(req.cfg_max_t),
+                        seed=used_seed,
+                        truncation_factor=truncation_factor,
+                        rescale_k=rescale_k,
+                        rescale_sigma=rescale_sigma,
+                        use_context_kv_cache=bool(req.context_kv_cache),
+                        speaker_kv_scale=speaker_kv_scale,
+                        speaker_kv_max_layers=speaker_kv_max_layers,
+                        speaker_kv_min_t=speaker_kv_min_t,
+                        t_schedule_mode=str(req.t_schedule_mode),
+                        sway_coeff=float(req.sway_coeff),
+                    )
                 stage_sec = _measure_end(self.model_device, t0)
-                stage_timings.append(("sample_rf", stage_sec))
-                _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
+                sample_stage = "sample_meanflow" if is_meanflow else "sample_rf"
+                stage_timings.append((sample_stage, stage_sec))
+                _log(f"[runtime] {sample_stage}: {stage_sec * 1000.0:.1f} ms")
 
                 t0 = _measure_start(self.model_device)
                 z = unpatchify_latent(
