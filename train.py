@@ -29,6 +29,15 @@ from irodori_tts.config import (
 )
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
 from irodori_tts.duration import set_duration_has_speaker_feature
+from irodori_tts.meanflow import (
+    EncodedConditions,
+    adaptive_meanflow_loss,
+    apply_condition_profile,
+    compute_teacher_meanflow_target,
+    conditions_to_device,
+    index_conditions,
+    sample_meanflow_interval,
+)
 from irodori_tts.model import TextToLatentRFDiT
 from irodori_tts.optim import build_optimizer, build_optimizer_extended, build_scheduler, current_lr
 from irodori_tts.progress import TrainProgress
@@ -41,7 +50,24 @@ from irodori_tts.rf import (
 from irodori_tts.tokenizer import PretrainedTextTokenizer
 
 WANDB_MODES = {"online", "offline", "disabled"}
-TRAIN_MODES = {"rf", "duration_only"}
+TRAIN_MODES = {"rf", "duration_only", "meanflow_distill"}
+MEANFLOW_RESUME_OBJECTIVE_FIELDS = (
+    "teacher_checkpoint",
+    "teacher_steps",
+    "meanflow_anchor_prob",
+    "meanflow_time_logit_mean",
+    "meanflow_time_logit_std",
+    "meanflow_adaptive_weight_power",
+    "meanflow_adaptive_weight_eps",
+    "meanflow_cfg_text_scale",
+    "meanflow_cfg_speaker_scale",
+    "meanflow_cfg_caption_scale",
+    "meanflow_cfg_min_t",
+    "meanflow_cfg_max_t",
+    "text_condition_dropout",
+    "speaker_condition_dropout",
+    "caption_condition_dropout",
+)
 CHECKPOINT_STEP_RE = re.compile(r"^checkpoint_(\d+)(?:\.pt)?$")
 CHECKPOINT_BEST_VAL_LOSS_RE = re.compile(
     r"^checkpoint_best_val_loss_(\d+)_(-?\d+(?:\.\d+)?)(?:\.pt)?$"
@@ -149,18 +175,17 @@ def apply_attention_backend(model: torch.nn.Module, backend: str) -> None:
 # Gradient checkpointing
 # ---------------------------------------------------------------------------
 def apply_gradient_checkpointing(model: torch.nn.Module) -> None:
-    """モデルのDiffusionBlock/TextBlockに勾配チェックポイントを適用する。
+    """TextBlock（テキスト/キャプションエンコーダ）に勾配チェックポイントを適用する。
+
+    DiffusionBlock と事前学習テキストエンコーダは model.py 内蔵の
+    set_gradient_checkpointing() で処理するため、ここでは TextBlock のみ扱う。
     VRAMを最大40%削減できるが、再計算のため学習速度が約20%低下する。
 
-    Irodori-TTSのモデル構造（model.py）に対応:
-      - DiffusionBlock : forward(x, cond_embed, text_state, text_mask,
-                                 speaker_state, speaker_mask, freqs_cis,
-                                 self_mask=None, context_kv=None)
-      - TextBlock       : forward(x, mask, freqs_cis)
+      - TextBlock : forward(x, mask, freqs_cis)
     """
     from torch.utils.checkpoint import checkpoint as ckpt_fn
 
-    TARGET_CLASSES = ("DiffusionBlock", "TextBlock")
+    TARGET_CLASSES = ("TextBlock",)
     count = 0
 
     for module in model.modules():
@@ -171,28 +196,7 @@ def apply_gradient_checkpointing(model: torch.nn.Module) -> None:
         # クロージャでmoduleをキャプチャし元のforwardを保持
         orig_forward = module.forward
 
-        if cls_name == "DiffusionBlock":
-            def make_diffusion_ckpt(orig):
-                def checkpointed(
-                    x, cond_embed, text_state, text_mask,
-                    speaker_state, speaker_mask, freqs_cis,
-                    self_mask=None, context_kv=None,
-                ):
-                    # context_kvはTensorでないためuse_reentrant=Falseで渡す
-                    def _fn(x_, ce_, ts_, tm_, ss_, sm_, fc_):
-                        return orig(
-                            x_, ce_, ts_, tm_, ss_, sm_, fc_,
-                            self_mask=self_mask, context_kv=context_kv,
-                        )
-                    return ckpt_fn(
-                        _fn, x, cond_embed, text_state, text_mask,
-                        speaker_state, speaker_mask, freqs_cis,
-                        use_reentrant=False,
-                    )
-                return checkpointed
-            module.forward = make_diffusion_ckpt(orig_forward)
-
-        elif cls_name == "TextBlock":
+        if cls_name == "TextBlock":
             def make_text_ckpt(orig):
                 def checkpointed(x, mask, freqs_cis):
                     def _fn(x_, fc_):
@@ -204,9 +208,7 @@ def apply_gradient_checkpointing(model: torch.nn.Module) -> None:
         count += 1
 
     if count > 0:
-        print(f"Gradient checkpointing: enabled ({count}ブロックに適用, VRAM削減, 速度約20%低下)")
-    else:
-        print("warning: gradient checkpointing: DiffusionBlock/TextBlockが見つかりませんでした。")
+        print(f"Gradient checkpointing (TextBlock): enabled ({count}ブロックに適用, VRAM削減, 速度約20%低下)")
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +321,206 @@ def compute_rf_loss(
     if mode == "utterance_mean":
         return utterance_mean_masked_mse(pred, target, valid_mask=valid_mask)
     raise ValueError(f"Unsupported rf_loss_mode={mode!r}. Expected 'echo' or 'utterance_mean'.")
+
+
+def freeze_for_meanflow(model: TextToLatentRFDiT) -> tuple[int, int]:
+    """Freeze non-DiT modules; MeanFlow updates the complete student DiT only."""
+    dit_prefixes = (
+        "cond_module.",
+        "delta_cond_module.",
+        "in_proj.",
+        "blocks.",
+        "out_norm.",
+        "out_proj.",
+    )
+    trainable = 0
+    frozen = 0
+    for name, parameter in model.named_parameters():
+        should_train = name.startswith(dit_prefixes)
+        parameter.requires_grad_(should_train)
+        if should_train:
+            trainable += parameter.numel()
+        else:
+            frozen += parameter.numel()
+    return trainable, frozen
+
+
+def set_meanflow_frozen_modules_eval(model: TextToLatentRFDiT) -> None:
+    for name in (
+        "pretrained_text_backbone",
+        "text_encoder",
+        "text_norm",
+        "speaker_encoder",
+        "speaker_norm",
+        "caption_encoder",
+        "caption_norm",
+        "duration_predictor",
+    ):
+        module = getattr(model, name, None)
+        if module is not None:
+            module.eval()
+
+
+def resolve_meanflow_teacher_device(
+    *,
+    student_device: torch.device,
+    local_rank: int,
+    local_world_size: int,
+    device_offset: int,
+    visible_cuda_devices: int | None = None,
+) -> torch.device:
+    if device_offset < 0:
+        raise ValueError("MeanFlow teacher device offset must be non-negative.")
+    if device_offset == 0:
+        return student_device
+    if student_device.type != "cuda":
+        raise ValueError("A separate MeanFlow teacher device requires CUDA.")
+    if local_world_size <= 0:
+        raise ValueError("MeanFlow local world size must be positive.")
+    if not 0 <= local_rank < local_world_size:
+        raise ValueError(
+            f"MeanFlow local_rank={local_rank} is outside local_world_size={local_world_size}."
+        )
+    if device_offset < local_world_size:
+        raise ValueError(
+            "Paired MeanFlow teacher GPUs must not overlap student GPUs: "
+            f"offset={device_offset} local_world_size={local_world_size}."
+        )
+    device_count = (
+        torch.cuda.device_count() if visible_cuda_devices is None else visible_cuda_devices
+    )
+    teacher_index = local_rank + device_offset
+    if device_offset + local_world_size > device_count or teacher_index >= device_count:
+        raise ValueError(
+            "Paired MeanFlow teacher GPU is unavailable: "
+            f"local_rank={local_rank} offset={device_offset} "
+            f"local_world_size={local_world_size} visible_cuda_devices={device_count}."
+        )
+    return torch.device(f"cuda:{teacher_index}")
+
+
+def compute_meanflow_distillation_loss(
+    *,
+    model,
+    teacher: TextToLatentRFDiT,
+    train_cfg: TrainConfig,
+    x0: torch.Tensor,
+    latent_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    ref_latent: torch.Tensor | None,
+    ref_mask: torch.Tensor | None,
+    caption_ids: torch.Tensor | None,
+    caption_mask: torch.Tensor | None,
+    text_drop: torch.Tensor,
+    speaker_drop: torch.Tensor | None,
+    caption_drop: torch.Tensor | None,
+    use_bf16: bool,
+) -> torch.Tensor:
+    batch_size = x0.shape[0]
+    r, t, delta_t, anchor_mask = sample_meanflow_interval(
+        batch_size=batch_size,
+        device=x0.device,
+        logit_mean=train_cfg.meanflow_time_logit_mean,
+        logit_std=train_cfg.meanflow_time_logit_std,
+        anchor_prob=train_cfg.meanflow_anchor_prob,
+    )
+    noise = torch.randn_like(x0)
+    x_t = rf_interpolate(x0, noise, t)
+    teacher_device = next(teacher.parameters()).device
+    cross_device_teacher = teacher_device != x0.device
+
+    def to_teacher(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        return value.to(device=teacher_device, non_blocking=not cross_device_teacher)
+
+    with torch.no_grad(), torch.autocast(device_type=teacher_device.type, enabled=False):
+        encoded = EncodedConditions(
+            *teacher.encode_conditions(
+                text_input_ids=to_teacher(text_ids),
+                text_mask=to_teacher(text_mask),
+                ref_latent=to_teacher(ref_latent),
+                ref_mask=to_teacher(ref_mask),
+                caption_input_ids=to_teacher(caption_ids),
+                caption_mask=to_teacher(caption_mask),
+            )
+        )
+        base_conditions = apply_condition_profile(
+            encoded,
+            text_drop=to_teacher(text_drop),
+            speaker_drop=to_teacher(speaker_drop),
+            caption_drop=to_teacher(caption_drop),
+        )
+        formula = rf_velocity_target(x0, noise).float()
+        target = formula.clone()
+        non_anchor_index = torch.nonzero(~anchor_mask, as_tuple=False).squeeze(-1)
+        if non_anchor_index.numel() > 0:
+            teacher_index = non_anchor_index.to(device=teacher_device)
+            rollout_target = compute_teacher_meanflow_target(
+                teacher=teacher,
+                x_t=to_teacher(x_t.index_select(0, non_anchor_index)),
+                t=to_teacher(t.index_select(0, non_anchor_index)),
+                r=to_teacher(r.index_select(0, non_anchor_index)),
+                conditions=index_conditions(base_conditions, teacher_index),
+                latent_mask=to_teacher(latent_mask.index_select(0, non_anchor_index)),
+                valid_mask=to_teacher(valid_mask.index_select(0, non_anchor_index)),
+                teacher_steps=train_cfg.teacher_steps,
+                cfg_text_scale=train_cfg.meanflow_cfg_text_scale,
+                cfg_speaker_scale=train_cfg.meanflow_cfg_speaker_scale,
+                cfg_caption_scale=train_cfg.meanflow_cfg_caption_scale,
+                cfg_min_t=train_cfg.meanflow_cfg_min_t,
+                cfg_max_t=train_cfg.meanflow_cfg_max_t,
+                sample_chunk_size=train_cfg.meanflow_teacher_chunk_size,
+                branch_batch_size=train_cfg.meanflow_teacher_branch_batch_size,
+                fuse_base_branch=train_cfg.meanflow_teacher_fuse_base_branch,
+            )
+            target.index_copy_(
+                0,
+                non_anchor_index,
+                rollout_target.to(
+                    device=x0.device,
+                    non_blocking=not cross_device_teacher,
+                ),
+            )
+        target = target * valid_mask[:, :, None].float()
+        student_conditions = conditions_to_device(
+            base_conditions,
+            x0.device,
+            non_blocking=not cross_device_teacher,
+        )
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext():
+        pred = model(
+            x_t=x_t,
+            t=t,
+            delta_t=delta_t,
+            text_input_ids=text_ids,
+            text_mask=text_mask,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption_input_ids=caption_ids,
+            caption_mask=caption_mask,
+            latent_mask=latent_mask,
+            encoded_conditions=(
+                student_conditions.text_state,
+                student_conditions.text_mask,
+                student_conditions.speaker_state,
+                student_conditions.speaker_mask,
+                student_conditions.caption_state,
+                student_conditions.caption_mask,
+            ),
+        )
+    if not isinstance(pred, torch.Tensor):
+        raise RuntimeError("MeanFlow student forward must return one velocity tensor.")
+    return adaptive_meanflow_loss(
+        pred,
+        target,
+        valid_mask,
+        power=train_cfg.meanflow_adaptive_weight_power,
+        eps=train_cfg.meanflow_adaptive_weight_eps,
+    )
 
 
 def freeze_for_speaker_inversion(model: torch.nn.Module) -> tuple[int, int]:
@@ -642,6 +844,43 @@ def initialize_text_embedding_from_pretrained(
     del text_backbone
 
 
+def _normalize_checkpoint_path(path: str | Path) -> Path:
+    return Path(os.path.abspath(str(Path(path).expanduser())))
+
+
+def _validate_meanflow_resume_objective(
+    train_cfg: TrainConfig,
+    *,
+    resume_train_cfg: dict | None,
+    resume_model_cfg: dict | None,
+) -> None:
+    """Prevent a MeanFlow checkpoint and Muon state resuming onto a new target."""
+    if not isinstance(resume_train_cfg, dict):
+        raise ValueError("MeanFlow resume checkpoint is missing train_config provenance.")
+    if str(resume_train_cfg.get("train_mode", "")).strip().lower() != "meanflow_distill":
+        raise ValueError("MeanFlow training can only resume a meanflow_distill checkpoint.")
+    if not isinstance(resume_model_cfg, dict):
+        raise ValueError("MeanFlow resume checkpoint is missing model_config provenance.")
+    if str(resume_model_cfg.get("flow_parameterization", "")).strip().lower() != "meanflow":
+        raise ValueError("MeanFlow resume checkpoint must contain a MeanFlow student.")
+
+    for field in MEANFLOW_RESUME_OBJECTIVE_FIELDS:
+        if field not in resume_train_cfg:
+            raise ValueError(
+                f"MeanFlow resume checkpoint is missing objective field train.{field}."
+            )
+        current_value = getattr(train_cfg, field)
+        resume_value = resume_train_cfg[field]
+        if field == "teacher_checkpoint":
+            current_value = str(_normalize_checkpoint_path(current_value))
+            resume_value = str(_normalize_checkpoint_path(resume_value))
+        if current_value != resume_value:
+            raise ValueError(
+                f"MeanFlow resume checkpoint expects train.{field}={resume_value!r}, "
+                f"but current config requests {current_value!r}."
+            )
+
+
 def _load_model_state_from_checkpoint(
     path: Path,
 ) -> tuple[dict[str, torch.Tensor], dict | None, dict | None, dict | None]:
@@ -881,15 +1120,116 @@ def split_train_valid_indices(
     return train_indices, valid_indices
 
 
-def run_validation(
+def run_meanflow_validation(
     *,
     model,
+    teacher: TextToLatentRFDiT,
     loader: DataLoader,
     train_cfg: TrainConfig,
     device: torch.device,
     use_bf16: bool,
     distributed: bool,
 ) -> dict[str, float]:
+    was_training = model.training
+    raw_model = model.module if isinstance(model, DDP) else model
+    model.eval()
+    teacher.eval()
+    totals = torch.zeros(3, device=device, dtype=torch.float64)
+    with torch.no_grad():
+        for batch in loader:
+            text_ids = batch["text_ids"].to(device, non_blocking=True)
+            text_mask = batch["text_mask"].to(device, non_blocking=True)
+            x0 = batch["latent_patched"].to(device, non_blocking=True)
+            latent_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
+            valid_mask = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
+            batch_size = text_ids.shape[0]
+
+            caption_ids = None
+            caption_mask = None
+            caption_drop = None
+            if raw_model.cfg.use_caption_condition:
+                caption_ids = batch["caption_ids"].to(device, non_blocking=True)
+                caption_mask = batch["caption_mask"].to(device, non_blocking=True)
+                has_caption = batch["has_caption"].to(device, non_blocking=True)
+                sampled_drop = (
+                    torch.rand(batch_size, device=device) < train_cfg.caption_condition_dropout
+                )
+                caption_drop = ~(has_caption & ~sampled_drop)
+
+            ref_latent = None
+            ref_mask = None
+            speaker_drop = None
+            if raw_model.cfg.use_speaker_condition_resolved:
+                ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
+                ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
+                has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+                sampled_drop = (
+                    torch.rand(batch_size, device=device) < train_cfg.speaker_condition_dropout
+                )
+                speaker_drop = ~(has_speaker & ~sampled_drop)
+
+            text_drop = torch.rand(batch_size, device=device) < train_cfg.text_condition_dropout
+            loss = compute_meanflow_distillation_loss(
+                model=model,
+                teacher=teacher,
+                train_cfg=train_cfg,
+                x0=x0,
+                latent_mask=latent_mask,
+                valid_mask=valid_mask,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_ids=caption_ids,
+                caption_mask=caption_mask,
+                text_drop=text_drop,
+                speaker_drop=speaker_drop,
+                caption_drop=caption_drop,
+                use_bf16=use_bf16,
+            )
+            weight = float(batch_size)
+            totals[0] += loss.detach().double() * weight
+            totals[1] += batch["num_frames"].float().mean().double().to(device) * weight
+            totals[2] += weight
+
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    denom = max(float(totals[2].item()), 1.0)
+    if was_training:
+        model.train()
+        set_meanflow_frozen_modules_eval(raw_model)
+    return {
+        "loss": float(totals[0].item() / denom),
+        "rf_loss": float(totals[0].item() / denom),
+        "duration_loss": 0.0,
+        "duration_mae_frames": 0.0,
+        "target_frames_mean": float(totals[1].item() / denom),
+        "num_samples": float(totals[2].item()),
+    }
+
+
+def run_validation(
+    *,
+    model,
+    teacher: TextToLatentRFDiT | None,
+    loader: DataLoader,
+    train_cfg: TrainConfig,
+    device: torch.device,
+    use_bf16: bool,
+    distributed: bool,
+) -> dict[str, float]:
+    if train_cfg.train_mode == "meanflow_distill":
+        if teacher is None:
+            raise RuntimeError("MeanFlow validation requires a teacher model.")
+        return run_meanflow_validation(
+            model=model,
+            teacher=teacher,
+            loader=loader,
+            train_cfg=train_cfg,
+            device=device,
+            use_bf16=use_bf16,
+            distributed=distributed,
+        )
     was_training = model.training
     # PeftModel は .cfg を直接持たないため base_model.model 経由で取得する。
     # DDP > PeftModel > TextToLatentRFDiT の順にアンラップして cfg を取得する。
@@ -1122,7 +1462,7 @@ def main() -> None:
         help="Separate learning rate for the pretrained text backbone (v4, text_encoder_type='pretrained').",
     )
     parser.add_argument(
-        "--pretrained-text-encoder-optimizer", choices=["adamw"], default=None,
+        "--pretrained-text-encoder-optimizer", choices=["adamw", "muon"], default=None,
         help="Optimizer used for the pretrained text backbone parameters (this fork: adamw only).",
     )
     parser.add_argument(
@@ -1227,7 +1567,12 @@ def main() -> None:
     # ── 勾配チェックポイント ──────────────────────────────────────────────
     parser.add_argument(
         "--grad-checkpoint", action="store_true", default=False,
-        help="勾配チェックポイントを有効化。VRAMを最大40%削減(速度約20%低下)。",
+        help="勾配チェックポイントを有効化。VRAMを最大40%%削減(速度約20%%低下)。",
+    )
+    parser.add_argument(
+        "--grad-checkpoint-store-every", type=int, default=0,
+        help="勾配チェックポイントで1/Nブロックごとに活性化を保持(再計算削減)。0=全ブロック再計算。"
+             "未指定時はtrain.gradient_checkpointing_store_every。",
     )
     # ── EMA ──────────────────────────────────────────────────────────────
     parser.add_argument(
@@ -1396,7 +1741,13 @@ def main() -> None:
 
     # 拡張引数はtrain_cfgに存在しないためargs直接参照
     attention_backend: str = args.attention_backend
-    use_grad_checkpoint: bool = args.grad_checkpoint
+    use_grad_checkpoint: bool = bool(
+        args.grad_checkpoint or train_cfg.gradient_checkpointing
+    )
+    if cli_provided(raw_argv, "--grad-checkpoint-store-every"):
+        grad_checkpoint_store_every: int = int(args.grad_checkpoint_store_every)
+    else:
+        grad_checkpoint_store_every = int(train_cfg.gradient_checkpointing_store_every)
     ema_decay: float | None = args.ema_decay
     clip_grad_norm: float = args.clip_grad_norm
     lion_betas: tuple[float, float] = (args.lion_beta1, args.lion_beta2)
@@ -1416,6 +1767,58 @@ def main() -> None:
     train_cfg = replace(train_cfg, train_mode=str(train_cfg.train_mode).strip().lower())
     if train_cfg.train_mode not in TRAIN_MODES:
         raise ValueError(f"train_mode must be one of {sorted(TRAIN_MODES)}, got {train_cfg.train_mode!r}")
+    # ── MeanFlow 蒸留の設定検証（model_cfg 同期前） ────────────────────────
+    _flow_parameterization = str(model_cfg.flow_parameterization).strip().lower()
+    if _flow_parameterization not in {"rf_velocity", "meanflow"}:
+        raise ValueError(
+            "model.flow_parameterization must be 'rf_velocity' or 'meanflow', "
+            f"got {model_cfg.flow_parameterization!r}"
+        )
+    if train_cfg.train_mode == "meanflow_distill":
+        if not train_cfg.teacher_checkpoint:
+            raise ValueError("train_mode='meanflow_distill' requires train.teacher_checkpoint.")
+        if args.resume is None:
+            _mf_teacher_path = str(Path(train_cfg.teacher_checkpoint).expanduser())
+            if args.init_checkpoint is not None:
+                _mf_init_path = str(_normalize_checkpoint_path(args.init_checkpoint))
+                if _mf_init_path != str(_normalize_checkpoint_path(_mf_teacher_path)):
+                    raise ValueError(
+                        "MeanFlow student and teacher must initialize from the same RF checkpoint; "
+                        "omit --init-checkpoint or set it equal to train.teacher_checkpoint."
+                    )
+            args.init_checkpoint = _mf_teacher_path
+        model_cfg = replace(model_cfg, flow_parameterization="meanflow")
+        if train_cfg.speaker_inversion_enabled:
+            raise ValueError("meanflow_distill does not support Speaker Inversion training.")
+        if train_cfg.caption_warmup or train_cfg.pretrained_projector_warmup_steps > 0:
+            raise ValueError("meanflow_distill does not train condition encoders or their warmups.")
+        if train_cfg.duration_backprop_to_condition:
+            raise ValueError("meanflow_distill freezes the duration and condition modules.")
+        if train_cfg.teacher_steps <= 0:
+            raise ValueError("meanflow_distill requires teacher_steps > 0.")
+        if not 0.0 <= train_cfg.meanflow_anchor_prob <= 1.0:
+            raise ValueError("meanflow_anchor_prob must be in [0, 1].")
+        if train_cfg.meanflow_time_logit_std <= 0:
+            raise ValueError("meanflow_time_logit_std must be positive.")
+        if train_cfg.meanflow_adaptive_weight_power < 0:
+            raise ValueError("meanflow_adaptive_weight_power must be non-negative.")
+        if train_cfg.meanflow_adaptive_weight_eps <= 0:
+            raise ValueError("meanflow_adaptive_weight_eps must be positive.")
+        if train_cfg.meanflow_cfg_min_t > train_cfg.meanflow_cfg_max_t:
+            raise ValueError("meanflow_cfg_min_t must be <= meanflow_cfg_max_t.")
+        if train_cfg.meanflow_teacher_chunk_size <= 0:
+            raise ValueError("meanflow_teacher_chunk_size must be positive.")
+        if not 1 <= train_cfg.meanflow_teacher_branch_batch_size <= 3:
+            raise ValueError("meanflow_teacher_branch_batch_size must be in [1, 3].")
+        if train_cfg.meanflow_teacher_device_offset < 0:
+            raise ValueError("meanflow_teacher_device_offset must be non-negative.")
+        if train_cfg.meanflow_compile_teacher and not hasattr(torch, "compile"):
+            raise RuntimeError("meanflow_compile_teacher requires torch.compile (PyTorch 2+).")
+    elif _flow_parameterization != "rf_velocity":
+        raise ValueError(
+            "model.flow_parameterization='meanflow' is only valid with "
+            "train_mode='meanflow_distill'."
+        )
     if str(train_cfg.rf_loss_mode).strip().lower() not in {"echo", "utterance_mean"}:
         raise ValueError(f"rf_loss_mode must be 'echo' or 'utterance_mean', got {train_cfg.rf_loss_mode!r}")
     if not (0.0 <= train_cfg.text_condition_dropout <= 1.0):
@@ -1496,6 +1899,8 @@ def main() -> None:
     # ── --init-checkpoint からモデル設定を自動判別して model_cfg を更新 ──────
     # --resume (.pt) も同様に model_cfg を自動同期する
     _sync_checkpoint_path: Path | None = None
+    _sync_model_cfg_dict: dict | None = None
+    _sync_train_cfg_dict: dict | None = None
     _text_encoder_config: dict | None = None  # v4系 事前学習テキストエンコーダ設定
     if args.init_checkpoint is not None:
         _sync_checkpoint_path = Path(args.init_checkpoint).expanduser()
@@ -1570,11 +1975,24 @@ def main() -> None:
                     print(f"Synchronized model_cfg from checkpoint: {_sync_checkpoint_path}")
         del _sync_state
 
+    # ── MeanFlow resume: 学習目的（teacher・時間サンプリング等）の一致検証 ──
+    if train_cfg.train_mode == "meanflow_distill" and args.resume is not None:
+        _validate_meanflow_resume_objective(
+            train_cfg,
+            resume_train_cfg=_sync_train_cfg_dict,
+            resume_model_cfg=_sync_model_cfg_dict,
+        )
+
     # ── v4 / Speaker Inversion 関連のバリデーション（model_cfg 同期後） ────
-    if str(train_cfg.pretrained_text_encoder_optimizer).strip().lower() != "adamw":
+    _pre_opt_name = str(train_cfg.pretrained_text_encoder_optimizer).strip().lower()
+    if _pre_opt_name not in {"adamw", "muon"}:
         raise ValueError(
-            "pretrained_text_encoder_optimizer must be 'adamw' in this fork, "
+            "pretrained_text_encoder_optimizer must be one of ['adamw', 'muon'], "
             f"got {train_cfg.pretrained_text_encoder_optimizer!r}."
+        )
+    if _pre_opt_name == "muon" and str(train_cfg.optimizer).strip().lower() != "muon":
+        raise ValueError(
+            "pretrained_text_encoder_optimizer='muon' requires optimizer='muon'."
         )
     if train_cfg.pretrained_projector_warmup_steps < 0:
         raise ValueError(
@@ -1771,8 +2189,23 @@ def main() -> None:
     # ── モデル構築 ───────────────────────────────────────────────────────
     # v4系でチェックポイントに text_encoder_config が埋め込まれている場合は、
     # HFから事前学習重みをダウンロードせず空構築して重みを流し込む。
+    meanflow_mode = train_cfg.train_mode == "meanflow_distill"
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    meanflow_teacher_device = resolve_meanflow_teacher_device(
+        student_device=device,
+        local_rank=local_rank,
+        local_world_size=local_world_size,
+        device_offset=(train_cfg.meanflow_teacher_device_offset if meanflow_mode else 0),
+    )
+    # MeanFlow student: fresh run は RF velocity で構築して teacher を複製し、
+    # 之後 delta 条件モジュールを追加する。resume は meanflow cfg で直接構築する。
+    construction_model_cfg = (
+        replace(model_cfg, flow_parameterization="rf_velocity")
+        if meanflow_mode and args.resume is None
+        else model_cfg
+    )
     raw_model = TextToLatentRFDiT(
-        model_cfg,
+        construction_model_cfg,
         pretrained_backbone_config=_text_encoder_config,
         load_pretrained_backbone_weights=not (
             model_cfg.use_pretrained_text_encoder and _text_encoder_config is not None
@@ -1848,6 +2281,63 @@ def main() -> None:
                 print(f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}")
             initialize_text_embedding_from_pretrained(raw_model, model_cfg, local_files_only=False)
 
+    # ── MeanFlow 蒸留: teacher 構築と student の parameterization 切替 ──────
+    # 勾配チェックポイント適用前（closure が元モジュールを捕捉しない時点）に構築する。
+    meanflow_teacher: TextToLatentRFDiT | None = None
+    if meanflow_mode:
+        if args.resume is None:
+            # fresh: RF 重み込みの student を複製して teacher にする
+            if meanflow_teacher_device == device:
+                meanflow_teacher = copy.deepcopy(raw_model)
+            else:
+                _mf_t_state, _, _, _ = _load_model_state_from_checkpoint(
+                    _normalize_checkpoint_path(train_cfg.teacher_checkpoint)
+                )
+                meanflow_teacher = TextToLatentRFDiT(
+                    construction_model_cfg,
+                    pretrained_backbone_config=_text_encoder_config,
+                    load_pretrained_backbone_weights=False,
+                ).to(meanflow_teacher_device)
+                meanflow_teacher.load_state_dict(_mf_t_state, strict=True)
+                del _mf_t_state
+            raw_model.enable_meanflow_parameterization()
+            raw_model.cfg = model_cfg
+        else:
+            # resume: student は meanflow cfg で構築済み。teacher は別経路で再構築。
+            _mf_t_path = _normalize_checkpoint_path(train_cfg.teacher_checkpoint)
+            _mf_t_state, _mf_t_cfg_dict, _, _mf_t_te_cfg = _load_model_state_from_checkpoint(
+                _mf_t_path
+            )
+            _mf_teacher_cfg = replace(model_cfg, flow_parameterization="rf_velocity")
+            if _mf_t_cfg_dict is not None:
+                _mf_teacher_cfg = merge_dataclass_overrides(
+                    ModelConfig(), _mf_t_cfg_dict, section="teacher model_config"
+                )
+            if str(_mf_teacher_cfg.flow_parameterization).strip().lower() != "rf_velocity":
+                raise ValueError("train.teacher_checkpoint must be an RF velocity checkpoint.")
+            meanflow_teacher = TextToLatentRFDiT(
+                _mf_teacher_cfg,
+                pretrained_backbone_config=_mf_t_te_cfg,
+                load_pretrained_backbone_weights=not _mf_teacher_cfg.use_pretrained_text_encoder,
+            ).to(meanflow_teacher_device)
+            meanflow_teacher.load_state_dict(_mf_t_state, strict=True)
+            del _mf_t_state, _mf_t_cfg_dict, _mf_t_te_cfg, _mf_teacher_cfg
+        for parameter in meanflow_teacher.parameters():
+            parameter.requires_grad_(False)
+        meanflow_teacher.float().eval()
+        if train_cfg.meanflow_compile_teacher:
+            object.__setattr__(
+                meanflow_teacher,
+                "_meanflow_compiled_forward",
+                torch.compile(
+                    meanflow_teacher.forward_with_encoded_conditions,
+                    dynamic=True,
+                    fullgraph=False,
+                ),
+            )
+        if is_main_process:
+            print(f"MeanFlow teacher initialized on {meanflow_teacher_device}.")
+
     # ── Speaker Inversion 学習: embedding トークン追加 + 他パラメータ凍結 ──
     if train_cfg.speaker_inversion_enabled:
         from irodori_tts.speaker_inversion import (
@@ -1879,6 +2369,24 @@ def main() -> None:
                 f"Speaker Inversion freeze applied: trainable={_trainable_si:,} frozen={_frozen_si:,}."
             )
 
+    # ── MeanFlow 蒸留: DiT 以外を凍結（student DiT 全体のみ学習） ──────────
+    if meanflow_mode:
+        _trainable_dit, _frozen_mf = freeze_for_meanflow(raw_model)
+        if _trainable_dit == 0:
+            raise RuntimeError("No student DiT parameters were found for MeanFlow training.")
+        set_meanflow_frozen_modules_eval(raw_model)
+        if is_main_process:
+            print(
+                "MeanFlow distillation enabled: "
+                f"trainable_dit={_trainable_dit:,} frozen={_frozen_mf:,} "
+                f"teacher_steps={train_cfg.teacher_steps} "
+                f"teacher_device={meanflow_teacher_device} "
+                f"teacher_chunk={train_cfg.meanflow_teacher_chunk_size} "
+                f"branch_batch={train_cfg.meanflow_teacher_branch_batch_size} "
+                f"fuse_base_branch={train_cfg.meanflow_teacher_fuse_base_branch} "
+                f"compile_teacher={train_cfg.meanflow_compile_teacher}."
+            )
+
     train_model = raw_model
     if train_cfg.compile_model:
         if not hasattr(torch, "compile"):
@@ -1893,7 +2401,28 @@ def main() -> None:
 
     # ── 勾配チェックポイント ─────────────────────────────────────────────
     if use_grad_checkpoint:
+        if grad_checkpoint_store_every < 0:
+            raise ValueError(
+                "gradient_checkpointing_store_every must be >= 0, "
+                f"got {grad_checkpoint_store_every}"
+            )
+        # DiffusionBlock と事前学習TEは model.py 内蔵機構で処理（store_every 対応）
+        raw_model.set_gradient_checkpointing(True, store_every=grad_checkpoint_store_every)
+        # TextBlock（テキスト/キャプションエンコーダ）はクロージャ方式で適用
         apply_gradient_checkpointing(raw_model)
+        if meanflow_mode and raw_model.pretrained_text_backbone is not None:
+            # MeanFlow は事前学習TEを学習しないため checkpointing しない
+            raw_model.pretrained_text_backbone.set_gradient_checkpointing(False)
+        if is_main_process:
+            scope = "diffusion blocks"
+            if model_cfg.use_pretrained_text_encoder and not meanflow_mode:
+                scope += " and the pretrained text encoder (when supported)"
+            store_note = (
+                ""
+                if grad_checkpoint_store_every == 0
+                else f" (activations kept for 1 of every {grad_checkpoint_store_every} blocks)"
+            )
+            print(f"Gradient checkpointing enabled on {scope}{store_note}.")
 
     # ── EMA初期化 ────────────────────────────────────────────────────────
     ema_model: EMAModel | None = None
@@ -1987,7 +2516,10 @@ def main() -> None:
         world_size=world_size,
         enabled=train_cfg.progress,
         show_all_ranks=train_cfg.progress_all_ranks,
-        description="Train Duration" if train_cfg.train_mode == "duration_only" else "Train RF",
+        description=(
+            "Train Duration" if train_cfg.train_mode == "duration_only"
+            else ("Train MeanFlow" if train_cfg.train_mode == "meanflow_distill" else "Train RF")
+        ),
     )
     accum_steps = int(train_cfg.gradient_accumulation_steps)
     global_batch_size = train_cfg.batch_size * world_size * accum_steps
@@ -2032,6 +2564,11 @@ def main() -> None:
 
     try:
         model.train()
+        if meanflow_mode:
+            set_meanflow_frozen_modules_eval(raw_model)
+            if meanflow_teacher is None:
+                raise RuntimeError("MeanFlow teacher was not initialized.")
+            meanflow_teacher.eval()
         if scheduler is not None and step == 0:
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
@@ -2072,21 +2609,23 @@ def main() -> None:
                     x0 = batch["latent_patched"].to(device, non_blocking=True)
                     x_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
                     x_mask_valid = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
-                    if train_cfg.timestep_stratified:
+                    if train_cfg.timestep_stratified and not meanflow_mode:
                         t = sample_stratified_logit_normal_t(
                             batch_size=bsz, device=device,
                             mean=train_cfg.timestep_logit_mean, std=train_cfg.timestep_logit_std,
                             t_min=train_cfg.timestep_min, t_max=train_cfg.timestep_max,
                         )
-                    else:
+                    elif not meanflow_mode:
                         t = sample_logit_normal_t(
                             batch_size=bsz, device=device,
                             mean=train_cfg.timestep_logit_mean, std=train_cfg.timestep_logit_std,
                             t_min=train_cfg.timestep_min, t_max=train_cfg.timestep_max,
                         )
-                    noise = torch.randn_like(x0)
-                    x_t = rf_interpolate(x0, noise, t)
-                    v_target = rf_velocity_target(x0, noise)
+                    # MeanFlow の t/r/delta_t と x_t は loss 計算側でサンプリングする
+                    if not meanflow_mode:
+                        noise = torch.randn_like(x0)
+                        x_t = rf_interpolate(x0, noise, t)
+                        v_target = rf_velocity_target(x0, noise)
 
                 # ── Conditioning dropout ────────────────────────────────
                 text_cond_drop = torch.rand(bsz, device=device) < train_cfg.text_condition_dropout
@@ -2096,9 +2635,10 @@ def main() -> None:
                     caption_cond_drop = torch.rand(bsz, device=device) < train_cfg.caption_condition_dropout
                     use_caption = has_caption & (~caption_cond_drop)
                     caption_drop_for_model = ~use_caption
-                    duration_caption_drop = torch.rand(bsz, device=device) < train_cfg.duration_caption_dropout
-                    duration_has_caption = has_caption & (~duration_caption_drop)
-                    if not raw_model.cfg.use_duration_predictor:
+                    if not meanflow_mode:
+                        duration_caption_drop = torch.rand(bsz, device=device) < train_cfg.duration_caption_dropout
+                        duration_has_caption = has_caption & (~duration_caption_drop)
+                    if not raw_model.cfg.use_duration_predictor and not meanflow_mode:
                         caption_mask = caption_mask & use_caption[:, None]
 
                 speaker_drop_for_model = None
@@ -2113,13 +2653,18 @@ def main() -> None:
                     else:
                         use_speaker = has_speaker & (~speaker_cond_drop)
                         speaker_drop_for_model = ~use_speaker
-                    duration_speaker_drop = torch.rand(bsz, device=device) < train_cfg.duration_speaker_dropout
-                    if train_cfg.speaker_inversion_enabled:
-                        duration_has_speaker = ~duration_speaker_drop
-                    else:
-                        duration_has_speaker = has_speaker & (~duration_speaker_drop)
-                    duration_features = set_duration_has_speaker_feature(duration_features, duration_has_speaker)
-                    if not raw_model.cfg.use_duration_predictor and not train_cfg.speaker_inversion_enabled:
+                    if not meanflow_mode:
+                        duration_speaker_drop = torch.rand(bsz, device=device) < train_cfg.duration_speaker_dropout
+                        if train_cfg.speaker_inversion_enabled:
+                            duration_has_speaker = ~duration_speaker_drop
+                        else:
+                            duration_has_speaker = has_speaker & (~duration_speaker_drop)
+                        duration_features = set_duration_has_speaker_feature(duration_features, duration_has_speaker)
+                    if (
+                        not raw_model.cfg.use_duration_predictor
+                        and not train_cfg.speaker_inversion_enabled
+                        and not meanflow_mode
+                    ):
                         # v2以前: 手動マスク
                         ref_mask = ref_mask & use_speaker[:, None]
                         ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
@@ -2134,12 +2679,41 @@ def main() -> None:
                 should_step = (accum_micro_steps % accum_steps) == 0
                 sync_context = model.no_sync() if distributed and not should_step else nullcontext()
                 with sync_context:
+                    meanflow_loss = None
                     with (
                         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                         if use_bf16
                         else nullcontext()
                     ):
-                        if duration_only:
+                        if meanflow_mode:
+                            if (
+                                meanflow_teacher is None
+                                or x0 is None
+                                or x_mask is None
+                                or x_mask_valid is None
+                            ):
+                                raise RuntimeError("MeanFlow training tensors are missing.")
+                            meanflow_loss = compute_meanflow_distillation_loss(
+                                model=model,
+                                teacher=meanflow_teacher,
+                                train_cfg=train_cfg,
+                                x0=x0,
+                                latent_mask=x_mask,
+                                valid_mask=x_mask_valid,
+                                text_ids=text_ids,
+                                text_mask=text_mask,
+                                ref_latent=ref_latent,
+                                ref_mask=ref_mask,
+                                caption_ids=caption_ids,
+                                caption_mask=caption_mask,
+                                text_drop=text_cond_drop,
+                                speaker_drop=speaker_drop_for_model,
+                                caption_drop=caption_drop_for_model,
+                                use_bf16=use_bf16,
+                            )
+                            v_pred = None
+                            duration_pred = None
+                        elif duration_only:
                             duration_pred = model(
                                 x_t=None, t=None,
                                 text_input_ids=text_ids, text_mask=text_mask,
@@ -2181,7 +2755,11 @@ def main() -> None:
                             duration_pred = None
 
                     rf_loss = torch.zeros((), device=device, dtype=torch.float32)
-                    if not duration_only:
+                    if meanflow_mode:
+                        if meanflow_loss is None:
+                            raise RuntimeError("MeanFlow loss is missing.")
+                        rf_loss = meanflow_loss
+                    elif not duration_only:
                         v_pred = v_pred.float()
                         rf_loss = compute_rf_loss(
                             pred=v_pred, target=v_target.float(),
@@ -2302,7 +2880,7 @@ def main() -> None:
                 # ── バリデーション ────────────────────────────────────────
                 if valid_loader is not None and train_cfg.valid_every > 0 and step % train_cfg.valid_every == 0:
                     valid_metrics = run_validation(
-                        model=model, loader=valid_loader, train_cfg=train_cfg,
+                        model=model, teacher=meanflow_teacher, loader=valid_loader, train_cfg=train_cfg,
                         device=device, use_bf16=use_bf16, distributed=distributed,
                     )
                     if is_main_process:
@@ -2350,7 +2928,7 @@ def main() -> None:
         # ── 最終バリデーション ────────────────────────────────────────────
         if valid_loader is not None and train_cfg.valid_every > 0 and step % train_cfg.valid_every != 0:
             valid_metrics = run_validation(
-                model=model, loader=valid_loader, train_cfg=train_cfg,
+                model=model, teacher=meanflow_teacher, loader=valid_loader, train_cfg=train_cfg,
                 device=device, use_bf16=use_bf16, distributed=distributed,
             )
             if is_main_process:
