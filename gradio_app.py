@@ -57,6 +57,7 @@ from irodori_tts.inference_runtime import (
 )
 
 from irodori_tts import model_version
+from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 
 # ─────────────────────────────────────────────────────────────────────────────
 # パス定数
@@ -491,13 +492,22 @@ def _detect_model_version_from_runtime() -> tuple[str, str, int] | None:
     return version, runtime.key.codec_repo, ldim
 
 
-def _runtime_uses_voice_design() -> bool:
+def _runtime_condition_flags() -> tuple[bool, bool]:
+    """読み込み済みモデルの (caption_enabled, speaker_enabled) を返す。
+
+    caption-only モデル（v2-VoiceDesign等、上流README: "caption-only and intentionally
+    ignores speaker/reference conditioning"）は speaker_enabled=False になる。
+    v4系は caption+speaker の両方が True（参照音声・キャプション併用可）。
+    """
     from irodori_tts.inference_runtime import _RUNTIME_CACHE_VALUE
 
     runtime = _RUNTIME_CACHE_VALUE
     if runtime is None:
-        return False
-    return bool(getattr(runtime.model_cfg, "use_caption_condition", False))
+        return False, False
+    cfg = runtime.model_cfg
+    caption_enabled = bool(getattr(cfg, "use_caption_condition", False))
+    speaker_enabled = bool(getattr(cfg, "use_speaker_condition_resolved", False))
+    return caption_enabled, speaker_enabled
 
 
 def _codec_repo_for_latent_dim(latent_dim: int) -> str:
@@ -718,8 +728,8 @@ def _build_runtime_key(checkpoint, model_device, model_precision, codec_device, 
         lora_path=lora_path,
     )
 
-def _load_model(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter="（なし）") -> tuple[str, str, bool]:
-    """モデルをロードしてステータスと自動選択された codec_repo を返す。"""
+def _load_model(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter="（なし）") -> tuple[str, str, bool, bool]:
+    """モデルをロードしてステータス・自動選択codec_repo・(caption_enabled, pure_voice_design)を返す。"""
     # ロード前にlatent_dimを先読みして正しいcodec_repoを決定する
     _raw_cp = _resolve_checkpoint_path_infer(str(checkpoint).strip())
     _ldim_pre = _peek_latent_dim_from_checkpoint(_raw_cp)
@@ -742,8 +752,13 @@ def _load_model(checkpoint, model_device, model_precision, codec_device, codec_p
     watermark_backend = "SilentCipher" if ldim == 32 else "DACVAE"
 
     lora_info = f"\nLoRAアダプタ: {runtime_key.lora_path}" if runtime_key.lora_path else ""
-    voice_design_enabled = _runtime_uses_voice_design()
-    vd_line = "\nvoice_design: enabled (caption conditioning)" if voice_design_enabled else "\nvoice_design: disabled"
+    caption_enabled, speaker_enabled = _runtime_condition_flags()
+    pure_voice_design = caption_enabled and not speaker_enabled
+    vd_line = (
+        f"\ncaption_condition: {'enabled' if caption_enabled else 'disabled'}"
+        f" / speaker_condition: {'enabled' if speaker_enabled else 'disabled'}"
+        + ("（caption-only VoiceDesign: 参照音声非対応）" if pure_voice_design else "")
+    )
     status_text = (
         f"{status}\n"
         f"checkpoint: {runtime_key.checkpoint}"
@@ -755,7 +770,7 @@ def _load_model(checkpoint, model_device, model_precision, codec_device, codec_p
         f"{vd_line}"
         f"{lora_info}"
     )
-    return status_text, auto_codec_repo, voice_design_enabled
+    return status_text, auto_codec_repo, caption_enabled, pure_voice_design
 
 def _clear_runtime_cache() -> str:
     clear_cached_runtime()
@@ -769,11 +784,41 @@ def _clear_runtime_cache_ui():
         gr.update(visible=True, open=False),
     )
 
+
+# 複数参照音声のパス解決（上流 gradio_app.py の移植）
+def _coerce_gradio_file_path(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        for key in ("path", "name"):
+            candidate = value.get(key)
+            if candidate is not None and str(candidate).strip():
+                return str(candidate)
+        return None
+    candidate = getattr(value, "name", None)
+    if candidate is not None and str(candidate).strip():
+        return str(candidate)
+    text = str(value).strip()
+    return text or None
+
+
+def _resolve_ref_wavs(uploaded_audio: object) -> list[str]:
+    if uploaded_audio is None:
+        return []
+    values = uploaded_audio if isinstance(uploaded_audio, (list, tuple)) else [uploaded_audio]
+    paths = [_coerce_gradio_file_path(value) for value in values]
+    return [path for path in paths if path is not None]
+
+
 def _run_generation(
     checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
     lora_adapter, lora_scale, lora_disabled_modules_raw,
     text, caption_text, uploaded_audio, spk_ref_latent_path, spk_ref_embed_path,
-    num_steps, seed_raw, cfg_guidance_mode, cfg_scale_text, cfg_scale_speaker,
+    num_steps, seed_raw, t_schedule_mode, sway_coeff,
+    cfg_guidance_mode, cfg_scale_text, cfg_scale_speaker,
     cfg_scale_caption,
     cfg_scale_raw, cfg_min_t, cfg_max_t, context_kv_cache,
     max_caption_len_raw,
@@ -822,7 +867,7 @@ def _run_generation(
     _spk_pt = str(spk_ref_latent_path).strip() if spk_ref_latent_path else ""
     ref_latent_path: str | None = None
     ref_embed_path: str | None = None
-    ref_wav: str | None = None
+    ref_wavs: list[str] = []
 
     if _spk_embed and Path(_spk_embed).is_file():
         ref_embed_path = _spk_embed
@@ -830,11 +875,12 @@ def _run_generation(
     elif _spk_pt and Path(_spk_pt).is_file():
         ref_latent_path = _spk_pt
         no_ref = False
-    elif uploaded_audio and str(uploaded_audio).strip():
-        ref_wav = str(uploaded_audio)
-        no_ref = False
     else:
-        no_ref = True
+        # 複数参照音声: 表示順（ドラッグで並び替え可）で連結して使用（上流の ref_wavs 仕様）
+        ref_wavs = _resolve_ref_wavs(uploaded_audio)
+        no_ref = not ref_wavs
+    if ref_wavs:
+        stdout_log(f"[gradio] reference clips: {len(ref_wavs)}")
 
     # ── 改行分割モードの判定 ────────────────────────────────────────
     _multiline_mode = str(multiline_mode).strip()
@@ -879,8 +925,9 @@ def _run_generation(
         request_steps = None if int(num_steps) <= 0 else int(num_steps)
         return runtime.synthesize(
             SamplingRequest(
-                text=str(line_text), ref_wav=ref_wav, ref_latent=ref_latent_path, no_ref=bool(no_ref),
+                text=str(line_text), ref_wavs=ref_wavs or None, ref_latent=ref_latent_path, no_ref=bool(no_ref),
                 ref_embed=ref_embed_path,
+                t_schedule_mode=str(t_schedule_mode), sway_coeff=float(sway_coeff),
                 seconds=request_seconds, duration_scale=1.0, max_ref_seconds=None, max_text_len=None,
                 caption=caption_value or None,
                 max_caption_len=max_caption_len,
@@ -2606,7 +2653,14 @@ def build_ui() -> gr.Blocks:
                     with gr.Tabs():
                         # ── タブ1: 直接アップロード ──────────────────────
                         with gr.Tab("🎙️ 直接アップロード"):
-                            infer_audio = gr.Audio(label="参照音声", type="filepath")
+                            # 複数参照音声: 表示順で連結・ドラッグで並び替え可（上流の移植）
+                            infer_audio = gr.File(
+                                label="参照音声アップロード（複数可・表示順で連結）",
+                                type="filepath",
+                                file_count="multiple",
+                                file_types=["audio"],
+                                allow_reordering=True,
+                            )
                             # アップロード時はスピーカーライブラリの選択をクリア
                             infer_audio.change(
                                 lambda v: ("", ""),
@@ -2774,6 +2828,29 @@ def build_ui() -> gr.Blocks:
                         )
                         seed_raw = gr.Textbox(label="シード（空白=ランダム）", value="")
 
+                    # ── タイムスケジュール（上流の t_schedule_mode / sway_coeff 移植）──
+                    with gr.Row():
+                        t_schedule_mode = gr.Dropdown(
+                            label="タイムスケジュール",
+                            choices=["linear", "sway"],
+                            value="linear",
+                            info="sway=低t側（初期）にステップを密配置。発話の安定性が向上しやすい。RFモデルに適用（MeanFlowでは無視）",
+                        )
+                        sway_coeff = gr.Slider(
+                            label="Sway係数（負ほど低t側へ集中）",
+                            minimum=-1.0, maximum=1.5, value=-1.0, step=0.1,
+                            interactive=False,
+                        )
+
+                    def _on_t_schedule_mode_change(mode: str):
+                        return gr.Slider(interactive=str(mode).strip().lower() == "sway")
+
+                    t_schedule_mode.change(
+                        _on_t_schedule_mode_change,
+                        inputs=[t_schedule_mode],
+                        outputs=[sway_coeff],
+                    )
+
                 # ── CFG設定 ─────────────────────────────────────────────
                 with gr.Accordion("⚙️ CFG設定", open=False):
                     gr.Markdown(
@@ -2896,14 +2973,19 @@ def build_ui() -> gr.Blocks:
                 )
 
                 # ── テキスト入力（生成ボタン直上） ─────────────────────
-                infer_text = gr.Textbox(label="テキスト（合成したい文章）", lines=4)
+                infer_text = gr.Textbox(
+                    label="テキスト（合成したい文章）", lines=4, elem_id="irodori-text-input"
+                )
+                # 絵文字スタイル制御（v4.1）: 入力欄のカーソル位置に絵文字注釈を
+                # 挿入するパレット。上流 gradio_app.py のピンポイント移植。
+                build_emoji_palette(infer_text, open=False)
                 with gr.Accordion("🎨 Caption (Voice Design)", open=False, visible=False) as caption_vd_accordion:
                     caption_input_vd = gr.Textbox(
                         label="Caption (Voice Design)",
                         value="",
                         lines=2,
                         placeholder="e.g. calm, bright, energetic, whispering",
-                        info="VoiceDesign モデル読み込み時のみ表示されます。",
+                        info="キャプション条件を持つモデル（v4系/VoiceDesign）読み込み時のみ表示されます。v4系ではスタイル制御の任意指定（未入力=条件なし）。",
                     )
                     with gr.Row():
                         cfg_scale_caption = gr.Slider(
@@ -3078,7 +3160,7 @@ def build_ui() -> gr.Blocks:
 
                 def _load_model_ui(checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, lora_adapter, cur_lora_adapter):
                     """モデルロード後にステータス・codec_repo・LoRA互換チェックを更新。"""
-                    status_text, auto_codec, voice_design_enabled = _load_model(
+                    status_text, auto_codec, caption_enabled, pure_voice_design = _load_model(
                         checkpoint, model_device, model_precision,
                         codec_device, codec_precision, enable_watermark, lora_adapter,
                     )
@@ -3090,8 +3172,8 @@ def build_ui() -> gr.Blocks:
                         status_text,
                         gr.Dropdown(value=auto_codec),
                         gr.Textbox(value=compat_msg),
-                        gr.update(visible=voice_design_enabled, open=voice_design_enabled),
-                        gr.update(visible=not voice_design_enabled, open=False),
+                        gr.update(visible=caption_enabled, open=caption_enabled),
+                        gr.update(visible=not pure_voice_design, open=False),
                     )
 
                 load_model_btn.click(
@@ -3108,7 +3190,7 @@ def build_ui() -> gr.Blocks:
                         infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
                         infer_lora_adapter, infer_lora_scale, infer_lora_disabled_modules,
                         infer_text, caption_input_vd, infer_audio, spk_ref_latent_path, spk_ref_embed_path,
-                        num_steps, seed_raw, cfg_guidance_mode,
+                        num_steps, seed_raw, t_schedule_mode, sway_coeff, cfg_guidance_mode,
                         cfg_scale_text, cfg_scale_speaker, cfg_scale_caption, cfg_scale_raw, cfg_min_t, cfg_max_t,
                         context_kv_cache, max_caption_len_raw, truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
                         speaker_kv_scale_raw, speaker_kv_min_t_raw, speaker_kv_max_layers_raw,
@@ -5144,7 +5226,7 @@ def main() -> None:
         share=bool(args.share),
         debug=bool(args.debug),
         theme=gr.themes.Soft(),
-        css=_DARK_CSS,
+        css=_DARK_CSS + "\n" + EMOJI_PALETTE_CSS,
         js=_DARK_JS,
     )
 
