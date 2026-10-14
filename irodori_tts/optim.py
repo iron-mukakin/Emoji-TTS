@@ -229,30 +229,112 @@ def _pretrained_text_encoder_lr(cfg) -> float:
 
 
 def _build_pretrained_text_encoder_optimizer(
-    params: list[torch.nn.Parameter],
+    model: torch.nn.Module,
+    named_params: list[tuple[str, torch.nn.Parameter]],
     cfg,
-) -> torch.optim.Optimizer:
-    """事前学習テキストバックボーン専用のオプティマイザを作る（フォーク版: AdamW 固定）。"""
+):
+    """事前学習テキストバックボーン専用のオプティマイザを作る（adamw / muon）。
+
+    muon の場合は本体と同基準（nn.Embedding 由来・out_proj を除く 2 次元行列）で
+    Muon 対象と補助 AdamW 対象に分割し、MuonWithAuxAdamW にまとめて返す。
+    """
     pre_lr = _pretrained_text_encoder_lr(cfg)
     opt_name = str(getattr(cfg, "pretrained_text_encoder_optimizer", "adamw") or "adamw").strip().lower()
-    if opt_name != "adamw":
-        raise ValueError(
-            "pretrained_text_encoder_optimizer must be 'adamw' in this fork, "
-            f"got {cfg.pretrained_text_encoder_optimizer!r}"
+    if opt_name == "adamw":
+        wd_params = [p for _, p in named_params if p.dim() >= 2]
+        no_wd_params = [p for _, p in named_params if p.dim() < 2]
+        param_groups = []
+        if wd_params:
+            param_groups.append({"params": wd_params, "weight_decay": cfg.weight_decay})
+        if no_wd_params:
+            param_groups.append({"params": no_wd_params, "weight_decay": 0.0})
+        return torch.optim.AdamW(
+            param_groups,
+            lr=pre_lr,
+            betas=(cfg.adam_beta1, cfg.adam_beta2),
+            eps=cfg.adam_eps,
         )
-    wd_params = [p for p in params if p.dim() >= 2]
-    no_wd_params = [p for p in params if p.dim() < 2]
-    param_groups = []
-    if wd_params:
-        param_groups.append({"params": wd_params, "weight_decay": cfg.weight_decay})
-    if no_wd_params:
-        param_groups.append({"params": no_wd_params, "weight_decay": 0.0})
-    return torch.optim.AdamW(
-        param_groups,
-        lr=pre_lr,
-        betas=(cfg.adam_beta1, cfg.adam_beta2),
-        eps=cfg.adam_eps,
+    if opt_name == "muon":
+        if str(cfg.optimizer).strip().lower() != "muon":
+            raise ValueError(
+                "pretrained_text_encoder_optimizer='muon' requires optimizer='muon' "
+                f"(got {cfg.optimizer!r}) so Muon hyperparameters apply consistently."
+            )
+        if not hasattr(torch.optim, "Muon"):
+            raise RuntimeError(
+                "pretrained_text_encoder_optimizer='muon' requires torch.optim.Muon "
+                "(available in newer PyTorch releases)."
+            )
+        adjust_lr_fn = cfg.muon_adjust_lr_fn
+        if adjust_lr_fn not in {"original", "match_rms_adamw"}:
+            raise ValueError(
+                "muon_adjust_lr_fn must be one of ['original', 'match_rms_adamw'], "
+                f"got {adjust_lr_fn!r}"
+            )
+        muon_decay: list[torch.nn.Parameter] = []
+        muon_no_decay: list[torch.nn.Parameter] = []
+        aux_decay: list[torch.nn.Parameter] = []
+        aux_no_decay: list[torch.nn.Parameter] = []
+        embedding_param_ids = {
+            id(parameter)
+            for module in model.modules()
+            if isinstance(module, torch.nn.Embedding)
+            for parameter in module.parameters(recurse=False)
+        }
+        for name, p in named_params:
+            # 本体（_partition_muon_params 相当）と同じ基準:
+            # 2 次元行列のみ。埋め込み・out_proj は補助 AdamW 側へ回す。
+            is_muon_candidate = (
+                p.ndim == 2
+                and id(p) not in embedding_param_ids
+                and not name.endswith("out_proj.weight")
+            )
+            has_decay = _use_weight_decay(name, p)
+            if is_muon_candidate:
+                (muon_decay if has_decay else muon_no_decay).append(p)
+            else:
+                (aux_decay if has_decay else aux_no_decay).append(p)
+        if not muon_decay and not muon_no_decay:
+            raise ValueError(
+                "No Muon-compatible parameters found for "
+                "pretrained_text_encoder_optimizer='muon'."
+            )
+        muon_param_groups = []
+        if muon_decay:
+            muon_param_groups.append({"params": muon_decay, "weight_decay": cfg.weight_decay})
+        if muon_no_decay:
+            muon_param_groups.append({"params": muon_no_decay, "weight_decay": 0.0})
+        muon_opt = torch.optim.Muon(
+            muon_param_groups,
+            lr=pre_lr,
+            weight_decay=0.0,
+            momentum=cfg.muon_momentum,
+            adjust_lr_fn=adjust_lr_fn,
+        )
+        aux_param_groups = []
+        if aux_decay:
+            aux_param_groups.append({"params": aux_decay, "weight_decay": cfg.weight_decay})
+        if aux_no_decay:
+            aux_param_groups.append({"params": aux_no_decay, "weight_decay": 0.0})
+        if not aux_param_groups:
+            return muon_opt
+        aux_opt = torch.optim.AdamW(
+            aux_param_groups,
+            lr=pre_lr,
+            weight_decay=0.0,
+            betas=(cfg.adam_beta1, cfg.adam_beta2),
+            eps=cfg.adam_eps,
+        )
+        return MuonWithAuxAdamW(muon_opt=muon_opt, aux_opt=aux_opt)
+    raise ValueError(
+        "pretrained_text_encoder_optimizer must be one of ['adamw', 'muon'], "
+        f"got {cfg.pretrained_text_encoder_optimizer!r}"
     )
+
+
+def _pretrained_optimizer_label(cfg) -> str:
+    opt_name = str(getattr(cfg, "pretrained_text_encoder_optimizer", "adamw") or "adamw").strip().lower()
+    return "Muon+aux AdamW" if opt_name == "muon" else "AdamW"
 
 
 def _split_params_by_ids(
@@ -274,9 +356,9 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
     pre_ids = _trainable_pretrained_backbone_ids(model)
     if opt_name == "adamw":
         decay, no_decay = _partition_adamw_params(model)
-        pre_params = [p for name, p in model.named_parameters() if id(p) in pre_ids]
-        if pre_params:
-            pre_set = {id(p) for p in pre_params}
+        pre_named = [(name, p) for name, p in model.named_parameters() if id(p) in pre_ids]
+        if pre_named:
+            pre_set = {id(p) for _, p in pre_named}
             decay = [p for p in decay if id(p) not in pre_set]
             no_decay = [p for p in no_decay if id(p) not in pre_set]
         param_groups = []
@@ -284,10 +366,13 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
             param_groups.append({"params": decay, "weight_decay": cfg.weight_decay})
         if no_decay:
             param_groups.append({"params": no_decay, "weight_decay": 0.0})
-        if pre_params:
+        if pre_named:
             pre_lr = _pretrained_text_encoder_lr(cfg)
-            pre_opt = _build_pretrained_text_encoder_optimizer(pre_params, cfg)
-            print(f"Pretrained text encoder optimizer: AdamW (lr={pre_lr:.3e}, params={len(pre_params)})")
+            pre_opt = _build_pretrained_text_encoder_optimizer(model, pre_named, cfg)
+            print(
+                f"Pretrained text encoder optimizer: {_pretrained_optimizer_label(cfg)} "
+                f"(lr={pre_lr:.3e}, params={len(pre_named)})"
+            )
             if not param_groups:
                 return pre_opt
             main_opt = torch.optim.AdamW(
@@ -349,10 +434,13 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
             )
         wrapped = MuonWithAuxAdamW(muon_opt=muon_opt, aux_opt=aux_opt)
         if pre_ids:
-            pre_params = [p for name, p in model.named_parameters() if id(p) in pre_ids]
+            pre_named = [(name, p) for name, p in model.named_parameters() if id(p) in pre_ids]
             pre_lr = _pretrained_text_encoder_lr(cfg)
-            pre_opt = _build_pretrained_text_encoder_optimizer(pre_params, cfg)
-            print(f"Pretrained text encoder optimizer: AdamW (lr={pre_lr:.3e}, params={len(pre_params)})")
+            pre_opt = _build_pretrained_text_encoder_optimizer(model, pre_named, cfg)
+            print(
+                f"Pretrained text encoder optimizer: {_pretrained_optimizer_label(cfg)} "
+                f"(lr={pre_lr:.3e}, params={len(pre_named)})"
+            )
             return OptimizerChain([wrapped, pre_opt])
         return wrapped
 
@@ -426,10 +514,12 @@ def build_optimizer_extended(
     def _maybe_chain(main_opt):
         if not pre_params:
             return main_opt
+        pre_id_set = {id(p) for p in pre_params}
+        pre_named = [(name, p) for name, p in model.named_parameters() if id(p) in pre_id_set]
         pre_lr = _pretrained_text_encoder_lr(train_cfg)
-        pre_opt = _build_pretrained_text_encoder_optimizer(pre_params, train_cfg)
+        pre_opt = _build_pretrained_text_encoder_optimizer(model, pre_named, train_cfg)
         print(
-            f"Pretrained text encoder optimizer: AdamW "
+            f"Pretrained text encoder optimizer: {_pretrained_optimizer_label(train_cfg)} "
             f"(lr={pre_lr:.3e}, params={sum(p.numel() for p in pre_params):,})"
         )
         return OptimizerChain([main_opt, pre_opt])
