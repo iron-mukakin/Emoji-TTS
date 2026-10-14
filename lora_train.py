@@ -392,6 +392,9 @@ def main() -> None:
     parser.add_argument("--attention-backend",
                         choices=["sdpa", "flash2", "sage", "eager"], default="sdpa")
     parser.add_argument("--grad-checkpoint", action="store_true", default=False)
+    parser.add_argument("--grad-checkpoint-store-every", type=int, default=0,
+                        help="勾配チェックポイント時に1/Nブロックごとに活性化を保持し再計算を削減するVRAM最適化"
+                             "（0=全ブロック再計算・従来動作）。--grad-checkpoint と併用時にのみ有効。")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--text-condition-dropout", type=float, default=0.1)
     parser.add_argument("--caption-condition-dropout", type=float, default=0.1)
@@ -461,6 +464,14 @@ def main() -> None:
 
     # ── 勾配チェックポイント ───────────────────────────────────────
     if args.grad_checkpoint:
+        if int(args.grad_checkpoint_store_every) < 0:
+            raise ValueError(
+                "grad-checkpoint-store-every must be >= 0, "
+                f"got {args.grad_checkpoint_store_every}"
+            )
+        # DiffusionBlock は model.py 内蔵機構で処理（store_every 対応）
+        raw_model.set_gradient_checkpointing(True, store_every=int(args.grad_checkpoint_store_every))
+        # TextBlock（テキスト/キャプションエンコーダ）はクロージャ方式で適用
         apply_gradient_checkpointing(raw_model)
 
     print(describe_model_version(version_info))
