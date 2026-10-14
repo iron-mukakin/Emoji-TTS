@@ -173,11 +173,12 @@ uv run python infer.py \
 | `--checkpoint` / `--hf-checkpoint` | *(必須・排他)* | ローカルckpt / HFリポジトリID |
 | `--text` | *(必須)* | 合成テキスト（絵文字スタイル制御可） |
 | `--caption` | `None` | VoiceDesignモデル用キャプション（スタイル記述） |
-| `--ref-wav` / `--ref-latent` / `--ref-embed` / `--no-ref` | *(必須・排他)* | 参照音声 / 事前計算潜在(.pt) / Speaker Inversion embedding（`.speaker.safetensors`、v4系） / 無条件 |
-| `--max-ref-seconds` | `30.0` | 参照音声の最大秒数（<=0で無制限） |
+| `--ref-wav` / `--ref-wavs` / `--ref-latent` / `--ref-latents` / `--ref-embed` / `--no-ref` | *(省略可・排他)* | 参照音声（単一/複数連結） / 事前計算潜在(.pt)（単一/複数連結） / Speaker Inversion embedding（`.speaker.safetensors`、v4系） / 無条件。話者条件付きckptではいずれかまたは `--no-ref` が必須 |
+| `--max-ref-seconds` | `None`（自動） | 参照音声の最大秒数。未指定時はckpt推奨値（v4系=120、旧ckpt=30）。<=0で無制限 |
 | `--ref-normalize-db` | `-16.0` | 参照音声のloudness正規化目標（`none`で無効） |
 | `--ref-ensure-max` | `True` | 参照音声のピークが1.0を超える時のみ縮小 |
 | `--num-steps` | `None`（自動） | Euler積分ステップ数。未指定時はMeanFlow ckpt=4 / RF ckpt=40に自動設定 |
+| `--t-schedule-mode` / `--sway-coeff` | `linear` / `-1.0` | RFサンプラーのタイムステップスケジュール（`sway`=低ノイズ側密）とその係数 |
 | `--num-candidates` | `1` | 1回の生成で得る候補数（バッチ生成） |
 | `--decode-mode` | `sequential` | 候補の復号方式（`sequential`=低VRAM / `batch`=高速） |
 | `--seconds` | `None` | 出力秒数の手動指定（省略時はDuration Predictor、非対応ckptは30秒） |
@@ -193,12 +194,14 @@ uv run python infer.py \
 | `--speaker-kv-scale` | `None` | 話者KV_attentionスケール（>1で話者同一性強調） |
 | `--speaker-kv-min-t` | `0.9` | 話者KVスケーリングを停止するタイムステップ |
 | `--speaker-kv-max-layers` | `None` | スケーリングを適用する先頭層数 |
+| `--speaker-uncond-mode` | `mask` | 話者条件なし埋め込みの作り方（`mask`=ゼロ / `noise`=ガウスノイズ） |
 | `--max-text-len` / `--max-caption-len` | ckpt値→256 | 条件の最大トークン長 |
-| `--model-device` / `--codec-device` | auto | 実行デバイス（`cuda` / `mps` / `cpu`） |
+| `--model-device` / `--codec-device` | auto | 実行デバイス（`cuda` / `mps` / `xpu` / `cpu`） |
 | `--model-precision` / `--codec-precision` | `fp32` | 精度（`fp32` / `bf16`） |
 | `--enable-watermark` | `False` | 透かし埋め込み（dim32=SilentCipher / dim128=DACVAE） |
 | `--codec-repo` | `Aratako/Semantic-DACVAE-Japanese-32dim` | 復号コーデック（モデルに合わせ自動選択可） |
 | `--lora-path` / `--lora-scale` / `--lora-disabled-modules` | `None` / `1.0` / `""` | LoRAアダプタ読込・スケール・モジュール単位無効化 |
+| `--lora-adapter` | `None` | リクエストごとにPEFTアダプタを動的適用（ベースckptには統合しない） |
 | `--compile-model` / `--compile-dynamic` | `False` | torch.compile 有効化 |
 | `--trim-tail` | `True` | 末尾無音の平坦化トリム |
 | `--tail-window-size` / `--tail-std-threshold` / `--tail-mean-threshold` | `20` / `0.05` / `0.1` | 末尾トリムのしきい値調整 |
@@ -217,7 +220,7 @@ uv run python infer.py \
 - **Voice Design** — キャプション対応モデル読込時のみ、キャプション欄とキャプションCFGが表示されます。
 - **感情スタイルプリセット** — Normal / Strong / Calm / Bright / Whisper。
 - **スタイルスライダー** — テキスト表現力、感情強度、話者追従、表現レンジ。
-- **サンプリング** — ステップ数（1–120）、シード、候補数（1–8）、改行分割生成（個別 / 連結+無音間隔）。
+- **サンプリング** — ステップ数（0=自動: MeanFlow=4 / RF=40、1–120）、シード、候補数（1–8）、改行分割生成（個別 / 連結+無音間隔）。
 - **CFG設定** — ガイダンスモード、テキスト/キャプション/話者CFG、タイムステップ範囲、KVキャッシュ、スコア再スケーリング、話者KVスケール。
 - 生成音声は `outputs_gradio/` に保存されます。
 

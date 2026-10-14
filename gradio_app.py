@@ -329,6 +329,7 @@ def _lora_config_from_ui(
     seed,
     model_version_choice="auto",
     modules_to_save="auto",
+    grad_checkpoint=False, grad_ckpt_store_every=0,
 ) -> dict:
     return {
         "lora": {
@@ -360,6 +361,8 @@ def _lora_config_from_ui(
             "wandb_project": str(wandb_project) if wandb_project else "",
             "wandb_run_name": str(wandb_run_name) if wandb_run_name else "",
             "seed": int(seed),
+            "grad_checkpoint": bool(grad_checkpoint),
+            "grad_ckpt_store_every": int(grad_ckpt_store_every),
         }
     }
 
@@ -400,6 +403,7 @@ def _load_lora_preset(config_path: str):
             False, "", "",
             0,
             "auto", "auto",
+            False, 0,
         )
     cfg = _load_lora_config(config_path)
     def g(k, fb):
@@ -433,6 +437,7 @@ def _load_lora_preset(config_path: str):
         g("seed", 0),
         g("model_version", "auto"),
         g("modules_to_save", "auto"),
+        g("grad_checkpoint", False), g("grad_ckpt_store_every", 0),
     )
 
 
@@ -870,14 +875,16 @@ def _run_generation(
     # ── 共通のsynthesize呼び出しヘルパー ───────────────────────────
     def _synthesize_line(line_text: str, line_seed) -> object:
         request_seconds = None if getattr(runtime.model_cfg, "use_duration_predictor", False) else FIXED_SECONDS
+        # 0 は自動設定（MeanFlow=4 / RF=40）。ランタイムの自動選択に委ねる。
+        request_steps = None if int(num_steps) <= 0 else int(num_steps)
         return runtime.synthesize(
             SamplingRequest(
                 text=str(line_text), ref_wav=ref_wav, ref_latent=ref_latent_path, no_ref=bool(no_ref),
                 ref_embed=ref_embed_path,
-                seconds=request_seconds, duration_scale=1.0, max_ref_seconds=30.0, max_text_len=None,
+                seconds=request_seconds, duration_scale=1.0, max_ref_seconds=None, max_text_len=None,
                 caption=caption_value or None,
                 max_caption_len=max_caption_len,
-                num_steps=int(num_steps),
+                num_steps=request_steps,
                 seed=line_seed,
                 cfg_guidance_mode=str(cfg_guidance_mode),
                 cfg_scale_text=float(cfg_scale_text),
@@ -1304,6 +1311,7 @@ def _config_from_ui(
     manifest, output_dir,
     batch_size, grad_accum, num_workers, persistent_workers, prefetch_factor,
     allow_tf32, compile_model, precision,
+    grad_checkpoint, grad_ckpt_store_every,
     optimizer, muon_momentum, learning_rate, weight_decay,
     adam_beta1, adam_beta2, adam_eps,
     lr_scheduler, warmup_steps, stable_steps, min_lr_scale,
@@ -1331,6 +1339,8 @@ def _config_from_ui(
             "allow_tf32": bool(allow_tf32),
             "compile_model": bool(compile_model),
             "precision": str(precision),
+            "gradient_checkpointing": bool(grad_checkpoint),
+            "gradient_checkpointing_store_every": int(grad_ckpt_store_every),
             "optimizer": str(optimizer),
             "muon_momentum": float(muon_momentum),
             "learning_rate": float(learning_rate),
@@ -2041,6 +2051,7 @@ def _build_lora_train_command(
     seed,
     model_version_choice="auto",
     modules_to_save="auto",
+    grad_checkpoint=False, grad_ckpt_store_every=0,
 ) -> list[str]:
     cmd = [sys.executable, str(BASE_DIR / "lora_train.py")]
     cmd += ["--base-model", str(base_model)]
@@ -2075,6 +2086,11 @@ def _build_lora_train_command(
 
     if str(attention_backend) != "sdpa":
         cmd += ["--attention-backend", str(attention_backend)]
+
+    if grad_checkpoint:
+        cmd += ["--grad-checkpoint"]
+        if int(grad_ckpt_store_every) > 0:
+            cmd += ["--grad-checkpoint-store-every", str(int(grad_ckpt_store_every))]
 
     if str(save_mode) == "EMA + Full両方":
         cmd += ["--save-full"]
@@ -2717,7 +2733,7 @@ def build_ui() -> gr.Blocks:
                             )
 
                 # ── 感情スタイルプリセット ──────────────────────────────
-                with gr.Accordion("🎭 感情スタイル", open=True):
+                with gr.Accordion("🎭 感情スタイル", open=False):
                     gr.Markdown(
                         "プリセットボタンを押すと、下の各パラメータが自動設定されます。"
                         "その後スライダーを手動調整することも可能です。"
@@ -2753,8 +2769,8 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("🎛️ サンプリング設定", open=True):
                     with gr.Row():
                         num_steps = gr.Slider(
-                            label="ステップ数（多いほど品質向上・低速）",
-                            minimum=1, maximum=120, value=40, step=1,
+                            label="ステップ数（0=自動: MeanFlow=4 / RF=40。多いほど品質向上・低速）",
+                            minimum=0, maximum=120, value=0, step=1,
                         )
                         seed_raw = gr.Textbox(label="シード（空白=ランダム）", value="")
 
@@ -2837,7 +2853,7 @@ def build_ui() -> gr.Blocks:
                     speaker_kv_scale_raw  = gr.Textbox(visible=False, value="")
 
                 # ── 改行分割生成オプション ───────────────────────────────
-                with gr.Accordion("📝 改行分割生成オプション", open=True):
+                with gr.Accordion("📝 改行分割生成オプション", open=False):
                     gr.Markdown(
                         "プロンプトの改行ごとに生成を区切り、連続生成・連結するオプションです。\n"
                         "- **デフォルト**: テキスト全体を1回で生成します（従来の動作）\n"
@@ -3407,6 +3423,16 @@ def build_ui() -> gr.Blocks:
                         t_allow_tf32         = gr.Checkbox(label="TF32を許可（Ampere以降GPU向け高速化）", value=_v("allow_tf32", True))
                         t_compile_model      = gr.Checkbox(label="torch.compileを使用（初回遅延あり）", value=_v("compile_model", False))
                         t_precision          = gr.Dropdown(label="学習精度", choices=["bf16", "fp32", "fp16"], value=_v("precision", "bf16"))
+                    with gr.Row():
+                        t_grad_checkpoint = gr.Checkbox(
+                            label="勾配チェックポイントを有効化（VRAM削減・再計算で約20%低速）",
+                            value=_v("gradient_checkpointing", False),
+                        )
+                        t_grad_ckpt_store_every = gr.Number(
+                            label="勾配チェックポイント: 活性化保持の間隔N（0=全ブロック再計算）",
+                            value=_v("gradient_checkpointing_store_every", 0), precision=0,
+                            info="1/Nブロックごとに活性化を保持し再計算を削減するVRAM最適化（全バージョン適用可）。0=従来動作。勾配チェックポイント有効時のみ機能します。",
+                        )
 
                 with gr.Accordion("🔧 オプティマイザ設定", open=True):
                     gr.Markdown("*Muon: 行列重み向けの高性能オプティマイザ。AdamW: 汎用的で安定。*")
@@ -3604,6 +3630,7 @@ def build_ui() -> gr.Blocks:
                     train_manifest, train_output_dir,
                     t_batch_size, t_grad_accum, t_num_workers, t_persistent_workers, t_prefetch_factor,
                     t_allow_tf32, t_compile_model, t_precision,
+                    t_grad_checkpoint, t_grad_ckpt_store_every,
                     t_optimizer, t_muon_momentum, t_learning_rate, t_weight_decay,
                     t_adam_beta1, t_adam_beta2, t_adam_eps,
                     t_lr_scheduler, t_warmup_steps, t_stable_steps, t_min_lr_scale,
@@ -3651,6 +3678,7 @@ def build_ui() -> gr.Blocks:
                         g("num_workers", 4), g("dataloader_persistent_workers", True),
                         g("dataloader_prefetch_factor", 2), g("allow_tf32", True),
                         g("compile_model", False), g("precision", "bf16"),
+                        g("gradient_checkpointing", False), g("gradient_checkpointing_store_every", 0),
                         g("optimizer", "muon"), g("muon_momentum", 0.95),
                         g("learning_rate", 3e-4), g("weight_decay", 0.01),
                         g("adam_beta1", 0.9), g("adam_beta2", 0.999), g("adam_eps", 1e-8),
@@ -3672,6 +3700,7 @@ def build_ui() -> gr.Blocks:
                 _preset_outputs = [
                     t_batch_size, t_grad_accum, t_num_workers, t_persistent_workers, t_prefetch_factor,
                     t_allow_tf32, t_compile_model, t_precision,
+                    t_grad_checkpoint, t_grad_ckpt_store_every,
                     t_optimizer, t_muon_momentum, t_learning_rate, t_weight_decay,
                     t_adam_beta1, t_adam_beta2, t_adam_eps,
                     t_lr_scheduler, t_warmup_steps, t_stable_steps, t_min_lr_scale,
@@ -3867,6 +3896,16 @@ def build_ui() -> gr.Blocks:
                         lora_max_steps = gr.Number(label="最大学習ステップ", value=1000, precision=0)
                         lora_save_every = gr.Number(label="保存間隔", value=100, precision=0)
                         lora_log_every = gr.Number(label="ログ間隔", value=10, precision=0)
+                    with gr.Row():
+                        lora_grad_checkpoint = gr.Checkbox(
+                            label="勾配チェックポイントを有効化（VRAM削減・再計算で約20%低速）",
+                            value=False,
+                        )
+                        lora_grad_ckpt_store_every = gr.Number(
+                            label="勾配チェックポイント: 活性化保持の間隔N（0=全ブロック再計算）",
+                            value=0, precision=0,
+                            info="1/Nブロックごとに活性化を保持し再計算を削減するVRAM最適化（全バージョン適用可）。0=従来動作。勾配チェックポイント有効時のみ機能します。",
+                        )
 
                 # ── EMA設定 ──
                 with gr.Accordion("📊 EMA設定", open=False):
@@ -3962,6 +4001,7 @@ def build_ui() -> gr.Blocks:
                     lora_wandb_enabled, lora_wandb_project, lora_wandb_run_name,
                     lora_seed,
                     lora_model_version, lora_modules_to_save,
+                    lora_grad_checkpoint, lora_grad_ckpt_store_every,
                 ]
 
                 # プリセット読み込み・保存対象コンポーネント
@@ -3978,6 +4018,7 @@ def build_ui() -> gr.Blocks:
                     lora_wandb_enabled, lora_wandb_project, lora_wandb_run_name,
                     lora_seed,
                     lora_model_version, lora_modules_to_save,
+                    lora_grad_checkpoint, lora_grad_ckpt_store_every,
                 ]
 
                 def _update_lora_cmd(*args):
@@ -3990,7 +4031,8 @@ def build_ui() -> gr.Blocks:
                               lora_rank, lora_alpha, lora_dropout, lora_target_modules,
                               lora_model_version, lora_modules_to_save,
                               lora_save_mode, lora_attention_backend,
-                              lora_use_ema, lora_ema_decay, lora_max_steps]:
+                              lora_use_ema, lora_ema_decay, lora_max_steps,
+                              lora_grad_checkpoint]:
                     comp.change(_update_lora_cmd, inputs=_lora_exec_inputs, outputs=[lora_cmd_preview])
 
                 # プリセット読み込み・更新・保存

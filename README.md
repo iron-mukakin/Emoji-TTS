@@ -173,11 +173,12 @@ uv run python infer.py \
 | `--checkpoint` / `--hf-checkpoint` | *(required, mutually exclusive)* | Local checkpoint / HF repo ID |
 | `--text` | *(required)* | Text to synthesize (emoji style control supported) |
 | `--caption` | `None` | Caption (style description) for VoiceDesign models |
-| `--ref-wav` / `--ref-latent` / `--ref-embed` / `--no-ref` | *(one required, mutually exclusive)* | Reference audio / pre-computed latent (.pt) / Speaker Inversion embedding (`.speaker.safetensors`, v4) / unconditional |
-| `--max-ref-seconds` | `30.0` | Maximum reference duration (<=0 disables the cap) |
+| `--ref-wav` / `--ref-wavs` / `--ref-latent` / `--ref-latents` / `--ref-embed` / `--no-ref` | *(optional, mutually exclusive)* | Reference audio (single / multiple concatenated) / pre-computed latent (.pt) (single / multiple concatenated) / Speaker Inversion embedding (`.speaker.safetensors`, v4) / unconditional. Speaker-conditioned checkpoints require one of these or `--no-ref` |
+| `--max-ref-seconds` | `None` (auto) | Maximum reference duration. Defaults to the checkpoint recommendation (120s for v4, 30s for legacy). <=0 disables the cap |
 | `--ref-normalize-db` | `-16.0` | Reference loudness normalization target (`none` to disable) |
 | `--ref-ensure-max` | `True` | Scale reference down only when peak exceeds 1.0 |
 | `--num-steps` | `None` (auto) | Number of Euler integration steps. Auto-selected when omitted: 4 for MeanFlow checkpoints / 40 for RF checkpoints |
+| `--t-schedule-mode` / `--sway-coeff` | `linear` / `-1.0` | RF sampler timestep schedule (`sway` = denser at low-noise side) and its coefficient |
 | `--num-candidates` | `1` | Candidates generated per batched pass |
 | `--decode-mode` | `sequential` | Candidate decoding (`sequential` = lower VRAM / `batch` = faster) |
 | `--seconds` | `None` | Manual output length (Duration Predictor used when omitted; 30 s fallback without one) |
@@ -193,12 +194,14 @@ uv run python infer.py \
 | `--speaker-kv-scale` | `None` | Speaker KV attention scale (>1 strengthens speaker identity) |
 | `--speaker-kv-min-t` | `0.9` | Timestep at which speaker KV scaling stops |
 | `--speaker-kv-max-layers` | `None` | Number of leading layers to apply speaker KV scale |
+| `--speaker-uncond-mode` | `mask` | Unconditional speaker embedding formulation (`mask` = zero / `noise` = Gaussian noise) |
 | `--max-text-len` / `--max-caption-len` | checkpoint value → 256 | Maximum conditioning token lengths |
-| `--model-device` / `--codec-device` | auto | Device (`cuda` / `mps` / `cpu`) |
+| `--model-device` / `--codec-device` | auto | Device (`cuda` / `mps` / `xpu` / `cpu`) |
 | `--model-precision` / `--codec-precision` | `fp32` | Precision (`fp32` / `bf16`) |
 | `--enable-watermark` | `False` | Watermark embedding (dim32 = SilentCipher / dim128 = DACVAE) |
 | `--codec-repo` | `Aratako/Semantic-DACVAE-Japanese-32dim` | Decoding codec (auto-selected to match the model) |
 | `--lora-path` / `--lora-scale` / `--lora-disabled-modules` | `None` / `1.0` / `""` | LoRA adapter loading, scaling, per-module disable |
+| `--lora-adapter` | `None` | Dynamically apply a PEFT adapter per request (not merged into the base checkpoint) |
 | `--compile-model` / `--compile-dynamic` | `False` | Enable torch.compile |
 | `--trim-tail` | `True` | Trim trailing silence via flattening heuristic |
 | `--tail-window-size` / `--tail-std-threshold` / `--tail-mean-threshold` | `20` / `0.05` / `0.1` | Tail trimming thresholds |
@@ -217,7 +220,7 @@ uv run python infer.py \
 - **Voice Design** — Caption field and caption CFG appear only when a caption-compatible model is loaded.
 - **Emotion style presets** — Normal / Strong / Calm / Bright / Whisper.
 - **Style sliders** — Text expressiveness, emotion strength, speaker adherence, expression range.
-- **Sampling** — Steps (1–120), seed, candidate count (1–8), multiline split generation (individual / concatenated with silence gaps).
+- **Sampling** — Steps (0=auto: MeanFlow=4 / RF=40, or 1–120), seed, candidate count (1–8), multiline split generation (individual / concatenated with silence gaps).
 - **CFG settings** — Guidance mode, text/caption/speaker CFG, timestep range, KV cache, score rescaling, speaker KV scale.
 - Generated audio is saved under `outputs_gradio/`.
 

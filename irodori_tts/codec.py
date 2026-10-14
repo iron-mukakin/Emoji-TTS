@@ -50,7 +50,7 @@ class DACVAECodec:
     @classmethod
     def load(
         cls,
-        repo_id: str = "facebook/dacvae-watermarked",
+        repo_id: str = "Aratako/Semantic-DACVAE-Japanese-32dim",
         device: str = "cuda",
         dtype: torch.dtype | None = None,
         enable_watermark: bool = False,

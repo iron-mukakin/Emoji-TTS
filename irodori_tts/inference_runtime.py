@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
 import secrets
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torchaudio
@@ -18,8 +21,9 @@ from safetensors.torch import load_file as load_safetensors_file
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig, merge_dataclass_overrides
 from .duration import build_duration_features
-from .model import TextToLatentRFDiT
+from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
 from .meanflow import sample_euler_meanflow
+from .model import TextToLatentRFDiT
 from .quantization import (
     is_torchao_quantized_state_dict,
     parse_quantization_metadata,
@@ -42,6 +46,13 @@ def _is_mps_available() -> bool:
     return bool(torch.backends.mps.is_available())
 
 
+def _is_xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except AttributeError:
+        return False
+
+
 def resolve_runtime_device(device: str | torch.device) -> torch.device:
     resolved = torch.device(device)
     if resolved.type == "cpu":
@@ -56,7 +67,15 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         if not _is_mps_available():
             raise ValueError("MPS device requested but torch.backends.mps.is_available() is False.")
         return torch.device("mps")
-    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps.")
+    if resolved.type == "xpu":
+        if resolved.index is not None:
+            raise ValueError("XPU device index is not supported. Use 'xpu'.")
+        if not _is_xpu_available():
+            raise ValueError("XPU device requested but torch.xpu.is_available() is False.")
+        return torch.device("xpu")
+    raise ValueError(
+        f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu."
+    )
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -65,6 +84,8 @@ def list_available_runtime_devices() -> list[str]:
         devices.append("cuda")
     if _is_mps_available():
         devices.append("mps")
+    if _is_xpu_available():
+        devices.append("xpu")
     devices.append("cpu")
     return devices
 
@@ -75,7 +96,7 @@ def default_runtime_device() -> str:
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     resolved = resolve_runtime_device(device)
-    if resolved.type == "cuda":
+    if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
     return ["fp32"]
 
@@ -87,6 +108,10 @@ def _sync_device(device: torch.device) -> None:
         mps = getattr(torch, "mps", None)
         if mps is not None and hasattr(mps, "synchronize"):
             mps.synchronize()
+    elif device.type == "xpu":
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and hasattr(xpu, "synchronize"):
+            xpu.synchronize()
 
 
 def _sync_devices(*devices: torch.device) -> None:
@@ -210,7 +235,7 @@ def trim_trailing_silence(
 class RuntimeKey:
     checkpoint: str
     model_device: str
-    codec_repo: str = "facebook/dacvae-watermarked"
+    codec_repo: str = "Aratako/Semantic-DACVAE-Japanese-32dim"
     model_precision: str = "fp32"
     codec_device: str = "cpu"
     codec_precision: str = "fp32"
@@ -240,7 +265,9 @@ class SamplingRequest:
     duration_scale: float = 1.0
     min_seconds: float = 0.5
     max_seconds: float = 30.0
-    max_ref_seconds: float | None = 30.0
+    # None selects the checkpoint recommendation; legacy checkpoints fall back
+    # to 30 seconds. A non-positive explicit value disables the cap.
+    max_ref_seconds: float | None = None
     max_text_len: int | None = None
     max_caption_len: int | None = None
     num_steps: int | None = None
@@ -266,6 +293,7 @@ class SamplingRequest:
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1
+    lora_adapter: str | None = None
     lora_scale: float = 1.0
     lora_disabled_modules: tuple[str, ...] = ()
 
@@ -330,8 +358,8 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
     if mode == "fp32":
         return torch.float32
     if mode == "bf16":
-        if device.type != "cuda":
-            raise ValueError("precision='bf16' currently requires CUDA device.")
+        if device.type not in ("cuda", "xpu"):
+            raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
         return torch.bfloat16
     raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
 
@@ -359,7 +387,8 @@ def resolve_cfg_scales(
     if not use_speaker_condition:
         if speaker_val > 0.0:
             messages.append(
-                "info: speaker conditioning is disabled for this checkpoint; ignoring cfg_scale_speaker."
+                "info: speaker conditioning is disabled for this checkpoint or request; "
+                "ignoring cfg_scale_speaker."
             )
         speaker_val = 0.0
 
@@ -411,6 +440,10 @@ def _load_checkpoint_from_pt(
             f"Checkpoint text_encoder_config must be a dictionary when present: {path}"
         )
 
+    if checkpoint_state_uses_lora(model_state):
+        raise ValueError(
+            f"LoRA checkpoints must be loaded from adapter directories or merged safetensors: {path}"
+        )
     return model_state, model_cfg, _extract_inference_train_config(train_cfg), text_encoder_config
 
 
@@ -537,6 +570,54 @@ def _load_checkpoint_for_inference(
     if path.suffix.lower() == ".safetensors":
         return _load_checkpoint_from_safetensors(path)
     return _load_checkpoint_from_pt(path)
+
+
+def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
+    raw = str(source).strip().strip("/")
+    if not raw:
+        raise ValueError("Hugging Face checkpoint source must be non-empty.")
+    parts = raw.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Invalid Hugging Face checkpoint source: {source!r}")
+    if len(parts) <= 2:
+        return raw, None
+    if len(parts) != 3:
+        raise ValueError(
+            f"Hugging Face checkpoint subfolders must use owner/repo/subfolder format: {source!r}"
+        )
+    return "/".join(parts[:2]), "/".join(parts[2:])
+
+
+def download_hf_checkpoint(source: str) -> str:
+    """Download an Irodori checkpoint and any bundled tokenizer assets.
+
+    ``source`` accepts either a Hugging Face repo id or ``repo_id/subfolder``.
+    """
+    from huggingface_hub import snapshot_download
+
+    repo_id, subfolder = _split_hf_checkpoint_source(source)
+    if subfolder is None:
+        checkpoint_relative = Path("model.safetensors")
+        allow_patterns = ["model.safetensors", "tokenizer/*"]
+    else:
+        checkpoint_relative = Path(subfolder) / "model.safetensors"
+        allow_patterns = [
+            checkpoint_relative.as_posix(),
+            f"{subfolder}/tokenizer/*",
+            "tokenizer/*",
+        ]
+    snapshot_dir = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            allow_patterns=allow_patterns,
+        )
+    )
+    checkpoint_path = snapshot_dir / checkpoint_relative
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Hugging Face checkpoint source has no model.safetensors: {source}"
+        )
+    return str(checkpoint_path)
 
 
 def _resolve_tokenizer_source(checkpoint_path: Path, fallback_repo: str) -> tuple[str, bool]:
@@ -673,6 +754,7 @@ class InferenceRuntime:
         codec: DACVAECodec,
         default_text_max_len: int,
         default_caption_max_len: int,
+        default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -685,12 +767,15 @@ class InferenceRuntime:
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
+        self.default_max_ref_seconds = float(default_max_ref_seconds)
         self.silentcipher_watermarker = (
             SilentCipherWatermarker(device=str(self.codec_device))
             if self._uses_silentcipher_watermark
             else None
         )
         self._infer_lock = threading.Lock()
+        self._model_dtype = next(self.model.parameters()).dtype
+        self._lora_adapter_names: dict[str, str] = {}
 
     @property
     def _uses_silentcipher_watermark(self) -> bool:
@@ -807,6 +892,7 @@ class InferenceRuntime:
 
         default_text_max_len = 256
         default_caption_max_len = default_text_max_len
+        default_max_ref_seconds = _default_max_ref_seconds(train_cfg)
         if isinstance(train_cfg, dict):
             ckpt_text_max_len = train_cfg.get("max_text_len")
             if isinstance(ckpt_text_max_len, int) and ckpt_text_max_len > 0:
@@ -847,7 +933,102 @@ class InferenceRuntime:
             codec=codec,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
+            default_max_ref_seconds=default_max_ref_seconds,
         )
+
+    def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
+        if adapter_path is None:
+            return None
+        raw = str(adapter_path).strip()
+        if raw.lower() in {"", "none", "null", "off", "disable", "disabled", "base"}:
+            return None
+
+        path = Path(raw).expanduser()
+        if not path.is_dir():
+            raise FileNotFoundError(f"LoRA adapter directory not found: {path}")
+        if not is_lora_adapter_dir(path):
+            raise ValueError(
+                f"LoRA adapter directory must contain adapter_config.json and adapter weights: {path}"
+            )
+        return str(path.resolve())
+
+    @staticmethod
+    def _adapter_name_for_path(path: str) -> str:
+        digest = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+        return f"runtime_{digest}"
+
+    def _prepare_lora_for_request(
+        self,
+        adapter_path: str | None,
+        *,
+        messages: list[str],
+        stage_timings: list[tuple[str, float]],
+        log_fn: Callable[[str], None],
+    ) -> Any:
+        should_time = adapter_path is not None and str(adapter_path).strip() != ""
+        t0 = _measure_start(self.model_device) if should_time else None
+        try:
+            return self._prepare_lora_for_request_inner(
+                adapter_path,
+                messages=messages,
+                log_fn=log_fn,
+            )
+        finally:
+            if t0 is not None:
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("prepare_lora", stage_sec))
+                log_fn(f"[runtime] prepare_lora: {stage_sec * 1000.0:.1f} ms")
+
+    def _prepare_lora_for_request_inner(
+        self,
+        adapter_path: str | None,
+        *,
+        messages: list[str],
+        log_fn: Callable[[str], None],
+    ) -> Any:
+        resolved_path = self._resolve_lora_adapter_path(adapter_path)
+        if resolved_path is None:
+            # フォーク固有: RuntimeKey.lora_path でロード時に適用したアダプタは
+            # 有効なまま維持する（disable_adapter で無効化しない）。
+            if self.key.lora_path is not None:
+                return nullcontext()
+            disable_adapter = getattr(self.model, "disable_adapter", None)
+            if callable(disable_adapter):
+                msg = "info: dynamic LoRA disabled for this request; using base model."
+                messages.append(msg)
+                log_fn(msg)
+                return disable_adapter()
+            return nullcontext()
+
+        if self.key.compile_model:
+            raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+
+        adapter_name = self._lora_adapter_names.get(resolved_path)
+        if adapter_name is None:
+            adapter_name = self._adapter_name_for_path(resolved_path)
+            msg = f"info: loading LoRA adapter: {resolved_path}"
+            messages.append(msg)
+            log_fn(msg)
+        else:
+            msg = f"info: using cached LoRA adapter: {resolved_path}"
+            messages.append(msg)
+            log_fn(msg)
+
+        self.model = load_lora_adapter(
+            self.model,
+            resolved_path,
+            is_trainable=False,
+            adapter_name=adapter_name,
+            torch_device=str(self.model_device),
+        )
+        self._lora_adapter_names[resolved_path] = adapter_name
+        self.model = _move_inference_module(
+            self.model,
+            device=self.model_device,
+            dtype=self._model_dtype,
+        )
+        self.model.eval()
+        return nullcontext()
 
     def _load_reference_latent(
         self,
@@ -857,8 +1038,27 @@ class InferenceRuntime:
         messages: list[str],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
+        max_ref_seconds = (
+            self.default_max_ref_seconds
+            if req.max_ref_seconds is None
+            else float(req.max_ref_seconds)
+        )
+        wav_paths = ([req.ref_wav] if req.ref_wav is not None else []) + list(req.ref_wavs or [])
+        latent_paths = ([req.ref_latent] if req.ref_latent is not None else []) + list(
+            req.ref_latents or []
+        )
+        if req.ref_wav is not None and req.ref_wavs:
+            raise ValueError("ref_wav and ref_wavs cannot be used together.")
+        if req.ref_latent is not None and req.ref_latents:
+            raise ValueError("ref_latent and ref_latents cannot be used together.")
+        if wav_paths and latent_paths:
+            raise ValueError("Waveform and latent reference inputs cannot be mixed.")
+        if any(not isinstance(path, str) or not path.strip() for path in wav_paths):
+            raise ValueError("Reference waveform paths must be non-empty strings.")
+        if any(not isinstance(path, str) or not path.strip() for path in latent_paths):
+            raise ValueError("Reference latent paths must be non-empty strings.")
         if not self.model_cfg.use_speaker_condition_resolved:
-            if req.ref_wav is not None or req.ref_latent is not None:
+            if wav_paths or latent_paths:
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
                 )
@@ -879,56 +1079,88 @@ class InferenceRuntime:
             )
             return ref_latent_patched, ref_mask
 
-        if req.ref_wav is None and req.ref_latent is None:
-            raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
+        if not wav_paths and not latent_paths:
+            raise ValueError("Specify ref_wav/ref_wavs/ref_latent/ref_latents, or set no_ref=True.")
 
-        max_ref_seconds = req.max_ref_seconds
-        if max_ref_seconds is None:
-            max_ref_seconds = _default_max_ref_seconds(self.train_cfg)
         max_ref_latent_steps = None
-        if max_ref_seconds is not None and max_ref_seconds > 0:
+        if max_ref_seconds > 0:
             max_ref_latent_steps = max(
                 1,
                 math.ceil(
-                    float(max_ref_seconds)
+                    max_ref_seconds
                     * float(self.codec.sample_rate)
                     / float(int(self.codec.model.hop_length))
                 ),
             )
 
-        if req.ref_latent is not None:
-            latent_raw = torch.load(req.ref_latent, map_location="cpu", weights_only=True)
-            ref_latent = _coerce_latent_shape(
-                latent_raw, latent_dim=self.model_cfg.latent_dim
-            ).unsqueeze(0)
-            ref_latent = ref_latent.to(dtype=runtime_dtype)
+        if latent_paths:
+            latent_pieces: list[torch.Tensor] = []
+            for path in latent_paths:
+                latent_raw = torch.load(path, map_location="cpu", weights_only=True)
+                piece = _coerce_latent_shape(
+                    latent_raw, latent_dim=self.model_cfg.latent_dim
+                ).unsqueeze(0)
+                if piece.shape[1] == 0:
+                    raise ValueError(f"Reference latent is empty: {path}")
+                latent_pieces.append(piece.to(dtype=runtime_dtype))
+                if (
+                    max_ref_latent_steps is not None
+                    and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
+                ):
+                    break
+            ref_latent = torch.cat(latent_pieces, dim=1)
+            if len(latent_paths) > 1:
+                messages.append(
+                    f"info: concatenated {len(latent_pieces)}/{len(latent_paths)} reference latents "
+                    f"in input order ({ref_latent.shape[1]} steps before max-length trimming)."
+                )
         else:
-            wav, sr = _load_audio(req.ref_wav)
-            if max_ref_seconds is not None and max_ref_seconds > 0:
-                max_ref_samples = max(1, int(float(max_ref_seconds) * float(sr)))
-                if wav.shape[1] > max_ref_samples:
-                    messages.append(
-                        f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
-                        f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
-                    )
-                    wav = wav[:, :max_ref_samples]
             if req.ref_normalize_db is not None:
                 messages.append(
-                    f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
+                    f"info: reference loudness normalize enabled per clip (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
                 )
             elif req.ref_ensure_max:
-                messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
-            ref_latent = self.codec.encode_waveform(
-                wav.unsqueeze(0),
-                sample_rate=int(sr),
-                normalize_db=req.ref_normalize_db,
-                ensure_max=bool(req.ref_ensure_max),
-            ).cpu()
+                messages.append(
+                    "info: reference peak safety scaling enabled per clip (ensure_max=True)."
+                )
+            latent_pieces = []
+            for path in wav_paths:
+                wav, sr = _load_audio(path)
+                if len(wav_paths) == 1 and max_ref_seconds > 0:
+                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
+                    if wav.shape[1] > max_ref_samples:
+                        messages.append(
+                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                        )
+                        wav = wav[:, :max_ref_samples]
+                piece = self.codec.encode_waveform(
+                    wav.unsqueeze(0),
+                    sample_rate=int(sr),
+                    normalize_db=req.ref_normalize_db,
+                    ensure_max=bool(req.ref_ensure_max),
+                ).cpu()
+                if piece.shape[1] == 0:
+                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
+                latent_pieces.append(piece)
+                if (
+                    max_ref_latent_steps is not None
+                    and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
+                ):
+                    break
+            ref_latent = torch.cat(latent_pieces, dim=1)
+            if len(wav_paths) > 1:
+                messages.append(
+                    f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
+                    "reference waveforms in input order "
+                    f"({ref_latent.shape[1]} latent steps before max-length trimming)."
+                )
 
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
             messages.append(
-                f"warning: reference latent steps ({ref_latent.shape[1]}) exceed max_ref_seconds bound ({max_ref_latent_steps} steps). "
-                "Trimming reference latent."
+                f"warning: combined reference latent steps ({ref_latent.shape[1]}) exceed "
+                f"max_ref_seconds bound ({max_ref_latent_steps} steps). "
+                "Trimming the concatenated reference latent."
             )
             ref_latent = ref_latent[:, :max_ref_latent_steps]
 
@@ -1095,7 +1327,7 @@ class InferenceRuntime:
         if speaker_kv_scale is not None:
             if not use_speaker_for_request:
                 messages.append(
-                    "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale."
+                    "info: speaker conditioning is disabled for this request; ignoring speaker_kv_scale."
                 )
                 speaker_kv_scale = None
             else:
@@ -1157,7 +1389,16 @@ class InferenceRuntime:
             _log(f"[runtime] using seed: {used_seed}")
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
-        with self._infer_lock, torch.inference_mode():
+        with (
+            self._infer_lock,
+            self._prepare_lora_for_request(
+                req.lora_adapter,
+                messages=messages,
+                stage_timings=stage_timings,
+                log_fn=_log,
+            ),
+            torch.inference_mode(),
+        ):
             lora_active = self.key.lora_path is not None and any(
                 hasattr(module, "scaling") for module in self.model.modules()
             )
@@ -1494,6 +1735,10 @@ class InferenceRuntime:
                 mps = getattr(torch, "mps", None)
                 if mps is not None and hasattr(mps, "empty_cache"):
                     mps.empty_cache()
+            elif device.type == "xpu":
+                xpu = getattr(torch, "xpu", None)
+                if xpu is not None and hasattr(xpu, "empty_cache"):
+                    xpu.empty_cache()
 
 
 _RUNTIME_CACHE_LOCK = threading.Lock()
@@ -1547,10 +1792,12 @@ def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
 def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
     try:
-        torchaudio.save(str(out_path), audio, sample_rate)
+        torchaudio.save(str(out_path), audio_cpu, sample_rate)
     except RuntimeError:
         import soundfile as sf
 
-        sf.write(str(out_path), audio.squeeze(0).numpy(), sample_rate)
+        audio_np = audio_cpu.squeeze(0).numpy() if audio_cpu.shape[0] == 1 else audio_cpu.T.numpy()
+        sf.write(str(out_path), audio_np, sample_rate)
     return out_path
