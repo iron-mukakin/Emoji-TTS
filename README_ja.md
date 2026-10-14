@@ -23,6 +23,7 @@ English → [README.md](README.md)
 - **Duration Predictor** — 対応モデルでは出力長を自動予測。`--seconds` / `--duration-scale` で手動制御も可能
 - **Speaker Inversion（v4系）** — 参照音声エンコーダの代わりに使える学習可能な話者トークン（`.speaker.safetensors`）。学習（`train.py` + `configs/train_v4_small_speaker_inversion.yaml`）・推論（`infer.py --ref-embed`）・Gradio UIまで対応
 - **事前学習テキストエンコーダ（v4系）** — 事前学習バックボーン + プロジェクタ構造を読み込み（v4-Small/v4.1-Small は `sbintuitions/modernbert-ja-310m` 使用）。バックボーンは別LRに分離、エンコーダ設定は保存チェックポイントに埋め込まれ再学習時にHF再ダウンロード不要
+- **MeanFlow蒸留学習（v4.1）** — `train_mode: meanflow_distill` でRF学習済みチェックポイントを数ステップ（既定4ステップ）の学生モデルへ蒸留（`configs/train_v4_small_meanflow.yaml`）。DiTのみ学習し、teacherはCFG融合付きオンラインEuler rolloutで標的を生成。MeanFlowチェックポイントは推論時に自動で4 NFEサンプリング（詳細は `docs/meanflow.md`）
 - **絵文字スタイル制御** — テキスト中の絵文字で感情・効果音を制御（`EMOJI_ANNOTATIONS` 準拠）
 - **感情スタイルプリセット** — ワンクリックでスタイル切替（ノーマル / 力強く / おとなしく / 明るく / ひそやかに）とCFGの手動微調整
 - **スピーカーライブラリ** — 参照音声を名前付きプロファイル（`speakers/`）として登録し再利用
@@ -30,7 +31,7 @@ English → [README.md](README.md)
 - **改行分割生成** — 行単位で個別生成、または無音区間を挟んで連結
 - **ウォーターマーク** — dim32は SilentCipher、dim128は DACVAE 埋め込み。UI/CLIでON・OFF
 - **LoRA差分学習** — `peft` 使用。Resume・EMA・Early Stopping・モジュール単位無効化・LoRA同士のマージ/焼き込み
-- **フルファインチューニング** — Multi-GPU DDP、Muon/AdamW/Lion/AdEMAMix/SGD、WSD/Cosine、勾配チェックポイント、TensorBoard・メトリクスログ
+- **フルファインチューニング** — Multi-GPU DDP、Muon/AdamW/Lion/AdEMAMix/SGD、WSD/Cosine、勾配チェックポイント（`store_every` による活性化部分保持対応）、TensorBoard・メトリクスログ
 - **データセットツール** — Silero VADスライス、Whisperキャプション、LLM APIによる絵文字注釈、VoiceDesign用「音声分析キャプション」生成
 - **モデルマージ** — Weighted Average・SLERP・Task Arithmetic・層グループ別部分マージ・LoRA的差分注入（v3系対応）
 - **Gradio Web UI / ダークモード** — 全機能をブラウザから操作可能
@@ -56,6 +57,8 @@ English → [README.md](README.md)
 - **量子化チェックポイント**（`Aratako/Irodori-TTS-v4-Small-Quantized` 等の torchao 形式）は **推論専用** です。読込には `uv sync --extra quantization`（torchao）が必要です。`--init-checkpoint` での学習再開には使用できません（フル精度ベースで学習 → マージ → 量子化の順で運用）。
 - マニフェスト作成のモード対応: `model_v1`(dim128) / `model_v2` / `model_v3` / `model_v4`(既定、話者+caption列) / `voice_design`(caption列必須)。
 - 学習時は YAML の `model:` セクションで `use_caption_condition`、`use_duration_predictor`、`text_encoder_type: pretrained` 等を指定できます。
+- **v4-Large 学習コンフィグ** — `configs/train_v4_large.yaml` / `configs/train_v4_large_duration.yaml` を同梱（事前学習テキストエンコーダは `google/t5gemma-2-1b-1b`、本体/事前TEとも muon 分離）。上流でのHF公開は未定のため設定同梱のみ（モデルコードの変更不要なし）。
+- **MeanFlowチェックポイント** — `train_mode: meanflow_distill` で生成したチェックポイントはメタデータに `flow_parameterization: meanflow` を持ち、推論（infer.py / Gradio）では自動で4 NFEサンプリングになります（実行時CFGは無効。CFGは学習時にteacherへ融合済み）。
 
 ---
 
@@ -174,7 +177,7 @@ uv run python infer.py \
 | `--max-ref-seconds` | `30.0` | 参照音声の最大秒数（<=0で無制限） |
 | `--ref-normalize-db` | `-16.0` | 参照音声のloudness正規化目標（`none`で無効） |
 | `--ref-ensure-max` | `True` | 参照音声のピークが1.0を超える時のみ縮小 |
-| `--num-steps` | `40` | Euler積分ステップ数 |
+| `--num-steps` | `None`（自動） | Euler積分ステップ数。未指定時はMeanFlow ckpt=4 / RF ckpt=40に自動設定 |
 | `--num-candidates` | `1` | 1回の生成で得る候補数（バッチ生成） |
 | `--decode-mode` | `sequential` | 候補の復号方式（`sequential`=低VRAM / `batch`=高速） |
 | `--seconds` | `None` | 出力秒数の手動指定（省略時はDuration Predictor、非対応ckptは30秒） |
@@ -389,7 +392,7 @@ uv run python prepare_manifest.py \
   --device cuda
 ```
 
-### 2. 学習（フル / LoRA / Speaker Inversion）
+### 2. 学習（フル / LoRA / Speaker Inversion / MeanFlow蒸留）
 
 ```bash
 # フル（v3）
@@ -415,6 +418,17 @@ uv run python train.py --config configs/train_v4_small_speaker_inversion.yaml \
   --manifest my_manifest/train_manifest.jsonl \
   --init-checkpoint checkpoints/Aratako_Irodori-TTS-v4-Small/model.safetensors \
   --output-dir outputs_train/speaker_inversion
+
+# MeanFlow蒸留（v4.1。RF学習済みckptをstudent/teacher両方の初期化に使い、
+# DiTのみ学習。teacherはCFG融合付きEuler rolloutで標的生成。生成ckptの推論は
+# 自動で4 NFE。teacher_checkpointはconfig側で必須、--resume で蒸留再開可）
+uv run python train.py --config configs/train_v4_small_meanflow.yaml \
+  --manifest my_manifest/train_manifest.jsonl \
+  --output-dir outputs_train/meanflow
+
+# v4-Large（t5gemma-2-1b-1bベース。事前学習TEもmuonに分離して学習）
+uv run python train.py --config configs/train_v4_large.yaml \
+  --manifest my_manifest/train_manifest.jsonl --output-dir outputs_train/irodori_tts_v4_large
 ```
 
 ### 3. チェックポイント変換（必要に応じて）
@@ -453,12 +467,15 @@ Irodori-TTS/
 │   ├── duration.py                       # Duration Predictor関連
 │   ├── quantization.py                   # torchao量子化チェックポイントの解析・量子化
 │   ├── speaker_inversion.py              # 学習済み話者トークン（v4-Small）
+│   ├── attention.py                      # セルフ/コンテキストattention共通実装（ContextAttentionPlan）
+│   ├── meanflow.py                       # MeanFlow蒸留loss・teacher rollout・数ステップサンプラー（v4.1）
 │   ├── watermark.py                      # 透かし関連ユーティリティ
 │   ├── text_normalization.py             # 日本語テキスト正規化
 │   ├── optim.py                          # Muon / AdamW / Lion / AdEMAMix / SGD
 │   └── progress.py                       # 学習進捗トラッカー
 │
 ├── configs/                              # 学習・LoRAプリセットYAML（model: / train: / lora: セクション）
+├── docs/                                 # 機能ドキュメント（meanflow.md = MeanFlow蒸留の学習・推論手順）
 ├── checkpoints/                          # 学習済み・DL済みモデル（codecs/ tokenizers/ whisper/ キャッシュ含む）
 ├── lora/                                 # LoRAアダプタ出力
 ├── speakers/                             # 名前付きスピーカープロファイル
@@ -483,9 +500,13 @@ YAMLは `model:` / `train:`（LoRAプリセットは `lora:`）のセクショ�
 | `gradient_accumulation_steps` | `1` | 実効バッチ = batch × accum |
 | `optimizer` | `muon` | `muon` / `adamw` / `lion` / `ademamix` / `sgd` |
 | `learning_rate` | `1e-4` | ピーク学習率 |
-| `pretrained_text_encoder_learning_rate` | `1e-5` | 事前学習テキストエンコーダ部の学習率（v4系。オプティマイザは本体と分離され AdamW 固定） |
-| `pretrained_text_encoder_optimizer` | `adamw` | 事前学習テキストエンコーダ分離用のオプティマイザ（adamw のみ可） |
+| `pretrained_text_encoder_learning_rate` | `1e-5` | 事前学習テキストエンコーダ部の学習率（v4系。オプティマイザは本体と分離され `pretrained_text_encoder_optimizer` で選択） |
+| `pretrained_text_encoder_optimizer` | `adamw` | 事前学習テキストエンコーダ分離用のオプティマイザ（`adamw` / `muon`。`muon` は `optimizer: muon` 必須） |
 | `pretrained_projector_warmup_steps` | `0` | 事前学習プロジェクタ（`text_encoder.*` / `caption_encoder.*`）の勾配を最初のNステップ間クリア（凍結相当） |
+| `train_mode` | `rf` | `rf` / `duration_only` / `meanflow_distill`（MeanFlow蒸留。詳細は `docs/meanflow.md`） |
+| `teacher_checkpoint` / `teacher_steps` | `None` / `40` | MeanFlow蒸留のteacherチェックポイント（RF版・必須）/ teacherのEulerステップ数 |
+| `meanflow_*` | `docs/meanflow.md` 参照 | MeanFlow蒸留パラメータ（時間サンプリング / teacher rollout分割・deviceオフセット / CFG融合 / 適応loss重み等） |
+| `gradient_checkpointing_store_every` | `0` | 勾配チェックポイント時に1/Nブロックごとに活性化を保持し再計算を削減（0=全ブロック再計算。CLI `--grad-checkpoint-store-every`） |
 | `lr_scheduler` | `none` | `wsd` / `cosine` / `none` |
 | `warmup_steps` / `stable_steps` / `min_lr_scale` | `0` / `0` / `0.1` | WSDスケジュール |
 | `max_steps` | `200000` | 総学習ステップ |
@@ -504,7 +525,7 @@ YAMLは `model:` / `train:`（LoRAプリセットは `lora:`）のセクショ�
 | `compile_model` | `false` | torch.compile |
 | `wandb_enabled` | `false` | Weights & Biasesログ |
 
-`model:` セクションでは `latent_dim`、`use_caption_condition`、`use_duration_predictor`、`text_encoder_type: pretrained`、`text_tokenizer_repo` 等を設定できます。既存モデルの `.safetensors` から開始する場合はメタデータの設定が自動引き継ぎされます。
+`model:` セクションでは `latent_dim`、`use_caption_condition`、`use_duration_predictor`、`text_encoder_type: pretrained`、`text_tokenizer_repo`、`flow_parameterization`（既定 `rf_velocity`。MeanFlow蒸留の成果物は自動で `meanflow`）等を設定できます。既存モデルの `.safetensors` から開始する場合はメタデータの設定が自動引き継ぎされます。
 
 ---
 

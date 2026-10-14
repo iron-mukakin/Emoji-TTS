@@ -23,6 +23,7 @@ Training and inference code for **Irodori-TTS**, a Flow Matching-based Text-to-S
 - **Duration Predictor** — Automatic output length on supported models; manual control via `--seconds` / `--duration-scale`
 - **Speaker Inversion (v4 family)** — Trainable speaker tokens that replace the reference-latent speaker encoder (`.speaker.safetensors`); full training (`train.py` + `configs/train_v4_small_speaker_inversion.yaml`), inference (`infer.py --ref-embed`), and a Gradio reference tab are supported
 - **Pretrained Text Encoder (v4 family)** — Loads pretrained backbone + projector (v4-Small/v4.1-Small use `sbintuitions/modernbert-ja-310m`); separate lower LR for the backbone, and the encoder config is embedded into saved checkpoints for offline re-loading
+- **MeanFlow Distillation Training (v4.1)** — `train_mode: meanflow_distill` distills an RF-trained checkpoint into a few-step student (default 4 NFE, `configs/train_v4_small_meanflow.yaml`); only the DiT is trained while the teacher produces targets via CFG-fused online Euler rollout. MeanFlow checkpoints are sampled automatically at 4 NFE during inference (see `docs/meanflow.md`)
 - **Emoji Style Control** — Emotion and sound-effect control via emojis in the input text (38 types, `EMOJI_ANNOTATIONS` compatible)
 - **Emotion Style Presets** — One-click presets (Normal / Strong / Calm / Bright / Whisper) with fine-grained CFG control
 - **Speaker Library** — Register reference audio as named speaker profiles (`speakers/`) and reuse them
@@ -30,7 +31,7 @@ Training and inference code for **Irodori-TTS**, a Flow Matching-based Text-to-S
 - **Multiline Split Generation** — Per-line individual output, or concatenation with silence gaps
 - **Watermarking** — SilentCipher (dim32) / DACVAE (dim128), toggleable in UI and CLI
 - **LoRA Fine-tuning** — `peft`-based adapters with resume, EMA, Early Stopping, per-module disable, adapter merge/bake-in
-- **Full Fine-tuning** — Multi-GPU DDP, Muon/AdamW/Lion/AdEMAMix/SGD, WSD/Cosine schedulers, gradient checkpointing, TensorBoard & metrics logging
+- **Full Fine-tuning** — Multi-GPU DDP, Muon/AdamW/Lion/AdEMAMix/SGD, WSD/Cosine schedulers, gradient checkpointing (with `store_every` partial activation retention), TensorBoard & metrics logging
 - **Dataset Tools** — Silero VAD slicing, Whisper captioning, LLM-based emoji annotation, and VoiceDesign "voice analysis caption" generation
 - **Model Merging** — Weighted Average, SLERP, Task Arithmetic, per-group partial merge, LoRA-style difference injection (v3-family compatible)
 - **Gradio Web UI / Dark Mode** — All features accessible from a single GUI
@@ -56,6 +57,8 @@ The loaded checkpoint's metadata (`model_config` / `text_encoder_config_json` / 
 - **Quantized checkpoints** (torchao format, e.g. `Aratako/Irodori-TTS-v4-Small-Quantized`) are **inference-only**. Loading them requires `uv sync --extra quantization` (torchao). They cannot be used with `--init-checkpoint` for training — train on the full-precision base, merge, then quantize.
 - Manifest preparation modes: `model_v1` (dim128) / `model_v2` / `model_v3` / `model_v4` (default; speaker + caption columns) / `voice_design` (caption column required).
 - Training configs can set `use_caption_condition`, `use_duration_predictor`, `text_encoder_type: pretrained`, etc. in the `model:` section of the YAML.
+- **v4-Large training configs** — `configs/train_v4_large.yaml` / `configs/train_v4_large_duration.yaml` are bundled (pretrained text encoder `google/t5gemma-2-1b-1b`, Muon for both the main model and the pretrained text encoder). The upstream HF release is still forthcoming, so only the configs are provided (no model code changes required).
+- **MeanFlow checkpoints** — Checkpoints produced by `train_mode: meanflow_distill` carry `flow_parameterization: meanflow` in their metadata; inference (infer.py / Gradio) automatically uses the 4 NFE sampler. Runtime CFG is ignored (CFG is fused into the teacher target during training).
 
 ---
 
@@ -174,7 +177,7 @@ uv run python infer.py \
 | `--max-ref-seconds` | `30.0` | Maximum reference duration (<=0 disables the cap) |
 | `--ref-normalize-db` | `-16.0` | Reference loudness normalization target (`none` to disable) |
 | `--ref-ensure-max` | `True` | Scale reference down only when peak exceeds 1.0 |
-| `--num-steps` | `40` | Number of Euler integration steps |
+| `--num-steps` | `None` (auto) | Number of Euler integration steps. Auto-selected when omitted: 4 for MeanFlow checkpoints / 40 for RF checkpoints |
 | `--num-candidates` | `1` | Candidates generated per batched pass |
 | `--decode-mode` | `sequential` | Candidate decoding (`sequential` = lower VRAM / `batch` = faster) |
 | `--seconds` | `None` | Manual output length (Duration Predictor used when omitted; 30 s fallback without one) |
@@ -389,7 +392,7 @@ uv run python prepare_manifest.py \
   --device cuda
 ```
 
-### 2. Training (Full / LoRA / Speaker Inversion)
+### 2. Training (Full / LoRA / Speaker Inversion / MeanFlow Distillation)
 
 ```bash
 # Full (v3)
@@ -416,6 +419,18 @@ uv run python train.py --config configs/train_v4_small_speaker_inversion.yaml \
   --manifest my_manifest/train_manifest.jsonl \
   --init-checkpoint checkpoints/Aratako_Irodori-TTS-v4-Small/model.safetensors \
   --output-dir outputs_train/speaker_inversion
+
+# MeanFlow distillation (v4.1; initializes both student and teacher from an RF-trained
+# checkpoint and trains only the DiT. The teacher builds targets with CFG-fused Euler
+# rollout; resulting checkpoints are sampled at 4 NFE automatically. train.teacher_checkpoint
+# is required in the config; resume distillation with --resume)
+uv run python train.py --config configs/train_v4_small_meanflow.yaml \
+  --manifest my_manifest/train_manifest.jsonl \
+  --output-dir outputs_train/meanflow
+
+# v4-Large (t5gemma-2-1b-1b based; the pretrained text encoder also runs on Muon)
+uv run python train.py --config configs/train_v4_large.yaml \
+  --manifest my_manifest/train_manifest.jsonl --output-dir outputs_train/irodori_tts_v4_large
 ```
 
 ### 3. Checkpoint Conversion (if needed)
@@ -454,12 +469,15 @@ Irodori-TTS/
 │   ├── duration.py                       # Duration Predictor support
 │   ├── quantization.py                   # torchao quantized checkpoint parsing / quantization
 │   ├── speaker_inversion.py              # Learned speaker tokens (v4-Small)
+│   ├── attention.py                      # Shared self/context attention kernels (ContextAttentionPlan)
+│   ├── meanflow.py                       # MeanFlow distillation loss, teacher rollout & few-step sampler (v4.1)
 │   ├── watermark.py                      # Watermark utilities
 │   ├── text_normalization.py             # Japanese text normalization
 │   ├── optim.py                          # Muon / AdamW / Lion / AdEMAMix / SGD
 │   └── progress.py                       # Training progress tracker
 │
 ├── configs/                              # Training / LoRA preset YAMLs (model: / train: / lora: sections)
+├── docs/                                 # Feature docs (meanflow.md: MeanFlow distillation training & inference)
 ├── checkpoints/                          # Downloaded and trained models (codecs/ tokenizers/ whisper/ caches)
 ├── lora/                                 # LoRA adapter outputs
 ├── speakers/                             # Named speaker profiles
@@ -485,8 +503,12 @@ Main `train:` keys (defaults from `TrainConfig`):
 | `optimizer` | `muon` | `muon` / `adamw` / `lion` / `ademamix` / `sgd` |
 | `learning_rate` | `1e-4` | Peak learning rate |
 | `pretrained_text_encoder_learning_rate` | `1e-5` | LR for the pretrained text encoder part (v4 family) |
-| `pretrained_text_encoder_optimizer` | `adamw` | Optimizer for the pretrained text encoder split (AdamW only) |
+| `pretrained_text_encoder_optimizer` | `adamw` | Optimizer for the pretrained text encoder split (`adamw` or `muon`; `muon` requires `optimizer: muon`) |
 | `pretrained_projector_warmup_steps` | `0` | Freeze pretrained projectors (`text_encoder.*` / `caption_encoder.*` grads cleared) for the first N steps |
+| `train_mode` | `rf` | `rf` / `duration_only` / `meanflow_distill` (MeanFlow distillation; see `docs/meanflow.md`) |
+| `teacher_checkpoint` / `teacher_steps` | `None` / `40` | MeanFlow teacher checkpoint (must be an RF model; required) / teacher Euler steps |
+| `meanflow_*` | see `docs/meanflow.md` | MeanFlow distillation parameters (time sampling / teacher rollout chunking & device offset / CFG fusion / adaptive loss weights, etc.) |
+| `gradient_checkpointing_store_every` | `0` | Keep activations for 1 of every N blocks when gradient checkpointing is on (fewer recomputes; 0 = recompute all). CLI: `--grad-checkpoint-store-every` |
 | `lr_scheduler` | `none` | `wsd` / `cosine` / `none` |
 | `warmup_steps` / `stable_steps` / `min_lr_scale` | `0` / `0` / `0.1` | WSD schedule |
 | `max_steps` | `200000` | Total training steps |
@@ -504,7 +526,7 @@ Main `train:` keys (defaults from `TrainConfig`):
 | `compile_model` | `false` | torch.compile |
 | `wandb_enabled` | `false` | Weights & Biases logging |
 
-The `model:` section accepts `latent_dim`, `use_caption_condition`, `use_duration_predictor`, `text_encoder_type: pretrained`, `text_tokenizer_repo`, etc. When starting from an existing model's `.safetensors`, the embedded config is inherited automatically.
+The `model:` section accepts `latent_dim`, `use_caption_condition`, `use_duration_predictor`, `text_encoder_type: pretrained`, `text_tokenizer_repo`, `flow_parameterization` (default `rf_velocity`; MeanFlow outputs are marked `meanflow` automatically), etc. When starting from an existing model's `.safetensors`, the embedded config is inherited automatically.
 
 ---
 
