@@ -1022,12 +1022,13 @@ def _read_csv_headers(file_path: str) -> list[str]:
 
         suffix = p.suffix.lower()
         if suffix == ".csv":
-            with open(p, encoding="utf-8", errors="replace", newline="") as f:
+            # utf-8-sig: メモ帳等で追加され得る BOM を除いてヘッダーを読む
+            with open(p, encoding="utf-8-sig", errors="replace", newline="") as f:
                 headers = next(_csv.reader(f), [])
             return [h.strip() for h in headers if h.strip()]
 
         elif suffix in {".jsonl", ".json"}:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = p.read_text(encoding="utf-8-sig", errors="replace").splitlines()
             for line in lines:
                 line = line.strip()
                 if line:
@@ -1105,18 +1106,23 @@ def _build_manifest_command(
 
     cmd = [sys.executable, str(BASE_DIR / "prepare_manifest.py")]
 
-    if data_source_mode == "local_csv":
-        csv_path = Path(_s(dataset))
+    ds_path = _s(dataset)
+    if data_source_mode == "local_csv" or (
+        data_source_mode == "local_jsonl" and ds_path.lower().endswith(".csv")
+    ):
+        # local_jsonl モードで CSV を指定した場合、json ビルダーでは CSV を解析できず
+        # 分かりにくい JSON パースエラーになるため local_csv と同じ扱い (audiofolder) に寄せる
+        csv_path = Path(ds_path)
         folder = str(csv_path.parent if csv_path.suffix.lower() == ".csv" else csv_path)
         cmd += ["--dataset", "audiofolder",
                 "--data-files", folder,
                 "--split", "train"]
     elif data_source_mode == "local_jsonl":
         cmd += ["--dataset", "json",
-                "--data-files", _s(dataset),
+                "--data-files", ds_path,
                 "--split", "train"]
     else:
-        cmd += ["--dataset", _s(dataset),
+        cmd += ["--dataset", ds_path,
                 "--split",   _s(split, "train")]
 
     mode = str(prepare_mode).strip().lower()
@@ -1155,6 +1161,34 @@ def _build_manifest_command(
     return cmd
 
 
+def _validate_local_meta_columns(data_source_mode, dataset_path, speaker_col, caption_col) -> str | None:
+    """ローカルデータソースのメタデータ（metadata.csv/jsonl）列名を実行前に事前検証する。
+
+    UI の初期値や古い自動補完値がそのまま渡ると prepare_manifest.py の内部で
+    分かりにくい ValueError になるため、起動前に検出して分かりやすいメッセージを返す。
+    列名を取得できない場合は None（後段のエラーチェックに委ねる）。
+    """
+    if data_source_mode not in {"local_csv", "local_jsonl"}:
+        return None
+    headers = _read_csv_headers(str(dataset_path))
+    if not headers:
+        return None
+    # audiofolder は読み込み時に file_name 列を audio 列へリネームする
+    mapped = {("audio" if h == "file_name" else h) for h in headers}
+    problems = []
+    for label, col in (("話者ID", speaker_col), ("Caption", caption_col)):
+        col = str(col or "").strip()
+        if col and col not in mapped:
+            problems.append(f"{label}列 '{col}' がメタデータに存在しません")
+    if not problems:
+        return None
+    return (
+        "❌ " + " / ".join(problems) + "\n"
+        f"利用可能な列: {sorted(mapped)}\n"
+        "列名設定を再取得するか、該当欄を空にしてから実行してください。"
+    )
+
+
 def _manifest_cmd_preview(
     data_source_mode, dataset, split, prepare_mode, audio_col, text_col, speaker_col, caption_col,
     output_manifest, latent_dir, device, codec_repo,
@@ -1175,6 +1209,9 @@ def _run_manifest(
         output_manifest, latent_dir, device, codec_repo,
     )
     cmd_str = " ".join(cmd_list)
+    col_error = _validate_local_meta_columns(data_source_mode, dataset, speaker_col, caption_col)
+    if col_error:
+        return col_error, cmd_str
     with _proc_lock:
         if _active_proc is not None and _active_proc.poll() is None:
             return "別のプロセスが実行中です。停止してから再実行してください。", cmd_str
@@ -3123,8 +3160,11 @@ def build_ui() -> gr.Blocks:
                                                      choices=["text"], allow_custom_value=True)
                         pm_speaker_col = gr.Dropdown(label="話者ID列名（省略可）", value="",
                                                      choices=[""], allow_custom_value=True)
-                        pm_caption_col = gr.Dropdown(label="Caption列名（Voice Design）", value="caption",
-                                                     choices=["caption"], allow_custom_value=True, visible=False)
+                        # 初期値は空にする（v4/voice_design で未設定なら caption 列は渡さない）。
+                        # "caption" を初期値にすると、列名自動取得が走る前に実行すると
+                        # caption 列の無い metadata.csv で prepare_manifest.py が ValueError になる。
+                        pm_caption_col = gr.Dropdown(label="Caption列名（Voice Design/v4・省略可）", value="",
+                                                     choices=[""], allow_custom_value=True, visible=False)
                     pm_col_status = gr.Textbox(label="列名取得状況", interactive=False, lines=1)
 
                 with gr.Row():
@@ -3171,7 +3211,7 @@ def build_ui() -> gr.Blocks:
                         else "Aratako/Semantic-DACVAE-Japanese-32dim"
                     )
                     if is_v4:
-                        status = "model_v4: speaker_id列 + caption列を使用 / codec dim32 (v4/v4.1推奨)"
+                        status = "model_v4: speaker/caption列は任意（メタデータにある列は自動補完） / codec dim32 (v4/v4.1推奨)"
                     elif is_voice:
                         status = "voice_design: caption列を使用 / codec dim32"
                     elif mode_key == "model_v1":
@@ -3208,7 +3248,9 @@ def build_ui() -> gr.Blocks:
                     text_guess = next((h for h in headers if h not in exclude), text_choices[0] if text_choices else "text")
                     spk_choices = [""] + [h for h in headers if h not in {"file_name", "audio", text_guess}]
                     cap_choices = [""] + [h for h in headers if h not in {"file_name", "audio", text_guess}]
-                    spk_default = "speaker_id" if "speaker_id" in headers else ""
+                    # このアプリの Dataset作成タブは speaker 列を出力するため、
+                    # speaker_id / speaker の両方に対応して既定値を選ぶ
+                    spk_default = next((h for h in ("speaker_id", "speaker") if h in headers), "")
                     cap_default = "caption" if "caption" in headers else ""
                     status = f"✅ 列名を取得しました: {headers}"
                     return (

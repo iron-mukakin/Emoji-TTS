@@ -15,6 +15,7 @@ from queue import Queue
 from threading import Event, Thread
 from typing import Any
 
+import pyarrow as pa
 import torch
 import torch.multiprocessing as mp
 from datasets import Audio, load_dataset
@@ -23,11 +24,53 @@ from tqdm import tqdm
 from irodori_tts.codec import DACVAECodec
 
 
+def _patch_folder_builder_metadata_types() -> None:
+    """datasets<=4.5 + pandas>=3.0 互換パッチ。
+
+    pandas 3.0 では pd.read_csv の文字列列が新 str dtype として推論され、
+    pa.Table.from_pandas 経由で Arrow large_string になる。folder 系ビルダー
+    (audiofolder 等) のメタデータ検証は Value("string") しか認めないため、
+    file_name 列が正しくあっても
+    "`file_name` or `*_file_name` must be present..." で失敗する。
+    上流では datasets 5.x で修正済み (huggingface/datasets#8010)。
+    ここでは _read_metadata が返すテーブルの large_string 列を string に
+    正規化して検証を通過させる。
+    """
+    try:
+        from datasets.packaged_modules.folder_based_builder import (
+            folder_based_builder as _fbb,
+        )
+    except Exception:
+        return
+    builder_cls = _fbb.FolderBasedBuilder
+    if getattr(builder_cls, "_irodori_large_string_fix", False):
+        return
+
+    _orig_read_metadata = builder_cls._read_metadata
+
+    def _read_metadata(self, metadata_file: str, metadata_ext: str = ""):
+        for table in _orig_read_metadata(self, metadata_file, metadata_ext=metadata_ext):
+            for i, field in enumerate(table.schema):
+                if pa.types.is_large_string(field.type):
+                    table = table.set_column(
+                        i,
+                        field.with_type(pa.string()),
+                        table.column(i).cast(pa.string()),
+                    )
+            yield table
+
+    builder_cls._read_metadata = _read_metadata
+    builder_cls._irodori_large_string_fix = True
+
+
 def _coerce_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
         return value
+    if isinstance(value, float) and math.isnan(value):
+        # CSV の空セル (pandas が NaN として読む) は空欄として扱う
+        return ""
     if isinstance(value, (list, tuple)):
         return " ".join(str(x) for x in value)
     return str(value)
@@ -496,6 +539,7 @@ def _run_worker(
 
     # datasets 4.x: audiofolder + data_files にフォルダを渡すと FileNotFoundError になるため
     # フォルダパスは data_dir に変換して渡す
+    _patch_folder_builder_metadata_types()
     _data_files = _parse_data_files(args.data_files)
     _data_dir = None
     if args.dataset == "audiofolder" and _data_files is not None:
