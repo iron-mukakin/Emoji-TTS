@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 
 @dataclass
 class ModelConfig:
+    flow_parameterization: str = "rf_velocity"
     latent_dim: int = 128
     latent_patch_size: int = 1
     model_dim: int = 2048
@@ -143,6 +144,11 @@ class TrainConfig:
     allow_tf32: bool = False
     compile_model: bool = False
     gradient_checkpointing: bool = False
+    # Keep activations (skip checkpointing) for one out of every N diffusion
+    # blocks to trade memory for less recompute in backward. 0 disables the
+    # skipping (every block is checkpointed); each kept block costs roughly
+    # one block's activations of extra memory.
+    gradient_checkpointing_store_every: int = 0
     train_mode: str = "rf"
     learning_rate: float = 1e-4
     pretrained_text_encoder_learning_rate: float = 1e-5
@@ -197,6 +203,33 @@ class TrainConfig:
     timestep_stratified: bool = True
     timestep_min: float = 0.001
     timestep_max: float = 0.999
+    teacher_checkpoint: str | None = None
+    teacher_steps: int = 40
+    meanflow_anchor_prob: float = 0.5
+    meanflow_time_logit_mean: float = 0.4
+    meanflow_time_logit_std: float = 1.0
+    meanflow_adaptive_weight_power: float = 0.5
+    meanflow_adaptive_weight_eps: float = 0.001
+    meanflow_cfg_text_scale: float = 3.0
+    meanflow_cfg_caption_scale: float = 4.0
+    meanflow_cfg_speaker_scale: float = 5.0
+    meanflow_cfg_min_t: float = 0.5
+    meanflow_cfg_max_t: float = 1.0
+    # Number of non-anchor samples rolled out together on the teacher. A
+    # positive value bounds the reusable FP32 context-KV cache per chunk.
+    meanflow_teacher_chunk_size: int = 8
+    # Number of active condition-drop branches combined into one teacher call.
+    meanflow_teacher_branch_batch_size: int = 1
+    # Fuse the conditional base prediction into the first packed drop-branch
+    # call. This removes one teacher forward per Euler step at the cost of one
+    # additional chunk's worth of transient branch workspace.
+    meanflow_teacher_fuse_base_branch: bool = False
+    # Compile only the frozen teacher DiT callable. This is opt-in because
+    # active-sample packing produces dynamic batch sizes.
+    meanflow_compile_teacher: bool = False
+    # Pair student cuda:local_rank with teacher cuda:(local_rank + offset).
+    # Launch only the student ranks (offset=2 for 2+2 GPUs, 4 for 4+4 GPUs).
+    meanflow_teacher_device_offset: int = 0
     wandb_enabled: bool = False
     wandb_project: str = "Irodori-TTS"
     wandb_entity: str | None = None
