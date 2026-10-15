@@ -352,18 +352,7 @@ v4系向けプリセットとして `configs/train_v4_small_lora.yaml` を同梱
 
 > 絵文字キャプションはCSV出力形式が必須で、本体キャプション処理の後に自動実行されます。
 
-### タブ6: チェックポイント変換（🔄）
-
-- **通常変換** — 学習用 `.pt` を推論専用 `.safetensors` へ変換（モデル設定をメタデータへ埋め込み）。
-
-```bash
-uv run python convert_checkpoint_to_safetensors.py outputs_train/irodori_tts/checkpoint_final.pt
-# 出力: checkpoint_final.safetensors（上書きは --force）
-```
-
-- **LoRA変換** — `_full` LoRAチェックポイント（optimizer状態込み）を推論用 `_ema` アダプタ形式へ変換。
-
-### タブ7: モデルマージ（🔀）
+### タブ6: モデルマージ（🔀）
 
 2つのチェックポイント（`.pt` / `.safetensors`）をアーキテクチャ互換性チェック後にマージします。
 
@@ -377,10 +366,40 @@ uv run python convert_checkpoint_to_safetensors.py outputs_train/irodori_tts/che
 **LoRA的差分注入** — `result = base + scale × (donor − base)`。対象グループを選択可。
 出力は `.safetensors`（推奨）/ `.pt`。
 
-### タブ8: LoRAマージ（🧬）
+### タブ7: LoRAマージ（🧬）
 
 - **通常LoRAマージ** — 2つのLoRAアダプタを新アダプタへ統合（ベースモデルには焼き込まない）。マージ方法はモデルマージと同様、グループ別部分マージ対応。出力は `lora/lora_merged_*/`。
 - **本体モデルマージ（焼き込み）** — 1〜2つのLoRAを独立スケールでベースモデルへ融合。融合結果同士のpost-bakeマージ、部分焼き込みにも対応。出力は `checkpoints/lora_merged/`。
+
+### タブ8: チェックポイント変換（🔄）
+
+- **通常変換** — 学習用 `.pt` を推論専用 `.safetensors` へ変換（モデル設定をメタデータへ埋め込み）。
+
+```bash
+uv run python convert_checkpoint_to_safetensors.py outputs_train/irodori_tts/checkpoint_final.pt
+# 出力: checkpoint_final.safetensors（上書きは --force）
+```
+
+- **LoRA変換** — `_full` LoRAチェックポイント（optimizer状態込み）を推論用 `_ema` アダプタ形式へ変換。
+
+### タブ9: モデル量子化（⚖️）
+
+推論専用 `.safetensors` を torchao 量子化チェックポイント（int8 / int4 / float8）へ変換します。
+出力ファイルはそのまま推論タブ・推論CLIで読み込めます。量子化済みチェックポイントは推論専用で、学習再開や再量子化には使用できません。
+使用には torchao が必要です（`uv sync --extra quantization`）。
+
+| パラメータ | 説明 |
+|---|---|
+| 量子化方式 | `int8-weight-only`（推奨）/ `int8-dynamic` / `int4-weight-only` / `float8-weight-only` / `float8-dynamic` |
+| 量子化範囲 | `core`: トランスフォーマ本体のみ（プロジェクタ・AdaLN・Duration予測はBF16維持）/ `all-linear`: 全Linear層 |
+| INT4グループサイズ | `int4-weight-only` 選択時のみ（32 / 64 / 128 / 256） |
+
+CLIでも同じ処理が行えます（本家 `quantize_checkpoint.py` の移植、`irodori_tts/quantize_checkpoint.py`）:
+
+```bash
+uv run python -m irodori_tts.quantize_checkpoint checkpoints/model.safetensors --quantization int8-weight-only
+# 出力: model.int8-weight-only.safetensors（上書きは --force）
+```
 
 ---
 

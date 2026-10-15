@@ -45,6 +45,17 @@ from lora_merge import (
     peek_adapter_version,
 )
 
+from irodori_tts.quantization import (
+    DEFAULT_INT4_GROUP_SIZE,
+    INT4_GROUP_SIZES,
+    QUANTIZATION_CLI_CHOICES,
+    QUANTIZATION_PROFILES,
+)
+from irodori_tts.quantize_checkpoint import (
+    default_output_path,
+    quantize_checkpoint,
+)
+
 from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
@@ -2577,6 +2588,61 @@ def _run_lora_convert(input_full_dir: str, force: bool = False) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# モデル量子化 タブ ロジック
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _quant_scan() -> list[str]:
+    """checkpoints/ 配下の推論用 .safetensors を列挙（モデル量子化タブ用）。"""
+    return [p for p in _merge_scan() if p.lower().endswith(".safetensors")]
+
+
+def _run_quantize_ui(
+    input_ckpt,
+    quantization,
+    profile,
+    int4_group_size,
+    device,
+    output_dir,
+    force,
+) -> str:
+    if not str(input_ckpt).strip():
+        return "エラー: 量子化対象の .safetensors ファイルを選択してください。"
+    p = Path(str(input_ckpt).strip())
+    if not p.is_file():
+        return f"エラー: ファイルが見つかりません: {p}"
+
+    try:
+        out_path = None
+        out_dir = str(output_dir).strip()
+        if out_dir:
+            out_path = str(Path(out_dir) / default_output_path(p, str(quantization)).name)
+        report = quantize_checkpoint(
+            str(p),
+            output_path=out_path,
+            quantization=str(quantization),
+            profile=str(profile),
+            int4_group_size=int(int4_group_size),
+            device=str(device),
+            force=bool(force),
+        )
+    except Exception as e:
+        return f"量子化失敗: {e}"
+
+    lines = [
+        "✅ 量子化が完了しました。出力は推論タブでそのまま選択できます。",
+        f"入力: {report['input_path']}",
+        f"保存: {report['output_path']}",
+        f"量子化方式: {report['quantization']}",
+        f"量子化範囲: {report['profile']}",
+        f"量子化されたLinearモジュール数: {report['quantized_modules']:,}",
+        f"保存テンソルサイズ: {report['tensor_bytes'] / (1024 ** 3):.2f} GiB",
+    ]
+    if report["tokenizer_dir"]:
+        lines.append(f"トークナイザ: 出力先にコピーしました ({report['tokenizer_dir']})")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UI 構築
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4715,66 +4781,7 @@ def build_ui() -> gr.Blocks:
                 )
 
             # ═══════════════════════════════════════════════════════════════
-            # タブ6: チェックポイント変換
-            # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("🔄 チェックポイント変換"):
-                with gr.Tab("📦 通常チェックポイント変換"):
-                    gr.Markdown(
-                        "## .pt → .safetensors 変換\n"
-                        "学習チェックポイント（`.pt`）を推論用の `.safetensors` 形式に変換します。\n"
-                        "変換後のファイルは元の `.pt` と同じフォルダに保存されます。"
-                    )
-
-                    with gr.Row():
-                        conv_input = gr.Dropdown(
-                            label="変換対象の .pt ファイル",
-                            choices=initial_train_ckpts,
-                            value=initial_train_ckpts[-1] if initial_train_ckpts else None,
-                            allow_custom_value=True, scale=4,
-                        )
-                        conv_refresh_btn = gr.Button("🔄 更新", scale=1)
-
-                    conv_btn    = gr.Button("⚙️ 変換実行", variant="primary", size="lg")
-                    conv_status = gr.Textbox(label="変換結果", interactive=False, lines=6)
-
-                    conv_refresh_btn.click(
-                        lambda: gr.Dropdown(choices=_scan_train_checkpoints(), value=(_scan_train_checkpoints() or [None])[-1]),
-                        outputs=[conv_input],
-                    )
-                    conv_btn.click(_run_convert, inputs=[conv_input], outputs=[conv_status])
-
-                with gr.Tab("🚀 LoRA変換"):
-                    gr.Markdown(
-                        "## LoRA Full版 → EMA版 変換\n"
-                        "`_full` フォルダの EMA shadow 重みから、推論用の `_ema` フォルダを生成します。\n\n"
-                        "> **必要条件**: LoRA学習時に `--save-full` と `--ema-decay` を指定して保存したチェックポイント"
-                    )
-
-                    with gr.Row():
-                        lora_conv_input = gr.Dropdown(
-                            label="変換対象の _full フォルダ",
-                            choices=_scan_lora_full_adapters(),
-                            value=(_scan_lora_full_adapters() or [None])[-1],
-                            allow_custom_value=True, scale=4,
-                        )
-                        lora_conv_refresh_btn = gr.Button("🔄 更新", scale=1)
-
-                    lora_conv_force = gr.Checkbox(label="既存の出力を上書き (--force)", value=False)
-                    lora_conv_btn = gr.Button("⚙️ LoRA変換実行", variant="primary", size="lg")
-                    lora_conv_status = gr.Textbox(label="変換結果", interactive=False, lines=8)
-
-                    lora_conv_refresh_btn.click(
-                        lambda: gr.Dropdown(choices=_scan_lora_full_adapters(), value=(_scan_lora_full_adapters() or [None])[-1]),
-                        outputs=[lora_conv_input],
-                    )
-                    lora_conv_btn.click(
-                        _run_lora_convert,
-                        inputs=[lora_conv_input, lora_conv_force],
-                        outputs=[lora_conv_status],
-                    )
-
-            # ═══════════════════════════════════════════════════════════════
-            # タブ7: モデルマージ
+            # タブ6: モデルマージ
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("🔀 モデルマージ"):
                 gr.Markdown(
@@ -4972,7 +4979,7 @@ def build_ui() -> gr.Blocks:
 
 
             # ═══════════════════════════════════════════════════════════════
-            # タブ8: LoRAマージ
+            # タブ7: LoRAマージ
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("🧬 LoRAマージ"):
                 gr.Markdown("## LoRAマージ")
@@ -5432,6 +5439,156 @@ def build_ui() -> gr.Blocks:
                             lm_output_format, lm_output_dir,
                         ]
                         lm_run_btn.click(_run_lm_bake_ui, inputs=_lm_inputs, outputs=[lm_status])
+
+
+            # ═══════════════════════════════════════════════════════════════
+            # タブ8: チェックポイント変換
+            # ═══════════════════════════════════════════════════════════════
+            with gr.Tab("🔄 チェックポイント変換"):
+                with gr.Tab("📦 通常チェックポイント変換"):
+                    gr.Markdown(
+                        "## .pt → .safetensors 変換\n"
+                        "学習チェックポイント（`.pt`）を推論用の `.safetensors` 形式に変換します。\n"
+                        "変換後のファイルは元の `.pt` と同じフォルダに保存されます。"
+                    )
+
+                    with gr.Row():
+                        conv_input = gr.Dropdown(
+                            label="変換対象の .pt ファイル",
+                            choices=initial_train_ckpts,
+                            value=initial_train_ckpts[-1] if initial_train_ckpts else None,
+                            allow_custom_value=True, scale=4,
+                        )
+                        conv_refresh_btn = gr.Button("🔄 更新", scale=1)
+
+                    conv_btn    = gr.Button("⚙️ 変換実行", variant="primary", size="lg")
+                    conv_status = gr.Textbox(label="変換結果", interactive=False, lines=6)
+
+                    conv_refresh_btn.click(
+                        lambda: gr.Dropdown(choices=_scan_train_checkpoints(), value=(_scan_train_checkpoints() or [None])[-1]),
+                        outputs=[conv_input],
+                    )
+                    conv_btn.click(_run_convert, inputs=[conv_input], outputs=[conv_status])
+
+                with gr.Tab("🚀 LoRA変換"):
+                    gr.Markdown(
+                        "## LoRA Full版 → EMA版 変換\n"
+                        "`_full` フォルダの EMA shadow 重みから、推論用の `_ema` フォルダを生成します。\n\n"
+                        "> **必要条件**: LoRA学習時に `--save-full` と `--ema-decay` を指定して保存したチェックポイント"
+                    )
+
+                    with gr.Row():
+                        lora_conv_input = gr.Dropdown(
+                            label="変換対象の _full フォルダ",
+                            choices=_scan_lora_full_adapters(),
+                            value=(_scan_lora_full_adapters() or [None])[-1],
+                            allow_custom_value=True, scale=4,
+                        )
+                        lora_conv_refresh_btn = gr.Button("🔄 更新", scale=1)
+
+                    lora_conv_force = gr.Checkbox(label="既存の出力を上書き (--force)", value=False)
+                    lora_conv_btn = gr.Button("⚙️ LoRA変換実行", variant="primary", size="lg")
+                    lora_conv_status = gr.Textbox(label="変換結果", interactive=False, lines=8)
+
+                    lora_conv_refresh_btn.click(
+                        lambda: gr.Dropdown(choices=_scan_lora_full_adapters(), value=(_scan_lora_full_adapters() or [None])[-1]),
+                        outputs=[lora_conv_input],
+                    )
+                    lora_conv_btn.click(
+                        _run_lora_convert,
+                        inputs=[lora_conv_input, lora_conv_force],
+                        outputs=[lora_conv_status],
+                    )
+
+            # ═══════════════════════════════════════════════════════════════
+            # タブ9: モデル量子化
+            # ═══════════════════════════════════════════════════════════════
+            with gr.Tab("⚖️ モデル量子化"):
+                gr.Markdown(
+                    "## モデル量子化\n"
+                    "推論用 `.safetensors` チェックポイントを torchao 量子化チェックポイント（int8 / int4 / float8）へ変換します。\n"
+                    "出力ファイルはそのまま推論タブ・推論CLIで読み込めます。\n\n"
+                    "> **前提**: torchao のインストールが必要です（`uv sync --extra quantization`）\n"
+                    "> **注意**: 量子化済みチェックポイントは推論専用です。学習再開や再量子化には使用できません。\n"
+                    "> 学習チェックポイント（`.pt`）が対象の場合は、先にチェックポイント変換タブで `.safetensors` へ変換してください。"
+                )
+
+                initial_quant_ckpts = _quant_scan()
+
+                with gr.Row():
+                    quant_input = gr.Dropdown(
+                        label="量子化対象の .safetensors ファイル",
+                        choices=initial_quant_ckpts,
+                        value=initial_quant_ckpts[-1] if initial_quant_ckpts else None,
+                        allow_custom_value=True, scale=4,
+                    )
+                    quant_refresh_btn = gr.Button("🔄 更新", scale=1)
+
+                with gr.Row():
+                    quant_method = gr.Dropdown(
+                        label="量子化方式",
+                        choices=list(QUANTIZATION_CLI_CHOICES),
+                        value="int8-weight-only",
+                        info="int8-weight-only: 推奨・品質維持 / int8-dynamic: 追加削減 / int4: 最小サイズ / float8: 学習済み大型向け",
+                        scale=3,
+                    )
+                    quant_profile = gr.Dropdown(
+                        label="量子化範囲",
+                        choices=list(QUANTIZATION_PROFILES),
+                        value="core",
+                        info="core: トランスフォーマ本体のみ（推奨）/ all-linear: 全Linear層",
+                        scale=2,
+                    )
+
+                quant_int4_group = gr.Dropdown(
+                    label="INT4グループサイズ",
+                    choices=[str(g) for g in INT4_GROUP_SIZES],
+                    value=str(DEFAULT_INT4_GROUP_SIZE),
+                    visible=False,
+                    info="int4-weight-only 選択時のみ使用",
+                )
+
+                with gr.Row():
+                    quant_device = gr.Dropdown(
+                        label="変換デバイス",
+                        choices=["auto", "cpu", "cuda", "xpu"],
+                        value="auto",
+                        info="変換中の一時デバイス",
+                        scale=2,
+                    )
+                    quant_force = gr.Checkbox(
+                        label="既存の出力を上書き (--force)",
+                        value=False,
+                        scale=1,
+                    )
+
+                quant_output_dir = gr.Textbox(
+                    label="保存先フォルダ（空欄=元ファイルと同じフォルダ・ファイル名は量子化方式を付与して自動生成）",
+                    value="",
+                    placeholder="(自動) 元ファイルと同じフォルダ",
+                )
+
+                quant_run_btn = gr.Button("⚖️ 量子化実行", variant="primary", size="lg")
+                quant_status  = gr.Textbox(label="実行結果", interactive=False, lines=10)
+
+                def _quant_rescan():
+                    ckpts = _quant_scan()
+                    return gr.Dropdown(choices=ckpts, value=ckpts[-1] if ckpts else None)
+
+                def _quant_method_change(method):
+                    return gr.update(visible=(str(method) == "int4-weight-only"))
+
+                quant_refresh_btn.click(_quant_rescan, outputs=[quant_input])
+                quant_method.change(_quant_method_change, inputs=[quant_method], outputs=[quant_int4_group])
+
+                quant_run_btn.click(
+                    _run_quantize_ui,
+                    inputs=[
+                        quant_input, quant_method, quant_profile, quant_int4_group,
+                        quant_device, quant_output_dir, quant_force,
+                    ],
+                    outputs=[quant_status],
+                )
 
 
     return demo

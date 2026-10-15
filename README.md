@@ -352,18 +352,7 @@ In the Inference tab, the **LoRA Disabled Modules** field zeroes out selected Lo
 
 > Emoji Caption requires CSV output and runs automatically after the main captioning job.
 
-### Tab 6: Checkpoint Conversion (🔄)
-
-- **Normal conversion** — Converts a training `.pt` checkpoint to inference-only `.safetensors` (model config embedded in metadata).
-
-```bash
-uv run python convert_checkpoint_to_safetensors.py outputs_train/irodori_tts/checkpoint_final.pt
-# Output: checkpoint_final.safetensors (use --force to overwrite)
-```
-
-- **LoRA conversion** — Converts a `_full` LoRA checkpoint directory (with optimizer state) to an inference `_ema` adapter format.
-
-### Tab 7: Model Merge (🔀)
+### Tab 6: Model Merge (🔀)
 
 Merges two checkpoints (`.pt` / `.safetensors`) after an architecture compatibility check.
 
@@ -377,10 +366,38 @@ Merges two checkpoints (`.pt` / `.safetensors`) after an architecture compatibil
 **LoRA-style injection** — `result = base + scale × (donor − base)` with selectable target groups.
 Output format: `.safetensors` (recommended) or `.pt`.
 
-### Tab 8: LoRA Merge (🧬)
+### Tab 7: LoRA Merge (🧬)
 
 - **Standard LoRA Merge** — Merges two LoRA adapters into a new adapter (not baked into the base). Same merge methods as model merge, with per-group partial merge. Output goes to `lora/lora_merged_*/`.
 - **Bake into Base Model** — Fuses one or two LoRA adapters (each with an independent scale) into a base model checkpoint, with optional post-bake merge between two baked results and partial baking. Output goes to `checkpoints/lora_merged/`.
+
+### Tab 8: Checkpoint Conversion (🔄)
+
+- **Normal conversion** — Converts a training `.pt` checkpoint to inference-only `.safetensors` (model config embedded in metadata).
+
+```bash
+uv run python convert_checkpoint_to_safetensors.py outputs_train/irodori_tts/checkpoint_final.pt
+# Output: checkpoint_final.safetensors (use --force to overwrite)
+```
+
+- **LoRA conversion** — Converts a `_full` LoRA checkpoint directory (with optimizer state) to an inference `_ema` adapter format.
+
+### Tab 9: Model Quantization (⚖️)
+
+Converts an inference-only `.safetensors` checkpoint into a torchao-quantized checkpoint (int8 / int4 / float8). The output can be loaded directly in the Inference tab and CLI. Quantized checkpoints are inference-only and cannot be used to resume training or to re-quantize. Requires `uv sync --extra quantization`.
+
+| Parameter | Description |
+|---|---|
+| Quantization | `int8-weight-only` (recommended) / `int8-dynamic` / `int4-weight-only` / `float8-weight-only` / `float8-dynamic` |
+| Profile | `core`: transformer blocks only (projectors, AdaLN and duration prediction stay BF16) / `all-linear`: every compatible Linear |
+| INT4 group size | Only used with `int4-weight-only` (32 / 64 / 128 / 256) |
+
+The same operation is available from the CLI (ported from upstream `quantize_checkpoint.py` into `irodori_tts/quantize_checkpoint.py`):
+
+```bash
+uv run python -m irodori_tts.quantize_checkpoint checkpoints/model.safetensors --quantization int8-weight-only
+# Output: model.int8-weight-only.safetensors (use --force to overwrite)
+```
 
 ---
 
