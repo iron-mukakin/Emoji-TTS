@@ -23,9 +23,9 @@ dependencies = [
     "sentencepiece>=0.2.1,<0.3",
     "silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@d46d7d0893a583d8968ab3a6626e2289faec9152",
     "soundfile>=0.12.0",
-    "torch>=2.9.1,<2.10",
-    "torchaudio>=2.9.1,<2.10",
-    "torchcodec>=0.9.1,<0.10",
+    "torch>=2.10.0,<2.11",
+    "torchaudio>=2.10.0,<2.11",
+    "torchcodec>=0.10.0,<0.11",
     "transformers>=5.12.1,<6",
     "tqdm>=4.67.3",
     "wandb>=0.17.0",
@@ -47,7 +47,7 @@ torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sy
 dacvae = { git = "https://github.com/facebookresearch/dacvae" }
 
 # 旧GPU（GTX 10系等のPascal/Volta、sm_75未満）はCUDA 13系（cu130/cu128）が未対応のため
-# pytorch-cu130 を pytorch-cu126 へ張替えて uv sync / uv lock し直すこと（torch 2.9.1のcu126ビルドはsm_50以上対応）。
+# pytorch-cu130 を pytorch-cu126 へ張替えて uv sync / uv lock し直すこと（torch 2.10.0のcu126ビルドはsm_50以上対応）。
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
