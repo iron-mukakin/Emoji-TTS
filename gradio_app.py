@@ -5216,6 +5216,11 @@ def main() -> None:
     parser.add_argument("--server-port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="サーバー起動完了後にブラウザを自動的に開く",
+    )
     args = parser.parse_args()
 
     demo = build_ui()
@@ -5225,6 +5230,7 @@ def main() -> None:
         server_port=args.server_port,
         share=bool(args.share),
         debug=bool(args.debug),
+        inbrowser=bool(args.open_browser),
         theme=gr.themes.Soft(),
         css=_DARK_CSS + "\n" + EMOJI_PALETTE_CSS,
         js=_DARK_JS,

@@ -1,3 +1,8 @@
+# 想定環境: Python 3.13 / torch 2.9.1 + CUDA 13.0 (cu130)
+# torch / torchaudio の CUDA ビルドは uv（pyproject.toml の pytorch-cu130 index）経由で解決する。
+# pip で手動運用する場合は torch/torchaudio/torchcodec に
+#   --index-url https://download.pytorch.org/whl/cu130
+# を付けること（GTX10系等 sm_75 未満の旧GPUは cu126 に張替え）。
 dacvae @ git+https://github.com/facebookresearch/dacvae
 datasets>=3.0.0
 faster-whisper
@@ -6,21 +11,20 @@ huggingface-hub>=0.34.0
 librosa
 llvmlite>=0.40.0
 numba>=0.57.0
-nvidia-cudnn-cu12
 openai
 pandas
 peft>=0.18.0
 pyyaml>=6.0
 safetensors>=0.7.0
-sentencepiece>=0.1.99,<0.2
+sentencepiece>=0.2.1,<0.3  # 0.2.1以降にcp313用Windowsホイールあり
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@d46d7d0893a583d8968ab3a6626e2289faec9152
 soundfile>=0.12.0
-torch>=2.10.0
-torchaudio>=2.10.0
-torchcodec>=0.10.0,<0.11.0
-torchdata>=0.11.0
+torch>=2.9.1,<2.10
+torchaudio>=2.9.1,<2.10
+torchcodec>=0.9.1,<0.10
 transformers>=5.12.1,<6
 tqdm>=4.67.3
 wandb>=0.17.0
 # 量子化チェックポイント(int8/int4/float8, quantization.py)を読み込む場合のみ必要:
+# torch 2.9.x との組み合わせでは cpp 拡張スキップの警告が出るが推論機能は aten/Triton カーネルで動作する。
 torchao>=0.16.0,<0.17.0

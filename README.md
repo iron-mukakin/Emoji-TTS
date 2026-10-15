@@ -77,19 +77,23 @@ Audio is represented as continuous latent sequences via the DACVAE codec. v2 and
 
 ## Installation
 
+### Windows (recommended)
+
+Double-click `install.bat` — it creates the virtual environment, installs dependencies (including the quantization extra), and verifies torch/CUDA/torchao/ffmpeg.
+If `uv` is not installed it attempts to install it via `winget` (otherwise install [uv](https://docs.astral.sh/uv/) first).
+
+### Manual (all platforms)
+
 ```bash
 git clone <this-repo>
 cd Irodori-TTS
-uv sync
+uv sync --extra quantization   # includes torchao (int8/int4/float8 checkpoints)
 ```
 
-- Python 3.10+. On Linux/Windows with CUDA, PyTorch is installed from the cu128 index automatically (macOS/CPU use the default PyTorch build).
-- Only when loading quantized checkpoints:
-
-```bash
-uv sync --extra quantization   # torchao (for int8/int4/float8 checkpoints)
-```
-
+- Python is **auto-selected in order 3.13 → 3.12 → 3.11** (multiple entries in `.python-version`; the first one present in your environment is used, and if none exist uv downloads 3.13 automatically). The same `uv.lock` resolution applies to every listed version — torch/torchao/torchcodec etc. ship wheels for 3.11–3.13, so dependency consistency is preserved.
+- On Linux/Windows with CUDA, PyTorch 2.9.1 is installed from the **cu130 index** automatically (macOS/CPU use the default PyTorch build).
+  - For GTX 10XX / Volta (sm_70 or older) GPUs, change the `pytorch-cu130` index in `pyproject.toml` to `pytorch-cu126` (CUDA 13 dropped support below Turing sm_75).
+- float8 quantization requires sm_89+ (Ada/Blackwell); use int8 / int4 on RTX 30XX and older.
 - ffmpeg is required for audio slicing / Whisper captioning (on Windows, add `ffmpeg-7.1-full_build\bin` to PATH).
 
 ---
@@ -99,8 +103,8 @@ uv sync --extra quantization   # torchao (for int8/int4/float8 checkpoints)
 ### Gradio Web UI
 
 ```bash
-uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
-# On Windows, double-clicking start.bat also works
+uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860 --open-browser
+# On Windows, double-clicking start.bat also works (it opens the browser once the server is up)
 ```
 
 Access the UI at `http://localhost:7860`. If no checkpoint is found, `Aratako/Irodori-TTS-v4.1-Small` is downloaded by default (falls back to v4-Small / v3 / v2 / v1 if already present locally); any HF repo ID can also be entered in the UI's download box.
@@ -111,6 +115,7 @@ Access the UI at `http://localhost:7860`. If no checkpoint is found, `Aratako/Ir
 | `--server-port` | Port number (default: `7860`) |
 | `--share` | Create a public Gradio link |
 | `--debug` | Enable Gradio debug mode |
+| `--open-browser` | Open the browser automatically once the server is up |
 
 ### CLI Inference
 
@@ -459,7 +464,8 @@ Irodori-TTS/
 ├── lora_merge.py                         # LoRA adapter merge / bake-in utilities
 ├── convert_checkpoint_to_safetensors.py  # .pt → .safetensors conversion
 ├── convert_lora_checkpoint.py            # LoRA _full → _ema conversion
-├── start.bat                             # Gradio launcher (Windows)
+├── install.bat                           # Environment setup + sanity checks (Windows)
+├── start.bat                             # Gradio launcher, opens browser (Windows)
 │
 ├── irodori_tts/                          # Core library
 │   ├── model.py                          # TextToLatentRFDiT (pretrained backbone / Duration Predictor)
@@ -471,6 +477,7 @@ Irodori-TTS/
 │   ├── inference_runtime.py              # Cached, thread-safe inference runtime
 │   ├── duration.py                       # Duration Predictor support
 │   ├── quantization.py                   # torchao quantized checkpoint parsing / quantization
+│   ├── quantize_checkpoint.py            # inference ckpt → torchao quantization (CLI/GUI, ported)
 │   ├── speaker_inversion.py              # Learned speaker tokens (v4-Small)
 │   ├── attention.py                      # Shared self/context attention kernels (ContextAttentionPlan)
 │   ├── meanflow.py                       # MeanFlow distillation loss, teacher rollout & few-step sampler (v4.1)

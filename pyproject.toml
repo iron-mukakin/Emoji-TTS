@@ -14,19 +14,18 @@ dependencies = [
     "librosa",
     "llvmlite>=0.40.0",
     "numba>=0.57.0",
-    "nvidia-cudnn-cu12",
     "openai",
     "pandas>=2.3.3",
     "peft>=0.18.0",
     "pyyaml>=6.0",
     "safetensors>=0.7.0",
-    "sentencepiece>=0.1.99,<0.2",
+    # 0.2.1以降でcp313用Windowsホイールが提供された（0.1.99/0.2.0はビルド必須で失敗しやすい）
+    "sentencepiece>=0.2.1,<0.3",
     "silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@d46d7d0893a583d8968ab3a6626e2289faec9152",
     "soundfile>=0.12.0",
-    "torch>=2.10.0",
-    "torchaudio>=2.10.0",
-    "torchcodec>=0.10.0,<0.11.0",
-    "torchdata>=0.11.0",
+    "torch>=2.9.1,<2.10",
+    "torchaudio>=2.9.1,<2.10",
+    "torchcodec>=0.9.1,<0.10",
     "transformers>=5.12.1,<6",
     "tqdm>=4.67.3",
     "wandb>=0.17.0",
@@ -43,13 +42,16 @@ dev = [
 ]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
-torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 dacvae = { git = "https://github.com/facebookresearch/dacvae" }
 
+# 旧GPU（GTX 10系等のPascal/Volta、sm_75未満）はCUDA 13系（cu130/cu128）が未対応のため
+# pytorch-cu130 を pytorch-cu126 へ張替えて uv sync / uv lock し直すこと（torch 2.9.1のcu126ビルドはsm_50以上対応）。
+
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.setuptools]

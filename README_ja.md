@@ -77,19 +77,23 @@ English → [README.md](README.md)
 
 ## インストール
 
+### Windows（推奨）
+
+`install.bat` をダブルクリックすると、仮想環境の作成から依存インストール（量子化エクストラ込み）、torch/CUDA/torchao/ffmpeg の確認まで自動で行います。
+`uv` が未インストールの場合は `winget` での導入を試みます（失敗した場合は [uv](https://docs.astral.sh/uv/) を先にインストールしてください）。
+
+### 手動（共通）
+
 ```bash
 git clone <このリポジトリ>
 cd Irodori-TTS
-uv sync
+uv sync --extra quantization   # torchao 含む（int8/int4/float8 チェックポイント用）
 ```
 
-- Python 3.10 以上。Linux/Windows + CUDA では PyTorch が cu128 インデックスから自動インストールされます（macOS/CPU は既定のPyTorch）。
-- 量子化チェックポイントを読む場合のみ追加:
-
-```bash
-uv sync --extra quantization   # torchao (int8/int4/float8 チェックポイント読込用)
-```
-
+- Python は **3.13 → 3.12 → 3.11 の順で自動選択**されます（`.python-version` に複数指定。ユーザー環境に存在する最初の一つが採用され、どれも無い場合は uv が 3.13 を自動ダウンロードします）。どのバージョンでも `uv.lock` 同一の解決結果が適用され、torch/torchao/torchcodec 等は 3.11〜3.13 すべてにホイールが提供されているため整合性は保たれます。
+- Linux/Windows + CUDA では PyTorch 2.9.1 が **cu130 インデックス**から自動インストールされます（macOS/CPU は既定のPyTorch）。
+  - GTX 10XX / Volta（sm_70 以下）の GPU を使う場合は、`pyproject.toml` の `pytorch-cu130` インデックスを `pytorch-cu126` に変更してください（CUDA 13 は Turing sm_75 未満非対応）。
+- float8 量子化は sm_89 以上（Ada/Blackwell）必須。RTX 30XX 以下では int8 / int4 を使用してください。
 - 音声スライス・Whisperキャプションには ffmpeg が必要です（Windows は `ffmpeg-7.1-full_build` を PATH へ登録）。
 
 ---
@@ -99,8 +103,8 @@ uv sync --extra quantization   # torchao (int8/int4/float8 チェックポイン
 ### Gradio Web UI
 
 ```bash
-uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
-# Windows では start.bat をダブルクリックして起動することもできます
+uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860 --open-browser
+# Windows では start.bat をダブルクリックして起動することもできます（起動完了後に自動でブラウザが開きます）
 ```
 
 `http://localhost:7860` にアクセス。チェックポイントが無い場合は既定で `Aratako/Irodori-TTS-v4.1-Small` を自動ダウンロードします（v4.1-Small → v4-Small → v3 → v2 → v1 の順で既存ファイルがあればそれを採用）。UI内のダウンロード欄から任意のHFリポジトリIDを指定することも可能です。
@@ -111,6 +115,7 @@ uv run python gradio_app.py --server-name 0.0.0.0 --server-port 7860
 | `--server-port` | ポート（既定 `7860`） |
 | `--share` | 公開Gradioリンクの作成 |
 | `--debug` | Gradioデバッグモード |
+| `--open-browser` | サーバー起動完了後にブラウザを自動で開く |
 
 ### CLI推論
 
@@ -457,7 +462,8 @@ Irodori-TTS/
 ├── lora_merge.py                         # LoRAマージ / 焼き込み
 ├── convert_checkpoint_to_safetensors.py  # .pt → .safetensors 変換
 ├── convert_lora_checkpoint.py            # LoRA _full → _ema 変換
-├── start.bat                             # Gradio起動用（Windows）
+├── install.bat                           # 環境構築 + 動作確認（Windows）
+├── start.bat                             # Gradio起動用・ブラウザ自動で開く（Windows）
 │
 ├── irodori_tts/                          # コアライブラリ
 │   ├── model.py                          # TextToLatentRFDiT（事前学習バックボーン/Duration Predictor含む）
@@ -469,6 +475,7 @@ Irodori-TTS/
 │   ├── inference_runtime.py              # キャッシュ対応・スレッドセーフな推論ランタイム
 │   ├── duration.py                       # Duration Predictor関連
 │   ├── quantization.py                   # torchao量子化チェックポイントの解析・量子化
+│   ├── quantize_checkpoint.py            # 推論ckpt→torchao量子化変換（CLI/GUI・本家移植）
 │   ├── speaker_inversion.py              # 学習済み話者トークン（v4-Small）
 │   ├── attention.py                      # セルフ/コンテキストattention共通実装（ContextAttentionPlan）
 │   ├── meanflow.py                       # MeanFlow蒸留loss・teacher rollout・数ステップサンプラー（v4.1）
