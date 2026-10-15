@@ -59,6 +59,8 @@ from irodori_tts.inference_runtime import (
 from irodori_tts import model_version
 from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 
+import dataset_tools
+
 # ─────────────────────────────────────────────────────────────────────────────
 # パス定数
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1839,107 +1841,232 @@ _DS_PROC: subprocess.Popen | None = None
 _DS_LOG_LOCK = threading.Lock()
 
 
-def _build_dataset_command(
-    mode: str,
-    input_path: str,
-    slice_output: str,
-    min_sec: float,
-    max_sec: float,
-    threshold: float,
-    min_silence_ms: int,
-    speech_pad_ms: int,
-    target_sr_enabled: bool,
-    target_sr: int,
-    recursive_slice: bool,
-    caption_input: str,
-    manifest_output_dir: str,
-    manifest_filename: str,
-    output_format: str,
-    whisper_model: str,
-    language: str,
-    speaker_id: str,
-    speaker_field_mode: str,
-    recursive_caption: bool,
-    device: str,
-    model_cache_dir: str,
-) -> list[str]:
-    fmt_ext = "csv" if output_format == "CSV" else "jsonl"
-    manifest_path = str(Path(manifest_output_dir) / f"{manifest_filename}.{fmt_ext}")
+# データセット作成タブの引数名（build_ui 側の _ds_all_inputs の順序と一致させること）
+_DS_ARG_NAMES = (
+    "mode", "input_path", "slice_output",
+    "min_sec", "max_sec", "threshold", "min_silence_ms", "speech_pad_ms",
+    "target_sr_enabled", "target_sr", "recursive_slice",
+    "caption_input", "manifest_output_dir", "manifest_filename",
+    "output_format", "whisper_model", "language",
+    "model_version", "speaker_id", "caption_spec", "caption_text",
+    "recursive_caption", "device", "model_cache_dir", "overwrite_existing",
+)
 
-    if mode == "スライスのみ":
+_DS_MODE_SLICE   = "スライスのみ"
+_DS_MODE_CAPTION = "キャプションのみ"
+_DS_MODE_PIPELINE = "パイプライン（スライス→キャプション）"
+
+# 対象モデルバージョン → manifest列仕様（dataset_tools.MODEL_VERSION_KEYS と対応）
+_DS_VERSION_CHOICES = [
+    ("v1: テキストのみ（dim128・旧世代）", "v1"),
+    ("v2: テキストのみ（dim32・旧世代）", "v2"),
+    ("v3: +話者ID列（参照音声学習）", "v3"),
+    ("v3-VoiceDesign: +caption列", "v3_voicedesign"),
+    ("v4/v4.1: 話者ID+caption列（同時学習・推奨）", "v4"),
+]
+
+# caption列の内容仕様（プルダウンで選択）
+_DS_CAPTION_SPEC_CHOICES = [
+    ("音声分析で自動生成（LLM・CSVのみ・v4推奨）", "acoustic"),
+    ("固定テキスト（全ファイルへ同一captionを付与）", "fixed"),
+    ("文字起こしテキストをそのまま使用", "transcript"),
+]
+
+
+def _ds_wanted_columns(model_version_value: str) -> tuple[bool, bool]:
+    """選択されたモデルバージョンから (speaker列, caption列) の要否を解決。"""
+    cols = dataset_tools.MANIFEST_COLUMNS_FOR_VERSION.get(str(model_version_value).strip(), ())
+    return ("speaker" in cols, "caption" in cols)
+
+
+def _ds_manifest_path(kw: dict) -> Path:
+    fmt_ext = "csv" if str(kw["output_format"]).strip() == "CSV" else "jsonl"
+    return Path(str(kw["manifest_output_dir"]).strip()) / f"{str(kw['manifest_filename']).strip()}.{fmt_ext}"
+
+
+def _ds_version_info_text(model_version_value: str) -> str:
+    """選択中モデルバージョンのmanifest列仕様説明文（UI表示用）。"""
+    want_speaker, want_caption = _ds_wanted_columns(model_version_value)
+    cols = "file_name,text"
+    if want_speaker:
+        cols += ",speaker"
+    if want_caption:
+        cols += ",caption"
+    notes = {
+        "v1": "v1はtext列のみ使用（speaker/caption列なし・dim128）",
+        "v2": "v2はtext列のみ使用（speaker/caption列なし・dim32）",
+        "v3": "v3は参照音声で話者を条件付け（speaker列）",
+        "v3_voicedesign": "v3-VoiceDesignはcaption列で声質・スタイルを条件付け",
+        "v4": "v4/v4.1は話者IDとcaptionを同時に使用（参照音声+caption+話者トークン）",
+    }
+    note = notes.get(str(model_version_value).strip(), "")
+    return f"出力列: {cols}" + (f"　※ {note}" if note else "")
+
+
+def _validate_dataset_request(kw: dict) -> tuple[list[str], list[str]]:
+    """ガードレール: 操作ミス・予期せぬ衝突を起動前に検出して (エラー, 警告) を返す。"""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    mode = str(kw["mode"]).strip()
+    do_slice   = mode in (_DS_MODE_SLICE, _DS_MODE_PIPELINE)
+    do_caption = mode in (_DS_MODE_CAPTION, _DS_MODE_PIPELINE)
+
+    if do_slice:
+        try:
+            min_sec = float(kw["min_sec"])
+            max_sec = float(kw["max_sec"])
+            if min_sec <= 0:
+                errors.append("最小セグメント長は0より大きい値にしてください")
+            if max_sec < min_sec:
+                errors.append(f"最大セグメント長({max_sec})は最小セグメント長({min_sec})より小さい値を指定できません")
+        except (TypeError, ValueError):
+            errors.append("最小/最大セグメント長は数値で指定してください")
+        try:
+            if int(kw["min_silence_ms"]) < 0 or int(kw["speech_pad_ms"]) < 0:
+                errors.append("無音最短継続時間・発話前後パディングは0以上の整数にしてください")
+        except (TypeError, ValueError):
+            errors.append("無音最短継続時間・発話前後パディングは整数で指定してください")
+        if kw["target_sr_enabled"]:
+            try:
+                if int(kw["target_sr"] or 0) <= 0:
+                    errors.append("リサンプルが有効ですがリサンプル先SRが不正です")
+            except (TypeError, ValueError):
+                errors.append("リサンプル先SRは整数で指定してください")
+        try:
+            in_res = Path(str(kw["input_path"]).strip()).resolve()
+            out_res = Path(str(kw["slice_output"]).strip()).resolve()
+            if in_res == out_res or in_res in out_res.parents:
+                warnings.append("スライス出力フォルダが入力パスの配下です。前回生成物が再入力になる可能性があります")
+        except OSError:
+            pass
+
+    if do_caption:
+        mv = str(kw.get("model_version") or "").strip()
+        if mv and mv not in dataset_tools.MODEL_VERSION_KEYS:
+            errors.append(f"未知のモデルバージョンです: {mv}")
+        want_speaker, want_caption = _ds_wanted_columns(mv)
+        spec = str(kw.get("caption_spec") or "").strip()
+        if want_caption:
+            if spec not in dataset_tools.CAPTION_SOURCES:
+                errors.append("caption列仕様を選択してください")
+            elif spec == "fixed" and not str(kw.get("caption_text") or "").strip():
+                errors.append("caption仕様が「固定テキスト」ですがcaptionテキストが空です")
+            elif spec == "acoustic" and str(kw["output_format"]).strip() != "CSV":
+                errors.append("音声分析caption（acoustic）はCSV形式のみ対応です。出力形式をCSVにしてください")
+        if want_speaker and not str(kw.get("speaker_id") or "").strip():
+            warnings.append("話者IDが空です。speaker列は空で出力されます（学習時は話者ID無しとして扱われます）")
+
+        fname = str(kw["manifest_filename"]).strip()
+        if not fname or any(sep in fname for sep in ("/", "\\")):
+            errors.append("manifestファイル名はパス区切り記号なしで指定してください")
+        if str(kw["manifest_output_dir"]).strip() == "":
+            errors.append("manifest保存先フォルダが空です")
+        elif _ds_manifest_path(kw).exists() and not kw.get("overwrite_existing"):
+            errors.append(
+                f"manifestが既に存在します: {_ds_manifest_path(kw)}\n"
+                "ファイル名を変えるか「既存manifestを上書き許可」を有効にしてください"
+            )
+        if str(kw["whisper_model"]) in ("large-v3", "large-v2", "large") and str(kw["device"]).strip() != "cpu":
+            warnings.append("large系WhisperモデルはVRAMを多く使用します。メモリ不足エラーの場合は小さいモデルまたはCPUを選択してください")
+
+    return errors, warnings
+
+
+def _build_dataset_command(*args) -> list[str]:
+    kw = dict(zip(_DS_ARG_NAMES, args))
+    return _build_dataset_command_kw(kw)
+
+
+def _build_dataset_command_kw(kw: dict) -> list[str]:
+    mode = str(kw["mode"]).strip()
+    fmt_ext = "csv" if str(kw["output_format"]).strip() == "CSV" else "jsonl"
+    manifest_path = _ds_manifest_path(kw)
+
+    if mode == _DS_MODE_SLICE:
         cmd = [sys.executable, str(DATASET_TOOLS), "slice",
-               "--input", input_path,
-               "--output", slice_output,
-               "--min-sec", str(min_sec),
-               "--max-sec", str(max_sec),
-               "--threshold", str(threshold),
-               "--min-silence-ms", str(int(min_silence_ms)),
-               "--speech-pad-ms",  str(int(speech_pad_ms)),
+               "--input", str(kw["input_path"]),
+               "--output", str(kw["slice_output"]),
+               "--min-sec", str(kw["min_sec"]),
+               "--max-sec", str(kw["max_sec"]),
+               "--threshold", str(kw["threshold"]),
+               "--min-silence-ms", str(int(kw["min_silence_ms"])),
+               "--speech-pad-ms",  str(int(kw["speech_pad_ms"])),
                ]
-        if target_sr_enabled and int(target_sr) > 0:
-            cmd += ["--target-sr", str(int(target_sr))]
-        if str(device).strip() and device != "自動":
-            cmd += ["--device", str(device).strip()]
-        if recursive_slice:
+        if kw["target_sr_enabled"] and int(kw["target_sr"]) > 0:
+            cmd += ["--target-sr", str(int(kw["target_sr"]))]
+        if str(kw["device"]).strip() and kw["device"] != "自動":
+            cmd += ["--device", str(kw["device"]).strip()]
+        if kw["recursive_slice"]:
             cmd += ["--recursive"]
 
-    elif mode == "キャプションのみ":
+    elif mode == _DS_MODE_CAPTION:
+        language = str(kw["language"])
         lang = "" if language in ("自動検出", "auto", "") else language
         cmd = [sys.executable, str(DATASET_TOOLS), "caption",
-               "--input", caption_input,
-               "--output-manifest", manifest_path,
+               "--input", str(kw["caption_input"]),
+               "--output-manifest", str(manifest_path),
                "--format", fmt_ext,
-               "--model", whisper_model,
+               "--model", str(kw["whisper_model"]),
                ]
         if lang:
             cmd += ["--language", lang]
-        speaker_value = str(speaker_id).strip()
-        is_voice_design = str(speaker_field_mode).strip() == "caption"
-        if is_voice_design:
-            cmd += ["--voice-design"]
-            if speaker_value:
-                cmd += ["--voice-design-caption", speaker_value]
-        elif speaker_value:
-            cmd += ["--speaker-id", speaker_value]
-        if recursive_caption:
+        cmd += _ds_column_args(kw)
+        if kw["recursive_caption"]:
             cmd += ["--recursive"]
-        if str(device).strip() and device != "自動":
-            cmd += ["--device", str(device).strip()]
-        if str(model_cache_dir).strip():
-            cmd += ["--model-cache-dir", str(model_cache_dir).strip()]
+        if str(kw["device"]).strip() and kw["device"] != "自動":
+            cmd += ["--device", str(kw["device"]).strip()]
+        if str(kw["model_cache_dir"]).strip():
+            cmd += ["--model-cache-dir", str(kw["model_cache_dir"]).strip()]
 
     else:
+        language = str(kw["language"])
         lang = "" if language in ("自動検出", "auto", "") else language
         cmd = [sys.executable, str(DATASET_TOOLS), "pipeline",
-               "--input", input_path,
-               "--slice-output", slice_output,
-               "--output-manifest", manifest_path,
+               "--input", str(kw["input_path"]),
+               "--slice-output", str(kw["slice_output"]),
+               "--output-manifest", str(manifest_path),
                "--format", fmt_ext,
-               "--min-sec", str(min_sec),
-               "--max-sec", str(max_sec),
-               "--threshold", str(threshold),
-               "--min-silence-ms", str(int(min_silence_ms)),
-               "--speech-pad-ms",  str(int(speech_pad_ms)),
-               "--model", whisper_model,
+               "--min-sec", str(kw["min_sec"]),
+               "--max-sec", str(kw["max_sec"]),
+               "--threshold", str(kw["threshold"]),
+               "--min-silence-ms", str(int(kw["min_silence_ms"])),
+               "--speech-pad-ms",  str(int(kw["speech_pad_ms"])),
+               "--model", str(kw["whisper_model"]),
                ]
-        if target_sr_enabled and int(target_sr) > 0:
-            cmd += ["--target-sr", str(int(target_sr))]
+        if kw["target_sr_enabled"] and int(kw["target_sr"]) > 0:
+            cmd += ["--target-sr", str(int(kw["target_sr"]))]
         if lang:
             cmd += ["--language", lang]
-        speaker_value = str(speaker_id).strip()
-        is_voice_design = str(speaker_field_mode).strip() == "caption"
-        if is_voice_design:
-            cmd += ["--voice-design"]
-            if speaker_value:
-                cmd += ["--voice-design-caption", speaker_value]
-        elif speaker_value:
-            cmd += ["--speaker-id", speaker_value]
-        if str(device).strip() and device != "自動":
-            cmd += ["--device", str(device).strip()]
-        if str(model_cache_dir).strip():
-            cmd += ["--model-cache-dir", str(model_cache_dir).strip()]
+        cmd += _ds_column_args(kw)
+        if str(kw["device"]).strip() and kw["device"] != "自動":
+            cmd += ["--device", str(kw["device"]).strip()]
+        if str(kw["model_cache_dir"]).strip():
+            cmd += ["--model-cache-dir", str(kw["model_cache_dir"]).strip()]
 
     return cmd
+
+
+def _ds_column_args(kw: dict) -> list[str]:
+    """モデルバージョン別の列仕様引数（--model-version / --speaker-id / --caption-source）を組み立てる。"""
+    args: list[str] = []
+    mv = str(kw.get("model_version") or "").strip()
+    if not mv:
+        return args
+    args += ["--model-version", mv]
+    want_speaker, want_caption = _ds_wanted_columns(mv)
+    if want_speaker:
+        speaker_value = str(kw.get("speaker_id") or "").strip()
+        if speaker_value:
+            args += ["--speaker-id", speaker_value]
+    if want_caption:
+        spec = str(kw.get("caption_spec") or "transcript").strip()
+        args += ["--caption-source", spec]
+        if spec == "fixed":
+            cap_text = str(kw.get("caption_text") or "").strip()
+            if cap_text:
+                args += ["--voice-design-caption", cap_text]
+    return args
 
 
 def _start_dataset_job(*args) -> tuple[str, str]:
@@ -1949,7 +2076,12 @@ def _start_dataset_job(*args) -> tuple[str, str]:
         if _DS_PROC is not None and _DS_PROC.poll() is None:
             return "別のジョブが実行中です。停止してから再実行してください。", ""
 
-    cmd_list = _build_dataset_command(*args)
+    kw = dict(zip(_DS_ARG_NAMES, args))
+    errors, warnings = _validate_dataset_request(kw)
+    if errors:
+        return "⛔ ガードレールチェックで停止しました:\n- " + "\n- ".join(errors), ""
+
+    cmd_list = _build_dataset_command_kw(kw)
     cmd_str  = " ".join(cmd_list)
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1975,7 +2107,10 @@ def _start_dataset_job(*args) -> tuple[str, str]:
         proc.wait()
 
     threading.Thread(target=_stream, daemon=True).start()
-    return f"実行開始 (PID {proc.pid})\nログ: {log_path}", cmd_str
+    status = f"実行開始 (PID {proc.pid})\nログ: {log_path}"
+    if warnings:
+        status += "\n⚠️ " + "\n⚠️ ".join(warnings)
+    return status, cmd_str
 
 
 def _stop_dataset_job() -> str:
@@ -2001,6 +2136,20 @@ def _read_dataset_log() -> str:
     if len(lines) > 300:
         text = "... （先頭省略、末尾300行表示）\n" + "\n".join(lines[-300:])
     return text
+
+
+def _memory_status_text() -> str:
+    """利用可能なメモリ/VRAMの表示。Whisperモデル読込時の実ガードレール
+    （compute_type自動降格・警告）は dataset_tools 側で実施される。"""
+    vram_gb, ram_gb = dataset_tools.get_free_memory_gb(None)
+    parts = []
+    if ram_gb is not None:
+        parts.append(f"空きメモリ {ram_gb:.1f}GB")
+    if vram_gb is not None:
+        parts.append(f"空きVRAM {vram_gb:.1f}GB")
+    if not parts:
+        return "メモリ状態を計測できませんでした"
+    return " / ".join(parts) + "　（Whisperモデル読込時はガードレールが利用可能メモリに応じて自動で量子化方式を選びます）"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2035,7 +2184,8 @@ def _run_emoji_caption_inline(
     wav_dir: str,
     api_label: str,
     api_key: str = "",
-    voice_design: bool = False,
+    model_version_value: str = "",
+    voice_caption: bool = False,
 ) -> None:
     global _DS_PROC, _DS_LOG_PATH
 
@@ -2049,7 +2199,11 @@ def _run_emoji_caption_inline(
     ]
     if api_key_str != "lm_studio" and str(api_key).strip():
         cmd += ["--api-key", str(api_key).strip()]
-    if voice_design:
+    if str(model_version_value).strip():
+        cmd += ["--model-version", str(model_version_value).strip()]
+        if voice_caption:
+            cmd += ["--voice-caption"]
+    elif voice_caption:
         cmd += ["--voice-design"]
 
     env = os.environ.copy()
@@ -4179,6 +4333,8 @@ def build_ui() -> gr.Blocks:
                     "## データセット作成\n"
                     "長尺音声の**無音区間スライス**と**Whisperキャプション**を行い、"
                     "学習用 manifest（CSV / JSONL）を生成します。\n\n"
+                    "**対象モデルバージョン（v1〜v4）を選択すると、出力manifestの列構成が各バージョン仕様に自動追従します。**"
+                    "v4/v4.1では話者ID列とcaption列を同時に出力でき、話者+captionの同時学習にそのまま使えます。\n\n"
                     "> 必要ライブラリ: `pip install librosa soundfile faster-whisper`"
                 )
 
@@ -4246,29 +4402,49 @@ def build_ui() -> gr.Blocks:
                             value="自動",
                         )
                     with gr.Row():
-                        ds_speaker_field_mode = gr.Radio(
-                            label="話者ID欄の用途",
-                            choices=["speaker", "caption"],
-                            value="speaker",
-                            info="speaker=通常モード（speaker_id列） / caption=VoiceDesignモード（caption列）",
-                            scale=2,
+                        ds_memory_status = gr.Textbox(
+                            label="メモリ状態（ガードレール監視）",
+                            value=_memory_status_text(),
+                            interactive=False,
+                            scale=3,
                         )
+                        ds_memory_refresh = gr.Button("🔄 再計測", scale=1)
                     with gr.Row():
+                        ds_model_version = gr.Dropdown(
+                            label="対象モデルバージョン（manifest列仕様）",
+                            choices=_DS_VERSION_CHOICES,
+                            value="v4",
+                            info="出力manifestの列構成がバージョン仕様に合わせて自動設定されます（Prepare Manifestタブのモードと対応）",
+                            scale=3,
+                        )
+                        ds_recursive_caption = gr.Checkbox(label="サブフォルダも検索", value=False, scale=1)
+                    ds_version_info = gr.Textbox(
+                        label="選択中の列仕様",
+                        value=_ds_version_info_text("v4"),
+                        interactive=False,
+                    )
+                    with gr.Row() as ds_speaker_row:
                         ds_speaker_id = gr.Textbox(
-                            label="話者ID（省略可・全ファイルに付与）",
+                            label="話者ID（speaker列へ付与・v3/v4用）",
                             value="",
                             placeholder="例: SPEAKER_A",
                             scale=2,
-                            visible=True,
                         )
-                        ds_recursive_caption = gr.Checkbox(label="サブフォルダも検索", value=False, scale=1)
-                    def _on_speaker_field_mode_change(mode):
-                        is_voice_design = str(mode).strip() == "caption"
-                        return gr.update(visible=not is_voice_design)
-                    ds_speaker_field_mode.change(
-                        _on_speaker_field_mode_change,
-                        inputs=[ds_speaker_field_mode],
-                        outputs=[ds_speaker_id],
+                    with gr.Row() as ds_caption_row:
+                        ds_caption_spec = gr.Dropdown(
+                            label="caption列の仕様（v3-VoiceDesign / v4で使用）",
+                            choices=_DS_CAPTION_SPEC_CHOICES,
+                            # 既定は音声分析生成（v4推奨）。transcript/fixed を選ぶとcaption列に
+                            # 読み上げテキスト・固定テキストが入り、音声分析キャプションは実行されない。
+                            value="acoustic",
+                            info="acoustic=後段の絵文字キャプション工程（音声分析）で生成 / fixed=下の固定テキストを使用 / transcript=文字起こしテキストをそのまま使用",
+                            scale=2,
+                        )
+                    ds_caption_text = gr.Textbox(
+                        label="固定captionテキスト（全ファイルへ同一のcaptionを付与）",
+                        value="",
+                        placeholder="例: 明るくやや高めの女性声。ゆっくりした語り口で、語間に間がある。",
+                        visible=False,
                     )
                     ds_model_cache_dir = gr.Textbox(
                         label="Whisperモデルキャッシュフォルダ",
@@ -4280,7 +4456,8 @@ def build_ui() -> gr.Blocks:
                     gr.Markdown(
                         "Whisperキャプション完了後に音響特徴量とLLMを使って自動処理します。\n\n"
                         "- **text列 （全モード）**: 絵文字キャプション（`EMOJI_ANNOTATIONS` ルール）\n"
-                        "- **caption列 （VoiceDesignモードのみ）**: 音声分析キャプション（`VOICE_ANALYSIS_CAPTION_RULES`・音響パラメーターのみ・読み上げ内容含まず）\n\n"
+                        "- **caption列 （音声分析caption生成が有効な場合のみ）**: 音声分析キャプション（`VOICE_ANALYSIS_CAPTION_RULES`・音響パラメーターのみ・読み上げ内容含まず）\n"
+                        "  caption列の仕様で「音声分析で自動生成」を選ぶと自動的に有効化されます。他の仕様ではcaption列の既存値は維持されます。\n\n"
                         "> 必要ライブラリ: `pip install librosa openai`  \n"
                         "> Manifest出力設定が **CSV形式** の場合のみ動作します。"
                     )
@@ -4343,11 +4520,18 @@ def build_ui() -> gr.Blocks:
                             value="CSV",
                             scale=1,
                         )
+                    ds_overwrite = gr.Checkbox(
+                        label="既存manifestを上書き許可",
+                        value=False,
+                        info="ガードレール: オフのあいだ出力ファイルが既に存在する場合は実行を拒否します（意図しない上書き事故の防止）",
+                    )
                     gr.Markdown(
-                        "📌 **フォーマット補足**\n"
-                        "- **CSV（speakerモード）**: `file_name,text,speaker`\n"
-                        "- **CSV（caption/VoiceDesignモード）**: `file_name,text,caption`\n"
-                        "- **JSONL**: `{\"text\":\"...\",\"audio_path\":\"...\"}` — `prepare_manifest.py` への入力前段として使用可能"
+                        "📌 **出力列（対象モデルバージョンに追従）**\n"
+                        "- **v1/v2**: `file_name,text`\n"
+                        "- **v3**: `file_name,text,speaker`\n"
+                        "- **v3-VoiceDesign**: `file_name,text,caption`\n"
+                        "- **v4/v4.1**: `file_name,text,speaker,caption`（話者+captionの同時学習用）\n"
+                        "- **JSONL**: `{\"text\":\"...\",\"audio_path\":\"...\"}` + バージョンに応じた `speaker`/`caption` キー — `prepare_manifest.py` への入力前段として使用可能"
                     )
 
                 gr.Markdown("### 📋 実行コマンドプレビュー")
@@ -4406,10 +4590,42 @@ def build_ui() -> gr.Blocks:
                     ds_min_sec, ds_max_sec, ds_top_db, ds_frame_length, ds_hop_length,
                     ds_target_sr_enabled, ds_target_sr, ds_recursive_slice,
                     ds_caption_input, ds_manifest_output_dir, ds_manifest_filename,
-                    ds_output_format, ds_whisper_model, ds_language, ds_speaker_id,
-                    ds_speaker_field_mode,
-                    ds_recursive_caption, ds_device, ds_model_cache_dir,
+                    ds_output_format, ds_whisper_model, ds_language,
+                    ds_model_version, ds_speaker_id, ds_caption_spec, ds_caption_text,
+                    ds_recursive_caption, ds_device, ds_model_cache_dir, ds_overwrite,
                 ]
+
+                # モデルバージョン・caption仕様の切り替えに合わせ、入力欄の表示と
+                # 音声分析caption（acoustic）時の絵文字キャプション有効化を連動させる
+                def _on_ds_version_spec_change(model_ver, caption_spec):
+                    want_speaker, want_caption = _ds_wanted_columns(str(model_ver or "").strip())
+                    spec = str(caption_spec or "").strip()
+                    force_ec = want_caption and spec == "acoustic"
+                    return (
+                        gr.update(visible=want_speaker),
+                        gr.update(visible=want_caption),
+                        gr.update(visible=want_caption and spec == "fixed"),
+                        gr.update(value=True) if force_ec else gr.update(),
+                        _ds_version_info_text(str(model_ver or "").strip()),
+                    )
+
+                _ds_version_outputs = [
+                    ds_speaker_row, ds_caption_row, ds_caption_text,
+                    ec_enabled, ds_version_info,
+                ]
+                ds_model_version.change(
+                    _on_ds_version_spec_change,
+                    inputs=[ds_model_version, ds_caption_spec],
+                    outputs=_ds_version_outputs,
+                )
+                ds_caption_spec.change(
+                    _on_ds_version_spec_change,
+                    inputs=[ds_model_version, ds_caption_spec],
+                    outputs=_ds_version_outputs,
+                )
+
+                ds_memory_refresh.click(lambda: _memory_status_text(), outputs=[ds_memory_status])
+                ds_whisper_model.change(lambda: _memory_status_text(), outputs=[ds_memory_status])
 
                 def _update_ds_cmd(*args):
                     try:
@@ -4428,28 +4644,34 @@ def build_ui() -> gr.Blocks:
                     ec_api_     = str(args[-2])
                     ec_api_key_ = str(args[-1]).strip()
 
-                    # args[18] = ds_speaker_field_mode（_ds_all_inputs の順序に対応）
-                    speaker_field_mode_ = str(args[18]).strip()
-                    is_voice_design_    = speaker_field_mode_ == "caption"
+                    kw = dict(zip(_DS_ARG_NAMES, base_args))
+                    mv = str(kw.get("model_version") or "").strip()
+                    want_speaker, want_caption = _ds_wanted_columns(mv)
+                    caption_spec_ = str(kw.get("caption_spec") or "").strip()
+                    # caption仕様が音声分析なら絵文字キャプション工程が必須（ガードレールで自動有効化）
+                    need_voice_caption = want_caption and caption_spec_ == "acoustic"
+                    if need_voice_caption and not ec_enabled_:
+                        ec_enabled_ = True
 
                     status, cmd = _start_dataset_job(*base_args)
+                    if "⛔" in status:
+                        return status, cmd
 
                     if ec_enabled_:
-                        # 絵文字キャプション（text列）は両モードで実行
-                        # 音声分析キャプション（caption列）はVoiceDesignモード時のみ実行
-                        output_fmt = str(args[14]).strip()
+                        # 絵文字キャプション（text列）は全バージョンで実行
+                        # 音声分析キャプション（caption列）はcaption列を持ち
+                        # 仕様がacousticのバージョンでのみ実行（他の仕様ではcaption列の値を維持）
+                        output_fmt = str(kw["output_format"]).strip()
                         if output_fmt != "CSV":
                             status += "\n⚠️ 絵文字キャプションはCSV形式のみ対応です。出力形式をCSVに変更してください。"
                         else:
-                            manifest_dir  = str(args[12]).strip()
-                            manifest_name = str(args[13]).strip()
-                            csv_path      = str(Path(manifest_dir) / f"{manifest_name}.csv")
-                            mode_         = str(args[0])
-                            wav_dir_      = str(args[11]).strip() if mode_ == "キャプションのみ" else str(args[2]).strip()
+                            csv_path = str(_ds_manifest_path(kw))
+                            mode_    = str(kw["mode"]).strip()
+                            wav_dir_ = str(kw["caption_input"]).strip() if mode_ == "キャプションのみ" else str(kw["slice_output"]).strip()
 
                             def _wait_and_emoji(csv_path=csv_path, wav_dir_=wav_dir_,
                                                 ec_api_=ec_api_, ec_api_key_=ec_api_key_,
-                                                vd=is_voice_design_):
+                                                mv_=mv, voice_cap=need_voice_caption):
                                 while True:
                                     with _DS_LOG_LOCK:
                                         proc = _DS_PROC
@@ -4459,13 +4681,18 @@ def build_ui() -> gr.Blocks:
                                 with _DS_LOG_LOCK:
                                     rc = _DS_PROC.returncode if _DS_PROC else -1
                                 if rc == 0:
-                                    _run_emoji_caption_inline(csv_path, wav_dir_, ec_api_, ec_api_key_, voice_design=vd)
+                                    _run_emoji_caption_inline(
+                                        csv_path, wav_dir_, ec_api_, ec_api_key_,
+                                        model_version_value=mv_, voice_caption=voice_cap,
+                                    )
 
                             threading.Thread(target=_wait_and_emoji, daemon=True).start()
-                            if is_voice_design_:
+                            if need_voice_caption:
                                 status += f"\n🎭 絵文字キャプション（text列）＋音声分析キャプション（caption列）: 完了後に自動実行します（API: {ec_api_}）"
                             else:
-                                status += f"\n🎭 絵文字キャプション（text列のみ）: 完了後に自動実行します（API: {ec_api_}）\n   ※ speaker列はそのまま維持されます。"
+                                kept = "speaker/caption列" if (want_speaker and want_caption) else \
+                                       ("caption列" if want_caption else "speaker列")
+                                status += f"\n🎭 絵文字キャプション（text列のみ）: 完了後に自動実行します（API: {ec_api_}）\n   ※ {kept}はそのまま維持されます。"
 
                     return status, cmd
 

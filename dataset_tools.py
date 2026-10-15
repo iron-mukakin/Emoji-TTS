@@ -29,6 +29,13 @@ dataset_tools.py
       --slice-output /path/to/sliced/ \
       --output-manifest /path/to/manifest.jsonl
 
+  # 対象モデルバージョン別の列仕様（v4は speaker列 + caption列 を同時出力）
+  python dataset_tools.py caption \
+      --input  /path/to/sliced/ \
+      --output-manifest /path/to/metadata.csv --format csv \
+      --model-version v4 --speaker-id SPEAKER_A \
+      --caption-source acoustic   # 後で emoji_caption --model-version v4 --voice-caption で埋める
+
   # 絵文字キャプション生成（GUIで操作推奨）
   python dataset_tools.py emoji_caption \
       --csv /path/to/metadata.csv \
@@ -54,6 +61,28 @@ from pathlib import Path
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
 DEFAULT_WHISPER_MODEL = "medium"
 DEFAULT_SR = 16000  # Whisper の内部サンプリングレート
+
+# モデル世代別 manifest 列仕様（prepare_manifest.py のモード・irodori_tts/model_version.py と対応）
+MODEL_VERSION_KEYS = ("v1", "v2", "v3", "v3_voicedesign", "v4")
+MANIFEST_COLUMNS_FOR_VERSION: dict[str, tuple[str, ...]] = {
+    "v1": (),
+    "v2": (),
+    "v3": ("speaker",),
+    "v3_voicedesign": ("caption",),
+    "v4": ("speaker", "caption"),
+}
+
+# caption列の内容仕様
+#   fixed      : --voice-design-caption で指定した固定テキスト
+#   transcript : 文字起こしテキストをそのまま使用（旧 VoiceDesign 既定動作）
+#   acoustic   : 空で出力し、emoji_caption（音声分析）で後から埋める（CSVのみ対応）
+CAPTION_SOURCES = ("fixed", "transcript", "acoustic")
+
+# Whisper モデルの概算メモリ要求（GB, float16 換算）。メモリガードレール用。
+WHISPER_MODEL_MEM_GB = {
+    "large-v3": 3.2, "large-v2": 3.2, "large": 3.2,
+    "medium": 1.6, "small": 0.8, "base": 0.4, "tiny": 0.3,
+}
 
 # Irodori-TTS 絵文字アノテーション仕様（EMOJI_ANNOTATIONS.md 準拠）
 EMOJI_ANNOTATIONS = """
@@ -313,6 +342,151 @@ def _split_at_silence(wav_orig, wav_vad, start, end,
     return segments
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ガードレール（入力値検証・メモリ監視・列仕様解決）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _validate_slice_args(
+    min_sec: float, max_sec: float, threshold: float,
+    min_silence_ms: int, speech_pad_ms: int,
+) -> None:
+    """操作ミスによる想定外のスライス結果を防ぐため、矛盾したパラメータを拒否する。"""
+    if min_sec <= 0:
+        raise ValueError(f"min_sec は 0 より大きい値が必要です: {min_sec}")
+    if max_sec < min_sec:
+        raise ValueError(f"max_sec ({max_sec}) は min_sec ({min_sec}) より小さい値を指定できません")
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(f"threshold は (0.0, 1.0) の範囲が必要です: {threshold}")
+    if min_silence_ms < 0:
+        raise ValueError(f"min_silence_ms は 0 以上の整数が必要です: {min_silence_ms}")
+    if speech_pad_ms < 0:
+        raise ValueError(f"speech_pad_ms は 0 以上の整数が必要です: {speech_pad_ms}")
+
+
+def get_free_memory_gb(device: str | None = None) -> tuple[float | None, float | None]:
+    """(利用可能VRAM GB, 利用可能RAM GB) を返す。計測できない項目は None。"""
+    vram_gb: float | None = None
+    if device in (None, "cuda"):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, _total_b = torch.cuda.mem_get_info()
+                vram_gb = free_b / (1024 ** 3)
+        except Exception:
+            vram_gb = None
+
+    ram_gb: float | None = None
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = _MemoryStatusEx()
+        stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            ram_gb = stat.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        ram_gb = int(line.split()[1]) / (1024 ** 2)
+                        break
+        except Exception:
+            ram_gb = None
+    return vram_gb, ram_gb
+
+
+def _resolve_whisper_compute_type(model_name: str, device: str, log_fn) -> str:
+    """Whisper モデルのメモリ要求を推定し、利用可能メモリに応じた compute_type を選ぶ。
+
+    VRAM が足りない場合は int8 量子化へ自動降格し、それでも不足そうな場合は
+    より小さいモデルを使うよう警告を出す（OOM による予期せぬクラッシュ防止）。
+    """
+    est_gb = WHISPER_MODEL_MEM_GB.get(model_name, 3.2)
+    vram_gb, ram_gb = get_free_memory_gb(device)
+
+    if device == "cuda":
+        if vram_gb is None:
+            return "float16"
+        if vram_gb >= est_gb + 0.5:
+            return "float16"
+        log_fn(
+            f"[ガードレール] VRAM不足の可能性 (空き {vram_gb:.1f}GB < 必要 約{est_gb:.1f}GB)。"
+            "int8 量子化推論へ切り替えます"
+        )
+        if vram_gb < est_gb / 3.0:
+            log_fn("[WARN] int8 でもVRAMが足りない可能性があります。より小さいWhisperモデルまたはCPU利用を検討してください")
+        return "int8"
+
+    if ram_gb is not None and ram_gb < est_gb + 0.5:
+        log_fn(
+            f"[ガードレール] 空きメモリ不足の可能性 (空き {ram_gb:.1f}GB < 必要 約{est_gb:.1f}GB)。"
+            "より小さいWhisperモデルの利用を検討してください"
+        )
+    return "int8"
+
+
+def _resolve_manifest_columns(
+    model_version: str | None,
+    voice_design: bool,
+    speaker_id: str | None,
+    voice_design_caption: str | None,
+    caption_source: str | None,
+    log_fn,
+) -> tuple[bool, bool, str | None]:
+    """対象モデルバージョンから manifest の列仕様を解決する。
+
+    戻り値: (speaker列を出すか, caption列を出すか, caption内容仕様)
+    model_version 未指定時は従来の --voice-design フラグ挙動と互換にする。
+    """
+    if model_version:
+        if model_version not in MANIFEST_COLUMNS_FOR_VERSION:
+            raise ValueError(
+                f"model_version は {', '.join(MODEL_VERSION_KEYS)} のいずれかを指定してください: {model_version!r}"
+            )
+        cols = MANIFEST_COLUMNS_FOR_VERSION[model_version]
+        want_speaker = "speaker" in cols
+        want_caption = "caption" in cols
+        if voice_design and not want_caption:
+            log_fn(f"[ガードレール] model_version={model_version} はcaption列を使用しないため --voice-design は無視します")
+    else:
+        # 従来動作（レガシー互換）: voice_design で caption列、それ以外は speaker列
+        want_speaker = not voice_design
+        want_caption = voice_design
+
+    caption_src: str | None = None
+    if want_caption:
+        caption_src = caption_source or ("fixed" if voice_design_caption else "transcript")
+        if caption_src not in CAPTION_SOURCES:
+            raise ValueError(
+                f"caption_source は {', '.join(CAPTION_SOURCES)} のいずれかを指定してください: {caption_source!r}"
+            )
+        if caption_src == "fixed" and not (voice_design_caption and str(voice_design_caption).strip()):
+            log_fn("[ガードレール] caption仕様は 'fixed' ですがcaptionテキストが空です。'transcript' にフォールバックします")
+            caption_src = "transcript"
+    elif caption_source:
+        log_fn("[ガードレール] caption列を出力しないため --caption-source は無視します")
+
+    if want_speaker and not (speaker_id and str(speaker_id).strip()):
+        log_fn("[ガードレール] speaker列は空で出力されます（prepare_manifest では話者ID無しとして扱われます）")
+    if not want_speaker and speaker_id:
+        log_fn("[ガードレール] speaker列を出力しないため speaker_id は無視します")
+
+    return want_speaker, want_caption, caption_src
+
+
 def slice_audio(
     input_path: Path,
     output_dir: Path,
@@ -351,6 +525,17 @@ def slice_audio(
     -------
     保存されたスライスファイルのパスリスト
     """
+    _validate_slice_args(min_sec, max_sec, threshold, min_silence_ms, speech_pad_ms)
+
+    # ガードレール: 入力フォルダ内に出力フォルダを置くと、前回生成物を再検出する衝突が起きる
+    try:
+        in_resolved = input_path.resolve()
+        out_resolved = output_dir.resolve()
+        if in_resolved == out_resolved or in_resolved in out_resolved.parents:
+            log_fn("[WARN][ガードレール] 出力フォルダが入力パスの配下です。前回生成のスライスが入力として再検出される可能性があります")
+    except OSError:
+        pass
+
     import torch
     import torchaudio
 
@@ -463,6 +648,8 @@ def caption_audio(
     speaker_id: str | None = None,
     voice_design: bool = False,
     voice_design_caption: str | None = None,
+    model_version: str | None = None,
+    caption_source: str | None = None,
     output_format: str = "jsonl",   # "jsonl" | "csv"
     recursive: bool = False,
     batch_size: int = 1,
@@ -473,13 +660,14 @@ def caption_audio(
     """
     Whisper で音声ファイルを文字起こしし、manifest（JSONL または CSV）を出力する。
 
-    出力JSONL フォーマット:
-        通常モード: {"text": "...", "audio_path": "...", "speaker": "..."}
-        VoiceDesign: {"text": "...", "audio_path": "...", "caption": "..."}
+    出力列は model_version で決まる（未指定時は従来の voice_design 挙動と互換）:
+        v1 / v2          : text / audio_path のみ
+        v3               : + speaker 列
+        v3_voicedesign   : + caption 列
+        v4               : + speaker 列 + caption 列（v4学習は話者とcaptionを同時学習できる）
 
-    出力CSV フォーマット:
-        通常モード: file_name,text,speaker
-        VoiceDesign: file_name,text,caption
+    出力CSV ヘッダー: file_name,text[,speaker][,caption]
+    出力JSONL: {"text": "...", "audio_path": "...", "speaker": "...", "caption": "..."}
 
     Parameters
     ----------
@@ -487,9 +675,11 @@ def caption_audio(
     output_manifest : 出力先ファイルパス（.jsonl / .csv）
     model_name      : Whisper モデル名（tiny / base / small / medium / large-v3 等）
     language        : 言語コード（ja / en / None=自動検出）
-    speaker_id      : 通常モード時に全ファイルへ付与する話者ID（speaker列）
-    voice_design    : True時はspeaker列を無効化しcaption列をVoiceDesign向けで出力
-    voice_design_caption : VoiceDesign時に全件へ固定で使うcaption
+    speaker_id      : speaker列へ付与する話者ID（空でも列自体は出力される）
+    voice_design    : 従来互換フラグ。model_version 未指定時に caption列を有効化
+    voice_design_caption : caption仕様 'fixed' 時の固定captionテキスト
+    model_version   : 対象モデルバージョン（v1/v2/v3/v3_voicedesign/v4）。列仕様を決める
+    caption_source  : caption列の内容仕様（fixed/transcript/acoustic）
     output_format   : "jsonl" または "csv"
     recursive       : フォルダを再帰的に検索するか
     batch_size      : バッチ処理数（faster-whisper 使用時に有効）
@@ -506,6 +696,10 @@ def caption_audio(
     _require("faster_whisper", "faster-whisper")
     from faster_whisper import WhisperModel
 
+    want_speaker, want_caption, caption_src = _resolve_manifest_columns(
+        model_version, voice_design, speaker_id, voice_design_caption, caption_source, log_fn,
+    )
+
     audio_files = _collect_audio_files(input_path, recursive)
     if not audio_files:
         log_fn(f"[WARN] 音声ファイルが見つかりません: {input_path}")
@@ -519,7 +713,8 @@ def caption_audio(
         except ImportError:
             device = "cpu"
 
-    compute_type = "float16" if device == "cuda" else "int8"
+    # メモリガードレール: 利用可能メモリを見て compute_type を選ぶ（OOM防止）
+    compute_type = _resolve_whisper_compute_type(model_name, device, log_fn)
 
     # モデルキャッシュディレクトリの準備
     download_root: str | None = None
@@ -536,8 +731,11 @@ def caption_audio(
     else:
         model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
-    if voice_design and speaker_id:
+    if voice_design and speaker_id and not want_speaker:
         log_fn("[INFO] VoiceDesignモードのため speaker_id は無視します。")
+
+    if output_manifest.exists():
+        log_fn(f"[WARN][ガードレール] 既存のmanifest出力を上書きします: {output_manifest}")
 
     output_manifest.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
@@ -565,10 +763,15 @@ def caption_audio(
             continue
 
         record: dict = {"text": text, "audio_path": str(audio_path)}
-        if voice_design:
-            record["caption"] = voice_design_caption if voice_design_caption else text
-        elif speaker_id:
-            record["speaker"] = speaker_id
+        if want_caption:
+            if caption_src == "fixed":
+                record["caption"] = str(voice_design_caption).strip()
+            elif caption_src == "acoustic":
+                record["caption"] = ""  # emoji_caption（音声分析）で後から埋める
+            else:  # transcript
+                record["caption"] = text
+        if want_speaker and (speaker_id or model_version):
+            record["speaker"] = str(speaker_id).strip() if speaker_id else ""
 
         records.append(record)
         log_fn(f"  → {text[:80]}{'...' if len(text) > 80 else ''}")
@@ -576,8 +779,8 @@ def caption_audio(
     # ── 出力 ──
     fmt = output_format.lower()
     if fmt == "csv":
-        # voice_design=False（speakerモード）時は話者ID未入力でもspeaker列を必ず出力
-        _write_csv(records, output_manifest, speaker_mode=not voice_design)
+        # speaker/caption列はモデルバージョン仕様どおり出力（話者ID未入力でも列は維持）
+        _write_csv(records, output_manifest, speaker_mode=want_speaker, caption_mode=want_caption)
     else:
         _write_jsonl(records, output_manifest)
 
@@ -591,34 +794,34 @@ def _write_jsonl(records: list[dict], path: Path) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _write_csv(records: list[dict], path: Path, *, speaker_mode: bool = False) -> None:
+def _write_csv(records: list[dict], path: Path, *, speaker_mode: bool = False, caption_mode: bool = False) -> None:
     """
-    出力形式:
-        通常モード(speaker_mode=True): file_name,text,speaker  ← 話者IDが空でも列は必ず出力
-        VoiceDesign: file_name,text,caption
+    出力形式（列はモデルバージョン仕様で決まる）:
+        file_name,text[,speaker][,caption]
+      - speaker列 : speaker_mode=True、またはレコードにspeaker値が存在なら出力
+      - caption列 : caption_mode=True、またはレコードにcaptionが存在なら出力
+      （v4では speaker列 と caption列 の両方を同時に出力する）
     """
     with open(path, "w", encoding="utf-8", newline="") as f:
-        has_caption = any("caption" in rec for rec in records)
+        has_caption = caption_mode or any("caption" in rec for rec in records)
+        has_speaker = speaker_mode or any(
+            "speaker" in rec or str(rec.get("speaker_id", "")).strip() != ""
+            for rec in records
+        )
         columns = ["file_name", "text"]
+        if has_speaker:
+            columns.append("speaker")
         if has_caption:
             columns.append("caption")
-        else:
-            # speaker_mode=True または speaker値が1件でもある場合は speaker 列を出力
-            has_speaker_value = any(
-                str(rec.get("speaker", rec.get("speaker_id", ""))).strip() != ""
-                for rec in records
-            )
-            if speaker_mode or has_speaker_value:
-                columns.append("speaker")
         writer = csv.writer(f)
         writer.writerow(columns)
         for rec in records:
             file_name = Path(rec["audio_path"]).name  # フルパスからファイル名のみ抽出
             row = [file_name, rec.get("text", "")]
+            if has_speaker:
+                row.append(rec.get("speaker", rec.get("speaker_id", "")))
             if has_caption:
                 row.append(rec.get("caption", ""))
-            elif "speaker" in columns:
-                row.append(rec.get("speaker", rec.get("speaker_id", "")))
             writer.writerow(row)
 
 
@@ -740,21 +943,22 @@ def _call_llm_emoji(
 
 
 def _strip_emoji_characters(text: str) -> str:
-    """caption列向けに絵文字を除去する。"""
+    """caption列向けに絵文字を除去する。
+
+    注意: 日本語コードポイント（漢字・かな・読点など U+3000〜U+9FFF 台）を
+    範囲に含めないこと。以前は U+24C2-U+1F251 の広すぎる範囲を使い、
+    日本語文全体が絵文字扱いで除去されていた（空→除去前を返すフォールバックで
+    結果的に絵文字が残る）。絵文字ブロックのみに限定する。
+    """
     if not text:
         return ""
     emoji_re = re.compile(
         "["
-        "\U0001F300-\U0001F5FF"
-        "\U0001F600-\U0001F64F"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F700-\U0001F77F"
-        "\U0001F780-\U0001F7FF"
-        "\U0001F800-\U0001F8FF"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FAFF"
-        "\U00002700-\U000027BF"
-        "\U000024C2-\U0001F251"
+        "\U0001F000-\U0001FAFF"   # 絵文字ブロック（記号・感情・交通・国旗・囲み文字等）
+        "\U00002600-\U000027BF"   # 各種記号・デンゲバツ（☀❤✨等）
+        "\U00002300-\U000023FF"   # 技術記号（⏸ ⏩等）
+        "\U00002B00-\U00002BFF"   # 矢印・補助記号（⭐等）
+        "\U000024C2"              # Ⓜ️
         "]",
         flags=re.UNICODE,
     )
@@ -830,6 +1034,8 @@ def emoji_caption(
     api_base_url: str = "",
     model_name: str = "",
     voice_design: bool = False,
+    model_version: str | None = None,
+    voice_caption: bool = False,
     retry_count: int = 2,
     log_fn=print,
 ) -> list[dict]:
@@ -838,25 +1044,30 @@ def emoji_caption(
 
     処理内容:
       - text列（全モード共通）: 絵文字キャプション（EMOJI_ANNOTATIONSルール）
-      - caption列（voice_design=True のみ）: 音声分析キャプション（VOICE_ANALYSIS_CAPTION_RULESルール）
+      - caption列（音声分析caption生成が有効な場合のみ）: 音声分析キャプション（VOICE_ANALYSIS_CAPTION_RULESルール）
         → 音響特徴量パラメーターのみを入力。文字起こし内容は一切参照しない。
 
     入力CSV: file_name, text（必須カラム）
-    出力CSV:
-      通常モード  : file_name, text（絵文字付き）, speaker（変更なし）
-      VoiceDesign: file_name, text（絵文字付き）, caption（音声分析）
+    出力CSV列仕様は model_version に従う:
+      v1/v2          : file_name,text（絵文字付き）
+      v3             : + speaker（変更なし）
+      v3_voicedesign : + caption（voice_caption有効時は音声分析で生成、無効時は既存値維持）
+      v4             : + speaker（維持） + caption（voice_caption有効時は音声分析で生成）
+      未指定         : 従来の voice_design フラグ挙動と互換
 
     Parameters
     ----------
-    csv_path     : 入力CSVファイルパス
-    wav_dir      : wavファイルが格納されているフォルダ
-    api_provider : "lm_studio" / "groq" / "openai" / "together"
-    api_key      : 外部APIキー（LM Studioは不要）
-    api_base_url : APIベースURL（省略時はデフォルトを使用）
-    model_name   : 使用モデル名（省略時はデフォルトを使用）
-    voice_design : True=VoiceDesignモード（caption列を生成）/ False=通常モード（caption列なし）
-    retry_count  : LLM呼び出し失敗時のリトライ回数
-    log_fn       : ログ出力関数
+    csv_path      : 入力CSVファイルパス
+    wav_dir       : wavファイルが格納されているフォルダ
+    api_provider  : "lm_studio" / "groq" / "openai" / "together"
+    api_key       : 外部APIキー（LM Studioは不要）
+    api_base_url  : APIベースURL（省略時はデフォルトを使用）
+    model_name    : 使用モデル名（省略時はデフォルトを使用）
+    voice_design  : 従来互換フラグ。model_version 未指定時に音声分析captionを有効化
+    model_version : 対象モデルバージョン（v1/v2/v3/v3_voicedesign/v4）。列の保持仕様を決める
+    voice_caption : caption列を音声分析で生成するか（caption列を持つバージョンでのみ有効）
+    retry_count   : LLM呼び出し失敗時のリトライ回数
+    log_fn        : ログ出力関数
 
     Returns
     -------
@@ -865,6 +1076,21 @@ def emoji_caption(
     if not csv_path.exists():
         log_fn(f"[ERROR] CSVファイルが見つかりません: {csv_path}")
         return []
+
+    if model_version:
+        if model_version not in MANIFEST_COLUMNS_FOR_VERSION:
+            raise ValueError(
+                f"model_version は {', '.join(MODEL_VERSION_KEYS)} のいずれかを指定してください: {model_version!r}"
+            )
+        cols = MANIFEST_COLUMNS_FOR_VERSION[model_version]
+        want_caption_col = "caption" in cols
+        keep_speaker = "speaker" in cols
+        voice_analysis = bool(voice_caption) and want_caption_col
+    else:
+        # 従来動作（レガシー互換）
+        voice_analysis = voice_design
+        want_caption_col = voice_design
+        keep_speaker = not voice_design
 
     # CSV読み込み
     records: list[dict] = []
@@ -918,14 +1144,14 @@ def emoji_caption(
                 log_fn(f"  リトライ {attempt + 1}/{retry_count}")
                 time.sleep(1)
 
-        # ── LLM呼び出し2: 音声分析キャプション（caption列・VoiceDesignモードのみ） ──
+        # ── LLM呼び出し2: 音声分析キャプション（caption列・音声分析caption生成が有効な場合のみ） ──
         # VOICE_ANALYSIS_CAPTION_RULESシステムプロンプトのみ使用。
         # 文字起こしテキストは渡さず、音響特徴量パラメーターのみを入力とする。
-        # 通常モード（voice_design=False）では実行しない。
-        if voice_design:
-            voice_caption = ""
+        # 無効なバージョン（caption列なし / voice_caption無効）では実行しない。
+        if voice_analysis:
+            voice_caption_text = ""
             if features:
-                voice_caption = _call_llm_voice_caption(
+                voice_caption_text = _call_llm_voice_caption(
                     features,
                     api_provider=api_provider,
                     api_key=api_key,
@@ -933,45 +1159,50 @@ def emoji_caption(
                     model_name=model_name,
                     log_fn=log_fn,
                 )
-            if not voice_caption:
+            if not voice_caption_text:
                 log_fn("  [WARN] 音声分析キャプション生成失敗。空文字列を設定します。")
-                voice_caption = ""
+                voice_caption_text = ""
             log_fn(f"  → text: {emoji_text}")
-            log_fn(f"  → caption: {voice_caption}")
+            log_fn(f"  → caption: {voice_caption_text}")
             updated = dict(rec)
             updated["text"] = emoji_text
-            updated["caption"] = voice_caption
+            updated["caption"] = voice_caption_text
         else:
-            # 通常モード: text列のみ絵文字付きに更新。speaker列はそのまま維持。
+            # text列のみ絵文字付きに更新。speaker/caption列はそのまま維持。
             log_fn(f"  → text: {emoji_text}")
             updated = dict(rec)
             updated["text"] = emoji_text
 
         results.append(updated)
 
-    # CSV上書き保存
+    # CSV上書き保存（列仕様は model_version に従う）
     fieldnames = list(records[0].keys()) if records else ["file_name", "text"]
-    if voice_design:
-        # VoiceDesignモード: caption列を追加、speaker列を除去
+    if want_caption_col:
+        # caption列を持つバージョン: 音声分析caption生成が無効なら既存のcaption値をそのまま維持する
         if "caption" not in fieldnames:
             fieldnames.append("caption")
-        fieldnames = [f for f in fieldnames if f != "speaker"]
     else:
-        # 通常モード: speaker列がなければ追加（話者ID未入力でもヘッダーは維持）
+        fieldnames = [f for f in fieldnames if f != "caption"]
+    if keep_speaker:
+        # speaker列がなければ追加（話者ID未入力でもヘッダーは維持）
         if "speaker" not in fieldnames:
             fieldnames.append("speaker")
-        # 通常モードではcaption列は出力しない
-        fieldnames = [f for f in fieldnames if f != "caption"]
-        # speaker値がない行に空文字を保証
         for r in results:
             r.setdefault("speaker", "")
+    else:
+        fieldnames = [f for f in fieldnames if f != "speaker"]
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
 
-    mode_label = "絵文字＋音声分析キャプション" if voice_design else "絵文字キャプション（text列のみ）"
+    if voice_analysis and keep_speaker:
+        mode_label = "絵文字キャプション＋音声分析キャプション（speaker列維持）"
+    elif voice_analysis:
+        mode_label = "絵文字＋音声分析キャプション"
+    else:
+        mode_label = "絵文字キャプション（text列のみ）"
     log_fn(f"\n{mode_label}完了: {len(results)}/{total} 件 → {csv_path}")
     return results
 
@@ -996,6 +1227,8 @@ def pipeline(
     speaker_id: str | None = None,
     voice_design: bool = False,
     voice_design_caption: str | None = None,
+    model_version: str | None = None,
+    caption_source: str | None = None,
     output_format: str = "jsonl",
     device: str | None = None,
     model_cache_dir: Path | str | None = None,
@@ -1024,6 +1257,7 @@ def pipeline(
         slice_output, output_manifest,
         model_name=model_name, language=language, speaker_id=speaker_id,
         voice_design=voice_design, voice_design_caption=voice_design_caption,
+        model_version=model_version, caption_source=caption_source,
         output_format=output_format, recursive=False, device=device,
         model_cache_dir=model_cache_dir, log_fn=log_fn,
     )
@@ -1057,9 +1291,16 @@ def _add_caption_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--language", default="ja", help="言語コード（ja/en/None=自動）[default: ja]")
     p.add_argument("--speaker-id", default=None, help="全ファイルに付与する話者ID（省略可）")
     p.add_argument("--voice-design", action="store_true",
-                   help="VoiceDesignモード（speaker_idは使わずcaption列を出力）")
+                   help="[互換] VoiceDesignモード（model_version未指定時のcaption列出力フラグ）")
     p.add_argument("--voice-design-caption", default=None,
-                   help="VoiceDesignモード時に全ファイルへ付与するcaption（省略時はWhisper text）")
+                   help="caption仕様 'fixed' 時に全ファイルへ付与するcaptionテキスト")
+    p.add_argument("--model-version", choices=list(MODEL_VERSION_KEYS), default=None,
+                   help="対象モデルバージョン別のmanifest列仕様 "
+                        "(v1/v2=textのみ, v3=+speaker, v3_voicedesign=+caption, v4=+speaker+caption)。"
+                        "未指定時は --voice-design による従来挙動")
+    p.add_argument("--caption-source", choices=list(CAPTION_SOURCES), default=None,
+                   help="caption列の内容仕様: fixed=固定テキスト / transcript=文字起こしそのまま / "
+                        "acoustic=空で出力しemoji_caption(音声分析)で後から埋める")
     p.add_argument("--device", default=None, help="cuda / cpu（省略=自動）")
     p.add_argument("--model-cache-dir", default=None,
                    help="Whisperモデルのキャッシュ先ディレクトリ（省略=~/.cache/huggingface/hub）")
@@ -1076,7 +1317,12 @@ def _add_emoji_caption_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--api-base-url", default="", help="APIベースURL（省略=自動）")
     p.add_argument("--model",        default="", help="モデル名（省略=デフォルト）")
     p.add_argument("--voice-design", action="store_true",
-                   help="VoiceDesignモード: caption列（音声分析）を生成する。省略時はtext列（絵文字）のみ")
+                   help="[互換] VoiceDesignモード: caption列（音声分析）を生成する。省略時はtext列（絵文字）のみ")
+    p.add_argument("--model-version", choices=list(MODEL_VERSION_KEYS), default=None,
+                   help="対象モデルバージョン。出力CSVの列保持仕様を決める"
+                        "（v4=speaker列維持+caption列、v3=speaker列維持、v1/v2=両方なし）")
+    p.add_argument("--voice-caption", action="store_true",
+                   help="caption列を音声分析キャプションで生成・上書きする（caption列を持つバージョンでのみ有効）")
 
 
 def main() -> None:
@@ -1113,6 +1359,8 @@ def main() -> None:
     p_pipe.add_argument("--speaker-id",     default=None)
     p_pipe.add_argument("--voice-design", action="store_true")
     p_pipe.add_argument("--voice-design-caption", default=None)
+    p_pipe.add_argument("--model-version", choices=list(MODEL_VERSION_KEYS), default=None)
+    p_pipe.add_argument("--caption-source", choices=list(CAPTION_SOURCES), default=None)
     p_pipe.add_argument("--device",         default=None)
     p_pipe.add_argument("--model-cache-dir", default=None)
 
@@ -1145,6 +1393,7 @@ def main() -> None:
             speaker_id=args.speaker_id, output_format=args.output_format,
             voice_design=args.voice_design,
             voice_design_caption=args.voice_design_caption,
+            model_version=args.model_version, caption_source=args.caption_source,
             recursive=args.recursive, device=args.device,
             model_cache_dir=args.model_cache_dir,
         )
@@ -1161,6 +1410,7 @@ def main() -> None:
             speaker_id=args.speaker_id, output_format=args.output_format,
             voice_design=args.voice_design,
             voice_design_caption=args.voice_design_caption,
+            model_version=args.model_version, caption_source=args.caption_source,
             device=args.device, model_cache_dir=args.model_cache_dir,
         )
 
@@ -1172,6 +1422,8 @@ def main() -> None:
             api_base_url=args.api_base_url,
             model_name=args.model,
             voice_design=args.voice_design,
+            model_version=args.model_version,
+            voice_caption=args.voice_caption,
         )
 
 
