@@ -56,3 +56,7 @@ logs/tensorboard/
 checkpoints/tokenizers/
 checkpoints/whisper/
 torch_hub/
+
+# GUI一時設定（ユーザー入力の復元用。生成物のためコミット対象外）
+gui_setting/*_temp.json
+gui_setting/*.json.tmp

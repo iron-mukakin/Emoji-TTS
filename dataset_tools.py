@@ -44,6 +44,11 @@ dataset_tools.py
       [--lm-studio-url http://localhost:1234] \
       [--lm-studio-model モデル名] \
       [--api-key YOUR_KEY]
+
+  # システムプロンプトファイル指定（既定は gui_setting/ 内の初期テキスト）
+  python dataset_tools.py emoji_caption --csv ... --wav-dir ... \
+      --emoji-prompt-file gui_setting/system_prompt_emoji.txt \
+      --voice-prompt-file gui_setting/system_prompt_voice_analysis.txt
 """
 from __future__ import annotations
 
@@ -84,81 +89,40 @@ WHISPER_MODEL_MEM_GB = {
     "medium": 1.6, "small": 0.8, "base": 0.4, "tiny": 0.3,
 }
 
-# Irodori-TTS 絵文字アノテーション仕様（EMOJI_ANNOTATIONS.md 準拠）
-EMOJI_ANNOTATIONS = """
-あなたはIrodori-TTS用の絵文字キャプション生成AIです。
-以下の絵文字仕様に従い、与えられた音声の音響特徴量とテキストから、
-テキストに絵文字を付与したキャプションを生成してください。
+# ── システムプロンプトファイル（外部テキスト参照） ─────────────────────────
+# 絵文字キャプション / 音声分析キャプションのシステムプロンプトは
+# gui_setting/ フォルダ内のプレーンテキストに格納する（初期テキストは同梱）。
+# カスタムのファイルは --emoji-prompt-file / --voice-prompt-file 引数
+# （または Gradio GUI の「⚙️ 設定」タブ）で指定する。
+GUI_SETTING_DIR = Path(__file__).resolve().parent / "gui_setting"
+DEFAULT_EMOJI_PROMPT_FILE = GUI_SETTING_DIR / "system_prompt_emoji.txt"
+DEFAULT_VOICE_PROMPT_FILE = GUI_SETTING_DIR / "system_prompt_voice_analysis.txt"
 
-【絵文字仕様一覧】
-👂 囁き・耳元の音（Whisper, sounds close to the ear）
-😮‍💨 吐息・溜息・寝息（Breath, sigh, sleeping breath）
-⏸️ 間・沈黙（Pause, silence）
-🤭 笑い・くすくす・含み笑い（Chuckle, giggle, suppressed laugh）
-🥵 喘ぎ・うめき声・唸り声（Panting, moan, groan）
-📢 エコー・リバーブ（Echo, reverb）
-😏 からかうように・甘えるように（Teasing, playfully sweet）
-🥺 声を震わせながら・自信のなさげに（Trembling voice, timidly）
-🌬️ 息切れ・荒い息遣い（Shortness of breath, heavy breathing）
-😮 息をのむ（Gasp）
-👅 舐める音・咀嚼音・水音（Licking, chewing, wet sound）
-💋 リップノイズ（Lip smack）
-🫶 優しく・柔らかく（Gently, tenderly）
-😭 嗚咽・泣き声・悲しみ（Sobbing, crying, sorrowfully）
-😱 悲鳴・叫び・絶叫（Scream, shout, shriek）
-😪 眠そうに・気だるげに（Sleepily/ languidly）
-😴 寝言、いびき（Sleep talking, snoring）
-⏩ 早口・一気にまくしたてる（Fast-speaking, rapidly）
-📞 電話越し・スピーカー越し（Over the phone）
-🐢 ゆっくりと（Slowly）
-🥤 唾を飲み込む音（Gulp, swallowing sound）
-🤧 咳き込み・鼻をすする・くしゃみ（Coughing, sniffling）
-😒 舌打ち（Tutting, clicking tongue）
-😰 慌てて・動揺・緊張・どもり（Panicked, nervous, stuttering）
-😆 喜びながら（Joyfully, happily）
-💥 勢いよく、勢いに任せて（With force,momentum, forcefully）
-😠 怒り・不満げに・拗ねながら（Angry, displeased, sulking）
-😲 驚き・感嘆（Surprise, awe）
-🥱 あくび（Yawn）
-😖 苦しげに（Painfully, agonizingly）
-😟 心配そうに（Anxiously, worriedly）
-🫣 恥ずかしそうに・照れながら（Shyly, bashfully）
-🙄 呆れたように（Exasperatedly）
-😊 楽しげに・嬉しそうに（Cheerfully, gladly）
-😎 得意げに、自信ありげに（Confidently, proudly）
-👌 相槌・頷く音（Backchanneling, agreement）
-🙏 懇願するように（Pleadingly, begging）
-🥴 酔っ払って（Drunkenly）
-🎵 鼻歌（Humming）
-🤐 口を塞がれて（Muffled）
-😌 安堵・満足げに（Relieved, contentedly）
-🤔 疑問の声（Questioning voice）
-💪 力を込めて、力強く（With effort, strongly）
-👃 匂いを嗅ぐ音（Sniffing / smelling sound）
-📖 ナレーション、独白、モノローグ（Narration, monologue）
 
-【音響特徴量の読み方】
-- pitch_mean_hz: 平均ピッチ。高い(>250Hz)=高音・明るい・興奮、低い(<150Hz)=低音・落ち着き・怒り
-- pitch_std_hz: ピッチの揺らぎ。大きい=感情的・不安定、小さい=落ち着き・棒読み
-- energy_mean: 平均音量。大きい=元気・怒り・叫び、小さい=囁き・疲れ
-- energy_std: 音量の変動。大きい=抑揚豊か、小さい=単調
-- speech_rate_syllables_per_sec: 発話速度。速い(>8)=早口、遅い(<4)=ゆっくり
-- zcr_mean: 零交差率。高い=ノイジー・息交じり・摩擦音、低い=クリアな声
-- mfcc_delta_energy: 声の変化速度。大きい=感情的変化あり
-- duration_sec: 発話時間（秒）
+def load_system_prompt_file(path, default_file: Path, label: str) -> str:
+    """外部テキストファイルからシステムプロンプトを読み込む。pathが空なら既定ファイル。"""
+    target = Path(path) if path else default_file
+    if not target.is_file():
+        raise FileNotFoundError(
+            f"{label}: システムプロンプトファイルが見つかりません: {target}\n"
+            f"  既定ファイルを復元するか、有効なパスを指定してください。"
+        )
+    text = target.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"{label}: システムプロンプトファイルが空です: {target}")
+    return text
 
-【出力ルール】
-1. テキストに絵文字を自然な位置に挿入または末尾に付与する
-2. 音響特徴量を根拠に、最も適切な絵文字を1〜3個選ぶ
-3. 特徴が弱い場合は絵文字なし（元のテキストそのまま）でもよい
-4. 必ずテキストのみを返す。説明・理由・JSON不要
-5. 元のテキストの意味・文字は変えない
 
-【例】
-テキスト:「どうして…」  音響:低ピッチ・音量大・高変動 → 「どうして…😠」
-テキスト:「こんにちは」  音響:高ピッチ・明るい・標準速度 → 「こんにちは😊」
-テキスト:「ねえ、聞いて」 音響:ピッチ高・音量小・ゆっくり → 「ねえ、聞いて👂」
-"""
+def load_emoji_annotations(prompt_file=None) -> str:
+    """絵文字キャプション用システムプロンプト（EMOJI_ANNOTATIONS.md 準拠）を読み込む。"""
+    return load_system_prompt_file(prompt_file, DEFAULT_EMOJI_PROMPT_FILE, "EMOJI_ANNOTATIONS")
+
+
+def load_voice_analysis_caption_rules(prompt_file=None) -> str:
+    """音声分析キャプション用システムプロンプトを読み込む。"""
+    return load_system_prompt_file(
+        prompt_file, DEFAULT_VOICE_PROMPT_FILE, "VOICE_ANALYSIS_CAPTION_RULES"
+    )
 
 # API設定
 API_PROVIDERS = {
@@ -183,53 +147,6 @@ API_DEFAULT_MODELS = {
     "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
 }
 
-VOICE_ANALYSIS_CAPTION_RULES = """
-あなたは音声分析キャプション作成AIです。以下の仕様を厳守してください。
-
-【目的】
-- 音響特徴量パラメーターのみを根拠にして、caption列に入れる短い日本語の音声描写文を1つ作る。
-- 読み上げ内容（文字起こしテキスト）は一切参照しない。音の特性だけを記述する。
-
-【入力】
-- 音響特徴量のみ: pitch_mean_hz, pitch_std_hz, energy_mean, energy_std,
-  speech_rate_syllables_per_sec, zcr_mean, mfcc_delta_energy, duration_sec
-
-【出力ルール】
-1) 出力は1文のみ（最大60文字目安）。
-2) 日本語の自然文で、次の順で書く:
-   「声質/声の高さ」→「話速」→「抑揚/感情傾向」
-3) 絵文字・顔文字・記号装飾（!?,♪など）・引用符は使わない。
-4) 箇条書き、JSON、説明文、前置き、理由文は禁止。文だけ返す。
-5) 性別・年齢・人格は、パラメーターから強く示唆される場合のみ記述し、根拠が弱い場合は断定しない。
-   - pitch_mean_hz > 200Hz かつ energy_mean が低め → 「高めの声」または「女性的な高さの声」
-   - pitch_mean_hz < 130Hz → 「低めの声」または「男性的な低さの声」
-6) 推定不能な要素は省略し、「やや」「比較的」などで弱く表現する。
-7) 読み上げ内容・単語・話題は絶対に含めない。
-
-【判定ガイド（目安）】
-- 声の高さ:
-  - pitch_mean_hz > 220: 高めの声
-  - pitch_mean_hz 130〜220: 中程度の声
-  - pitch_mean_hz < 130: 低めの声
-- 話速:
-  - speech_rate_syllables_per_sec < 4.0: ゆっくり
-  - 4.0〜8.0: 標準的な速さ
-  - > 8.0: 早口
-- 抑揚:
-  - pitch_std_hz > 40 または energy_std > 0.05: 抑揚が大きい
-  - pitch_std_hz < 15 かつ energy_std < 0.02: 抑揚が穏やか（単調）
-- 息感/ノイズ感:
-  - zcr_mean > 0.15: 息混じり
-- 音量:
-  - energy_mean < 0.02: 小さい声・囁き気味
-  - energy_mean > 0.10: 大きい声・張りのある声
-
-【出力例】
-- 高めの声で、標準的な速さで、抑揚が穏やかな話し方
-- 低めの声で、やや早口で、抑揚が大きく感情の動きがある話し方
-- 息混じりの声で、ゆっくりと、落ち着いた話し方
-- 中程度の声で、早口で、エネルギッシュな話し方
-"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -894,11 +811,13 @@ def _call_llm_emoji(
     api_key: str = "",
     api_base_url: str = "",
     model_name: str = "",
+    system_prompt: str = "",
     log_fn=print,
 ) -> str:
     """
     LLMにテキスト＋音響特徴量を渡して絵文字付きキャプションを返す。
     OpenAI互換APIを使用（LM Studio / Groq / OpenAI / Together AI）。
+    system_prompt が空の場合は gui_setting/ の既定ファイルから読み込む。
     """
     try:
         from openai import OpenAI
@@ -924,7 +843,7 @@ def _call_llm_emoji(
     kwargs: dict = {
         "model": model,
         "messages": [
-            {"role": "system", "content": EMOJI_ANNOTATIONS},
+            {"role": "system", "content": system_prompt or load_emoji_annotations()},
             {"role": "user",   "content": user_message},
         ],
         "temperature": 0.3,
@@ -973,10 +892,12 @@ def _call_llm_voice_caption(
     api_key: str = "",
     api_base_url: str = "",
     model_name: str = "",
+    system_prompt: str = "",
     log_fn=print,
 ) -> str:
     """音響特徴量のみからcaption列向け音声描写文を生成する。
     文字起こしテキストは一切参照しない。
+    system_prompt が空の場合は gui_setting/ の既定ファイルから読み込む。
     """
     try:
         from openai import OpenAI
@@ -1004,7 +925,7 @@ def _call_llm_voice_caption(
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": VOICE_ANALYSIS_CAPTION_RULES},
+                {"role": "system", "content": system_prompt or load_voice_analysis_caption_rules()},
                 {"role": "user", "content": user_message},
             ],
             temperature=0.2,
@@ -1036,6 +957,8 @@ def emoji_caption(
     voice_design: bool = False,
     model_version: str | None = None,
     voice_caption: bool = False,
+    emoji_prompt_file=None,
+    voice_prompt_file=None,
     retry_count: int = 2,
     log_fn=print,
 ) -> list[dict]:
@@ -1066,6 +989,8 @@ def emoji_caption(
     voice_design  : 従来互換フラグ。model_version 未指定時に音声分析captionを有効化
     model_version : 対象モデルバージョン（v1/v2/v3/v3_voicedesign/v4）。列の保持仕様を決める
     voice_caption : caption列を音声分析で生成するか（caption列を持つバージョンでのみ有効）
+    emoji_prompt_file : 絵文字キャプション用システムプロンプトtxtのパス（None=gui_setting/既定）
+    voice_prompt_file : 音声分析キャプション用システムプロンプトtxtのパス（None=gui_setting/既定）
     retry_count   : LLM呼び出し失敗時のリトライ回数
     log_fn        : ログ出力関数
 
@@ -1091,6 +1016,13 @@ def emoji_caption(
         voice_analysis = voice_design
         want_caption_col = voice_design
         keep_speaker = not voice_design
+
+    # システムプロンプト読み込み（gui_setting/ 等の外部テキストファイル）。
+    # ファイル不存在・空は処理前に失敗させる（fail fast）。
+    emoji_prompt = load_emoji_annotations(emoji_prompt_file)
+    voice_prompt = (
+        load_voice_analysis_caption_rules(voice_prompt_file) if voice_analysis else ""
+    )
 
     # CSV読み込み
     records: list[dict] = []
@@ -1136,6 +1068,7 @@ def emoji_caption(
                 api_key=api_key,
                 api_base_url=api_base_url,
                 model_name=model_name,
+                system_prompt=emoji_prompt,
                 log_fn=log_fn,
             )
             if emoji_text is not None:
@@ -1157,6 +1090,7 @@ def emoji_caption(
                     api_key=api_key,
                     api_base_url=api_base_url,
                     model_name=model_name,
+                    system_prompt=voice_prompt,
                     log_fn=log_fn,
                 )
             if not voice_caption_text:
@@ -1323,6 +1257,12 @@ def _add_emoji_caption_args(p: argparse.ArgumentParser) -> None:
                         "（v4=speaker列維持+caption列、v3=speaker列維持、v1/v2=両方なし）")
     p.add_argument("--voice-caption", action="store_true",
                    help="caption列を音声分析キャプションで生成・上書きする（caption列を持つバージョンでのみ有効）")
+    p.add_argument("--emoji-prompt-file", default=None,
+                   help=f"絵文字キャプション用システムプロンプトtxt "
+                        f"[default: {DEFAULT_EMOJI_PROMPT_FILE}]")
+    p.add_argument("--voice-prompt-file", default=None,
+                   help=f"音声分析キャプション用システムプロンプトtxt "
+                        f"[default: {DEFAULT_VOICE_PROMPT_FILE}]")
 
 
 def main() -> None:
@@ -1424,6 +1364,8 @@ def main() -> None:
             voice_design=args.voice_design,
             model_version=args.model_version,
             voice_caption=args.voice_caption,
+            emoji_prompt_file=args.emoji_prompt_file,
+            voice_prompt_file=args.voice_prompt_file,
         )
 
 
@@ -1659,6 +1601,19 @@ def _launch_gui() -> None:
         _row(ef, lbl, ent, i)
         b.grid(row=i, column=2, padx=5)
 
+    # システムプロンプトファイル（外部テキスト参照。既定=gui_setting/内の初期テキスト）
+    e_eprompt = tk.StringVar(value=str(DEFAULT_EMOJI_PROMPT_FILE))
+    e_vprompt = tk.StringVar(value=str(DEFAULT_VOICE_PROMPT_FILE))
+    for i, (lbl, var) in enumerate([
+        ("システムプロンプト(絵文字)ファイル", e_eprompt),
+        ("システムプロンプト(音声分析)ファイル", e_vprompt),
+    ], start=2):
+        ent = tk.Entry(ef, textvariable=var, width=50)
+        b = tk.Button(ef, text="参照",
+                      command=lambda v=var: _browse_file(v, [("テキスト", "*.txt"), ("All", "*.*")]))
+        _row(ef, lbl, ent, i)
+        b.grid(row=i, column=2, padx=5)
+
     # API設定フレーム
     af = ttk.LabelFrame(tab_emoji, text="API設定", padding=8)
     af.pack(fill="x", padx=10, pady=5)
@@ -1764,6 +1719,8 @@ def _launch_gui() -> None:
                 api_key=e_apikey.get(),
                 api_base_url=e_baseurl.get(),
                 model_name=e_model.get(),
+                emoji_prompt_file=e_eprompt.get().strip() or None,
+                voice_prompt_file=e_vprompt.get().strip() or None,
                 log_fn=e_log,
             )
         threading.Thread(target=task, daemon=True).start()

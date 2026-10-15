@@ -99,6 +99,12 @@ DATASET_TOOLS    = BASE_DIR / "dataset_tools.py"
 DEFAULT_DATASET_DIR = BASE_DIR / "my_dataset"
 SPEAKERS_DIR        = BASE_DIR / "speakers"
 
+# GUI設定置き場（システムプロンプトの初期txtはリポジトリ同梱、一時設定ファイルはgit外）
+GUI_SETTING_DIR           = BASE_DIR / "gui_setting"
+GUI_SETTINGS_TEMP         = GUI_SETTING_DIR / "gui_settings_temp.json"
+DEFAULT_EMOJI_PROMPT_FILE = dataset_tools.DEFAULT_EMOJI_PROMPT_FILE
+DEFAULT_VOICE_PROMPT_FILE = dataset_tools.DEFAULT_VOICE_PROMPT_FILE
+
 # ─────────────────────────────────────────────────────────────────────────────
 # グローバルプロセス管理（学習・前処理の排他制御）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2217,6 +2223,14 @@ def _run_emoji_caption_inline(
     elif voice_caption:
         cmd += ["--voice-design"]
 
+    # システムプロンプトファイル（⚙️設定タブで指定したパス。既定=gui_setting/内の初期テキスト）
+    emoji_pf = str(_PROMPT_FILES.get("emoji") or "").strip()
+    voice_pf = str(_PROMPT_FILES.get("voice") or "").strip()
+    if emoji_pf:
+        cmd += ["--emoji-prompt-file", emoji_pf]
+    if voice_pf:
+        cmd += ["--voice-prompt-file", voice_pf]
+
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -2649,119 +2663,290 @@ def _run_quantize_ui(
 # ─────────────────────────────────────────────────────────────────────────────
 # ダークモード切り替え用 CSS / JS（モジュールトップレベル）
 # ─────────────────────────────────────────────────────────────────────────────
-_DARK_CSS = """
-/* ── ダークモード変数 ── */
-.dark-mode {
-    --bg-primary:    #1a1a1a;
-    --bg-secondary:  #2a2a2a;
-    --bg-tertiary:   #333333;
-    --text-primary:  #e8e8e8;
-    --text-secondary:#aaaaaa;
-    --border-color:  #444444;
-    --accent:        #7c9cbf;
-}
-.dark-mode .gradio-container,
-.dark-mode body {
-    background-color: var(--bg-primary) !important;
-    color: var(--text-primary) !important;
-}
-.dark-mode .gr-box,
-.dark-mode .gr-panel,
-.dark-mode .gr-form,
-.dark-mode .gr-block,
-.dark-mode .block,
-.dark-mode .panel,
-.dark-mode fieldset {
-    background-color: var(--bg-secondary) !important;
-    border-color: var(--border-color) !important;
-}
-.dark-mode .tab-nav button,
-.dark-mode .tabs > .tab-nav > button {
-    background-color: var(--bg-tertiary) !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border-color) !important;
-}
-.dark-mode .tab-nav button.selected {
-    background-color: var(--accent) !important;
-    color: #ffffff !important;
-}
-.dark-mode input,
-.dark-mode textarea,
-.dark-mode select,
-.dark-mode .gr-textbox textarea,
-.dark-mode .gr-textbox input {
-    background-color: var(--bg-tertiary) !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border-color) !important;
-}
-.dark-mode label,
-.dark-mode .gr-label,
-.dark-mode .label-wrap span {
-    color: var(--text-secondary) !important;
-}
-.dark-mode .gr-button-secondary,
-.dark-mode button.secondary {
-    background-color: var(--bg-tertiary) !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border-color) !important;
-}
-.dark-mode .gr-accordion,
-.dark-mode details,
-.dark-mode details summary {
-    background-color: var(--bg-secondary) !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border-color) !important;
-}
-.dark-mode .gr-slider input[type=range] {
-    accent-color: var(--accent) !important;
-}
-.dark-mode .gr-dropdown,
-.dark-mode .wrap {
-    background-color: var(--bg-tertiary) !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border-color) !important;
-}
-#dark-mode-toggle-btn {
-    position: fixed;
-    top: 12px;
-    right: 18px;
-    z-index: 9999;
-    padding: 5px 14px;
-    border-radius: 20px;
-    border: 1px solid #888;
-    background: #f0f0f0;
-    color: #333;
-    font-size: 13px;
-    cursor: pointer;
-    transition: background 0.2s, color 0.2s;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-}
-.dark-mode #dark-mode-toggle-btn {
-    background: #444 !important;
-    color: #eee !important;
-    border-color: #666 !important;
+# ─────────────────────────────────────────────────────────────────────────────
+# GUI一時設定（gui_setting/gui_settings_temp.json）
+#   - 次回起動時にユーザー入力値を復元する
+#   - 外観テーマ・システムプロンプトファイルパスの指定もここに保存する
+#   - 一時ファイルのためgit管理外（.gitignore参照）。削除で初期状態に戻る
+# ─────────────────────────────────────────────────────────────────────────────
+_SETTINGS_LOCK = threading.Lock()
+_GUI_SETTINGS: dict = {}
+
+# 絵文字キャプション実行時に使うシステムプロンプトファイルパス
+# （⚙️設定タブで更新され、temp設定ファイルに保存される）
+_PROMPT_FILES: dict[str, str] = {}
+
+
+def _load_gui_settings() -> dict:
+    """temp設定ファイルを読み込む。不存在・破損時は空設定で起動する。"""
+    global _GUI_SETTINGS
+    try:
+        with open(GUI_SETTINGS_TEMP, encoding="utf-8") as f:
+            data = json.load(f)
+        _GUI_SETTINGS = data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        _GUI_SETTINGS = {}
+    _PROMPT_FILES.clear()
+    _PROMPT_FILES["emoji"] = str(_GUI_SETTINGS.get("emoji_prompt_file") or DEFAULT_EMOJI_PROMPT_FILE)
+    _PROMPT_FILES["voice"] = str(_GUI_SETTINGS.get("voice_prompt_file") or DEFAULT_VOICE_PROMPT_FILE)
+    return _GUI_SETTINGS
+
+
+def _save_gui_settings() -> None:
+    """temp設定ファイルへ原子的に書き出す（途中クラッシュでも壊れない）。"""
+    with _SETTINGS_LOCK:
+        try:
+            GUI_SETTING_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = GUI_SETTINGS_TEMP.with_name(GUI_SETTINGS_TEMP.name + ".tmp")
+            tmp.write_text(
+                json.dumps(_GUI_SETTINGS, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            tmp.replace(GUI_SETTINGS_TEMP)
+        except OSError as e:
+            print(f"[WARN] GUI一時設定の保存に失敗: {e}", file=sys.stderr)
+
+
+def _remember_setting(key: str, value) -> None:
+    _GUI_SETTINGS[key] = value
+    _save_gui_settings()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 入力値の復元（ビルド済みUIコンポーネントへの書き戻しと変更イベント保存）
+#   キーは「クラス名|ラベル|同一キーの出現順」。UIコードが変わらば再起動後も一致する。
+#   型・選択肢・範囲チェックを通った値のみ復元する（UI変更後のズレによる誤適用防止）。
+# ─────────────────────────────────────────────────────────────────────────────
+_PERSIST_TYPES = tuple(
+    t for t in (
+        getattr(gr, n, None)
+        for n in ("Textbox", "Number", "Slider", "Checkbox",
+                  "CheckboxGroup", "Radio", "Dropdown")
+    ) if t is not None
+)
+
+
+def _persist_key(comp, counters: dict) -> str:
+    base = f"{type(comp).__name__}|{comp.label or ''}"
+    seq = counters.get(base, 0)
+    counters[base] = seq + 1
+    return f"{base}|{seq}"
+
+
+def _choice_values(comp) -> list:
+    vals = []
+    for ch in (getattr(comp, "choices", None) or []):
+        vals.append(ch[1] if isinstance(ch, (tuple, list)) else ch)
+    return vals
+
+
+def _value_acceptable(comp, val) -> bool:
+    if isinstance(comp, gr.Checkbox):
+        return isinstance(val, bool)
+    if isinstance(comp, (gr.Number, gr.Slider)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return False
+        if isinstance(comp, gr.Slider):
+            return comp.minimum <= float(val) <= comp.maximum
+        return True
+    if isinstance(comp, gr.CheckboxGroup):
+        return isinstance(val, list) and all(
+            isinstance(v, str) and v in _choice_values(comp) for v in val
+        )
+    if isinstance(comp, (gr.Radio, gr.Dropdown)):
+        if getattr(comp, "multiselect", False):
+            return isinstance(val, list) and all(
+                isinstance(v, str) and (
+                    getattr(comp, "allow_custom_value", False) or v in _choice_values(comp)
+                ) for v in val
+            )
+        if not isinstance(val, str):
+            return False
+        return bool(getattr(comp, "allow_custom_value", False)) or val in _choice_values(comp)
+    if isinstance(comp, gr.Textbox):
+        return isinstance(val, str)
+    return False
+
+
+def _iter_persistable(demo: gr.Blocks):
+    """値を保存・復元対象にすべき入力コンポーネントを生成順に走査する。
+    interactive=False（ログ等の出力専用）は対象外。"""
+    counters: dict = {}
+    for comp in demo.blocks.values():
+        if not isinstance(comp, _PERSIST_TYPES) or comp.interactive is False:
+            continue
+        yield comp, _persist_key(comp, counters)
+
+
+def _restore_component_values(demo: gr.Blocks) -> int:
+    """launch前に、保存された値をコンポーネントの初期値として書き戻す。"""
+    data = _GUI_SETTINGS.get("components")
+    if not isinstance(data, dict):
+        return 0
+    restored = 0
+    for comp, key in _iter_persistable(demo):
+        if key not in data or data[key] is None:
+            continue
+        try:
+            if not _value_acceptable(comp, data[key]):
+                continue
+            comp.value = data[key]
+            restored += 1
+        except Exception:
+            continue
+    return restored
+
+
+def _attach_value_persistence(demo: gr.Blocks) -> int:
+    """ユーザーが入力値を変えたとき temp設定ファイルへ保存するイベントを張る。
+    ※ .change() は Blocks コンテキスト内でしか呼べないため with demo: で包む。"""
+    attached = 0
+    with demo:
+        for comp, key in _iter_persistable(demo):
+            def _handler(val, _key=key):
+                _GUI_SETTINGS.setdefault("components", {})[_key] = val
+                _save_gui_settings()
+            try:
+                comp.change(_handler, inputs=[comp], outputs=None)
+                attached += 1
+            except Exception as e:
+                print(f"[WARN] 値保存イベントの登録に失敗({type(comp).__name__}): {e}",
+                      file=sys.stderr)
+    return attached
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 環境情報・ライブラリチェック（⚙️設定タブに表示）
+# ─────────────────────────────────────────────────────────────────────────────
+def _pkg_version(dist_name: str):
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version(dist_name)
+    except PackageNotFoundError:
+        return None
+
+
+def _module_importable(mod_name: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(mod_name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+# (import名, pip配布名, このプロジェクトでの役割)
+_OPTIONAL_LIBS = [
+    ("flash_attn",           "flash-attn",     "FlashAttention-2（任意: 学習・推論の高速化）"),
+    ("flash_attn_interface", "flash-attn",     "FlashAttention-3（任意: マスク付きattention使用。Hopper+）"),
+    ("torchao",              "torchao",        "量子化チェックポイント対応（int8/int4/float8）"),
+    ("faster_whisper",       "faster-whisper", "Whisper文字起こし（Prepare Manifestタブ）"),
+    ("librosa",              "librosa",        "音響特徴量抽出（絵文字キャプション）"),
+    ("soundfile",            "soundfile",      "音声ファイルI/O"),
+    ("pandas",               "pandas",         "CSVテーブル表示・編集"),
+    ("openai",               "openai",         "LLM API（絵文字キャプション生成）"),
+    ("peft",                 "peft",           "LoRA学習・LoRAマージ"),
+    ("datasets",             "datasets",       "データセット読み込み"),
+    ("wandb",                "wandb",          "学習ログ記録（任意）"),
+    ("dacvae",               "dacvae",         "Codec（v1系モデル）"),
+    ("silentcipher",         "silentcipher",   "水印（watermark）"),
+]
+
+
+def _environment_report_md() -> str:
+    """python / torch / CUDA等のバージョンとライブラリチェック結果をMarkdownで生成。"""
+    import platform
+    lines: list[str] = ["### 基本バージョン"]
+    lines.append(f"- **Python**: {sys.version.split()[0]}  ({platform.platform()})")
+    lines.append(
+        f"- **torch**: {_pkg_version('torch') or '❌ 未導入'} | "
+        f"**torchaudio**: {_pkg_version('torchaudio') or '❌ 未導入'}"
+    )
+    for dist in ("gradio", "transformers", "huggingface-hub", "safetensors", "numpy"):
+        lines.append(f"- **{dist}**: {_pkg_version(dist) or '❌ 未導入'}")
+
+    lines.append("")
+    lines.append("### CUDA / GPU")
+    try:
+        import torch
+        avail = torch.cuda.is_available()
+        lines.append(
+            f"- CUDA利用可能: **{'はい' if avail else 'いいえ'}** | "
+            f"torchビルド時CUDA: {torch.version.cuda or '−（CPUビルド）'} | "
+            f"cuDNN: {torch.backends.cudnn.version() or '−'}"
+        )
+        if avail:
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                vram = props.total_memory / 1024 ** 3
+                lines.append(
+                    f"- GPU {i}: {props.name}"
+                    f"（VRAM {vram:.1f} GB / compute capability {props.major}.{props.minor}）"
+                )
+    except ImportError:
+        lines.append("- torchが未インストールのためCUDAチェックはスキップしました。")
+
+    lines.append("")
+    lines.append("### ライブラリチェック（任意導入ライブラリ）")
+    lines.append("| ライブラリ | 状態 | 役割 |")
+    lines.append("|---|---|---|")
+    for mod, dist, purpose in _OPTIONAL_LIBS:
+        if _module_importable(mod):
+            ver = _pkg_version(dist)
+            mark = f"✅ 導入済み {ver}" if ver else "✅ 導入済み"
+        else:
+            mark = "❌ 未導入"
+        lines.append(f"| `{mod}` | {mark} | {purpose} |")
+
+    lines.append("")
+    try:
+        from irodori_tts import attention as _attn
+        if getattr(_attn, "_fa3_varlen_func", None) is not None:
+            lines.append("- attention: FlashAttention-3モジュール検出済み → GPU対応環境では自動使用")
+        else:
+            lines.append(
+                "- attention: flash_attn 未導入 → SDPA（cuDNN優先）バックエンドで動作します。"
+                "学習・推論の高速化には flash-attn / flash_attn_3 の導入を検討してください。"
+            )
+    except Exception as e:
+        lines.append(f"- attention: バックエンド確認に失敗: {e}")
+
+    vad_cache = BASE_DIR / "torch_hub" / "snakers4_silero-vad_master"
+    lines.append(
+        "- Silero VAD（スライス機能）: "
+        + ("✅ キャッシュ済み" if vad_cache.exists() else "未キャッシュ（初回実行時に自動ダウンロード）")
+    )
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 外観テーマ（ダーク / ライト / システム準拠）
+#   Gradio本体のダークモード（bodyの.darkクラス）をJSで切り替える。
+#   既定はシステム準拠。選択値はtemp設定に保存し、次回起動時も同じJSで適用する。
+# ─────────────────────────────────────────────────────────────────────────────
+_THEME_MODE_CHOICES = {"システム準拠": "system", "ダーク": "dark", "ライト": "light"}
+
+_THEME_JS = """
+function() {
+    window.__irodoriThemeMap = {'システム準拠': 'system', 'ダーク': 'dark', 'ライト': 'light'};
+    window.__irodoriApplyTheme = function(mode) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        var dark;
+        if (mode === 'dark') dark = true;
+        else if (mode === 'light') dark = false;
+        else dark = mq.matches;
+        document.body.classList.toggle('dark', dark);
+    };
+    window.__irodoriApplyTheme('__THEME_MODE__');
 }
 """
 
-_DARK_JS = """
-function() {
-    if (!document.getElementById('dark-mode-toggle-btn')) {
-        var btn = document.createElement('button');
-        btn.id = 'dark-mode-toggle-btn';
-        btn.textContent = '🌙 ダーク';
-        document.body.appendChild(btn);
-        if (localStorage.getItem('irodori_dark') === '1') {
-            document.body.classList.add('dark-mode');
-            btn.textContent = '☀️ ライト';
-        }
-        btn.addEventListener('click', function() {
-            var isDark = document.body.classList.toggle('dark-mode');
-            btn.textContent = isDark ? '☀️ ライト' : '🌙 ダーク';
-            localStorage.setItem('irodori_dark', isDark ? '1' : '0');
-        });
-    }
-}
-"""
+
+def _theme_mode_key() -> str:
+    return _THEME_MODE_CHOICES.get(str(_GUI_SETTINGS.get("theme_mode")), "system")
+
+
+def _theme_js() -> str:
+    return _THEME_JS.replace("__THEME_MODE__", _theme_mode_key())
 
 def build_ui() -> gr.Blocks:
     _ensure_default_model()
@@ -2783,7 +2968,7 @@ def build_ui() -> gr.Blocks:
     def _v(key, fallback=None):
         return default_cfg.get(key, fallback)
 
-    # ダークモードCSS/JSはモジュールトップレベル (_DARK_CSS/_DARK_JS) で定義
+    # 外観テーマJS・一時設定の仕組みはモジュールトップレベル (_THEME_JS ほか) で定義
 
     with gr.Blocks(title="Irodori-TTS GUI") as demo:
         gr.Markdown("# 🎙️ Irodori-TTS GUI")
@@ -5590,6 +5775,107 @@ def build_ui() -> gr.Blocks:
                     outputs=[quant_status],
                 )
 
+            # ═══════════════════════════════════════════════════════════════
+            # タブ: 設定（環境情報・ライブラリチェック・システムプロンプト・外観）
+            # ═══════════════════════════════════════════════════════════════
+            with gr.Tab("⚙️ 設定"):
+                gr.Markdown("### 環境情報・ライブラリチェック")
+                gr.Markdown(
+                    "python / torch / CUDA / GPU のバージョンと、任意ライブラリ"
+                    "（flash_attn など）の導入状況を表示します。"
+                    "flash_attn が未導入の場合は attention が SDPA バックエンドで動作します。"
+                )
+                env_md = gr.Markdown(_environment_report_md())
+                env_refresh_btn = gr.Button("🔄 環境情報を再収集")
+                env_refresh_btn.click(fn=_environment_report_md, outputs=[env_md])
+
+                gr.Markdown("### システムプロンプトファイル")
+                gr.Markdown(
+                    "絵文字キャプション / 音声分析キャプションのシステムプロンプトは"
+                    "外部テキストファイルから読み込みます。空欄の場合は `gui_setting/` 内の"
+                    "既定ファイルを使用します。指定パスは temp 設定ファイルに保存され、"
+                    "次回起動時も復元されます。🎙️ Dataset作成タブの絵文字キャプション実行時に使用されます。"
+                )
+                with gr.Row():
+                    emoji_prompt_file_tb = gr.Textbox(
+                        label="絵文字キャプション用システムプロンプトファイル (.txt)",
+                        value=_PROMPT_FILES.get("emoji", str(DEFAULT_EMOJI_PROMPT_FILE)),
+                    )
+                    voice_prompt_file_tb = gr.Textbox(
+                        label="音声分析キャプション用システムプロンプトファイル (.txt)",
+                        value=_PROMPT_FILES.get("voice", str(DEFAULT_VOICE_PROMPT_FILE)),
+                    )
+                prompt_check_btn = gr.Button("📄 指定ファイルの内容を確認")
+                prompt_check_md = gr.Markdown()
+
+                def _on_prompt_path(kind: str, default_file: Path, value: str) -> None:
+                    val = str(value).strip() or str(default_file)
+                    _PROMPT_FILES[kind] = val
+                    _remember_setting(f"{kind}_prompt_file", val)
+
+                def _check_prompt_files(emoji_path: str, voice_path: str) -> str:
+                    _on_prompt_path("emoji", DEFAULT_EMOJI_PROMPT_FILE, emoji_path)
+                    _on_prompt_path("voice", DEFAULT_VOICE_PROMPT_FILE, voice_path)
+                    out: list[str] = []
+                    for label, kind, default_file in (
+                        ("EMOJI_ANNOTATIONS", "emoji", DEFAULT_EMOJI_PROMPT_FILE),
+                        ("VOICE_ANALYSIS_CAPTION_RULES", "voice", DEFAULT_VOICE_PROMPT_FILE),
+                    ):
+                        path = _PROMPT_FILES[kind]
+                        try:
+                            text = dataset_tools.load_system_prompt_file(
+                                path, Path(default_file), label,
+                            )
+                            preview = text[:300] + ("…" if len(text) > 300 else "")
+                            out.append(
+                                f"**{label}** ✅ `{path}`（{len(text)}文字）\n\n```\n{preview}\n```"
+                            )
+                        except Exception as e:
+                            out.append(f"**{label}** ❌ {e}")
+                    return "\n\n".join(out)
+
+                prompt_check_btn.click(
+                    _check_prompt_files,
+                    inputs=[emoji_prompt_file_tb, voice_prompt_file_tb],
+                    outputs=[prompt_check_md],
+                )
+                emoji_prompt_file_tb.change(
+                    lambda v: _on_prompt_path("emoji", DEFAULT_EMOJI_PROMPT_FILE, v),
+                    inputs=[emoji_prompt_file_tb], outputs=None,
+                )
+                voice_prompt_file_tb.change(
+                    lambda v: _on_prompt_path("voice", DEFAULT_VOICE_PROMPT_FILE, v),
+                    inputs=[voice_prompt_file_tb], outputs=None,
+                )
+
+                gr.Markdown("### 外観")
+                gr.Markdown(
+                    "*GUIの配色を選択します。選択その場で適用され、temp設定に保存されます"
+                    "（次回起動時も同じテーマが適用されます）。*"
+                )
+                theme_radio = gr.Radio(
+                    label="テーマ",
+                    choices=list(_THEME_MODE_CHOICES.keys()),
+                    value=next(
+                        (k for k, v in _THEME_MODE_CHOICES.items() if v == _theme_mode_key()),
+                        "システム準拠",
+                    ),
+                )
+                theme_status = gr.Markdown()
+
+                def _on_theme_change(mode: str) -> str:
+                    _remember_setting("theme_mode", mode)
+                    return (
+                        f"✅ 「{mode}」を適用しました。"
+                        "設定は保存済みで、次回起動時にも自動適用されます。"
+                    )
+
+                theme_radio.change(
+                    _on_theme_change,
+                    inputs=[theme_radio],
+                    outputs=[theme_status],
+                    js="(mode) => { try { window.__irodoriApplyTheme(window.__irodoriThemeMap[mode]); } catch (e) {} return [mode]; }",
+                )
 
     return demo
 
@@ -5607,7 +5893,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # temp設定（gui_setting/gui_settings_temp.json）を読み込んでからUIを構築し、
+    # 前回ユーザーが入力した値を復元した状態で起動する。
+    _load_gui_settings()
+
     demo = build_ui()
+    restored = _restore_component_values(demo)
+    _attach_value_persistence(demo)
+    if restored:
+        print(f"[GUI] {GUI_SETTINGS_TEMP} から {restored} 件の入力値を復元しました")
     demo.queue(default_concurrency_limit=1)
     demo.launch(
         server_name=args.server_name,
@@ -5616,8 +5910,8 @@ def main() -> None:
         debug=bool(args.debug),
         inbrowser=bool(args.open_browser),
         theme=gr.themes.Soft(),
-        css=_DARK_CSS + "\n" + EMOJI_PALETTE_CSS,
-        js=_DARK_JS,
+        css=EMOJI_PALETTE_CSS,
+        js=_theme_js(),
     )
 
 
